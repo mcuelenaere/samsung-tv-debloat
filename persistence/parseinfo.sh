@@ -6,8 +6,8 @@
 #     ExecStart=/opt/etc/parseinfo.sh &      # no User=  -> root
 #     WantedBy=starter.target                # runs every boot
 #
-# ⚠  THIS IS AN EXAMPLE. It is NOT installed anywhere. Review it, test it
-#    reversibly (see ./README.md), and keep a backup of the stock file.
+# ⚠  Review before installing, test it reversibly (see ./README.md), and keep a
+#    backup of the stock file (`/opt/etc/parseinfo.sh.orig`).
 #
 # WHAT IT DOES
 #   1. Reproduces the stock behaviour exactly (writes __<BUILD>__<MODEL> to
@@ -41,7 +41,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 BEGIN {
-    LOG = "/opt/at-hub-boot.log"
+    # Log to tmpfs, not /opt: writing here costs zero flash (MMC) writes, and
+    # /run survives the whole boot — so you can still read this after the TV has
+    # booted (it is wiped only at the NEXT reboot).
+    #
+    # NB: stdout/stderr are NOT usable here. This TV ships
+    #   DefaultStandardOutput=null / DefaultStandardError=null
+    # in /etc/systemd/system.conf, and systemd-journald is inactive, so systemd
+    # discards both streams — `systemctl status AT-HUB.service` would show
+    # nothing. A tmpfs file is the only cheap inspectable sink available.
+    LOG = "/run/at-hub-boot.log"
     ts  = strftime("%Y-%m-%dT%H:%M:%S%z")
 
     # gawk's system() runs "/bin/sh -c <string>" — an inline command string, NOT a

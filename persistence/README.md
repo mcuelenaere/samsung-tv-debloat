@@ -94,7 +94,7 @@ cat parseinfo.sh   > /opt/etc/parseinfo.sh        # (push over scp/sdb)
 
 # 2. Reboot, then observe
 cat /proc/target_version                 # same stock value
-cat /opt/at-hub-boot.log                 # gawk ran; stage/start rcs
+cat /run/at-hub-boot.log                 # gawk ran; stage/start rcs (tmpfs, no flash writes)
 systemctl status dropbear.service        # active (running), own cgroup
 netstat -tln | grep ':22 '
 ssh root@192.0.2.10                    # login as root
@@ -122,4 +122,11 @@ systemctl daemon-reload
 - Everything under `/run` (the unit, the staged binary) is recreated each boot by
   the hook; nothing in this design writes to the signed rootfs or to `/opt`
   systemd paths.
+- **Logging (no flash writes):** the hook appends to `/run/at-hub-boot.log`
+  (tmpfs — survives the boot, wiped at the next reboot; read it over SSH after a
+  reboot). Do **not** log to `/opt` (MMC wear). stdout/stderr are *not* usable:
+  `/etc/systemd/system.conf` sets `DefaultStandardOutput=null` /
+  `DefaultStandardError=null` and `systemd-journald` is inactive, so systemd
+  discards both streams and `systemctl status AT-HUB.service` shows no program
+  output.
 ```
