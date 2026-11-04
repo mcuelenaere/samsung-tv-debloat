@@ -311,6 +311,14 @@ analysis). No files were changed on the TV. Key sources:
 
 ### Open questions
 
+> *Update 2026-11-04:* items 1, 3 and parts of 5 are resolved in
+> [re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md)
+> (§2.5–2.6): `#RPA` is the `#RPAC=…` anti-tamper first-line tag on ~93 image unit
+> files (inert to systemd); the trailer layout is
+> `[signature][base64(len)][":UEP"]`; and the bash check is a **userspace** call into
+> `libkUEPUser.so` (`BSContext::verifyFileWihtoutKey`) that only verifies scripts on a
+> **writable mount**, armed by the platform token `micom` in `/proc/modules`.
+
 1. Exact semantic of the kernel gate's "file type" (`#RPA`) and which paths/labels
    are exempt from the exec check.
 2. Whether the two embedded RSA keys map 1:1 to (a) firmware/update files and
