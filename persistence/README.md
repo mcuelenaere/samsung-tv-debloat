@@ -57,7 +57,9 @@ Why it works (three independent properties):
    re-scan enablement). Verified on-device: `systemctl restart <brand-new unit>`
    → `rc=0`, and `busctl call … LoadUnit s <unit>` returned its object path.
 
-## What was validated on-device (2026-11-04)
+## Validation
+
+### Controlled test (2026-11-04, later torn down)
 
 A live test wrote a unit to `/run/systemd/system`, started it, and confirmed:
 
@@ -77,9 +79,33 @@ PID 1** exec'd an unsigned ELF **from `/run`** with no UEP block — i.e. the
 boot-time context behaves the same as the interactive one. Exec from `/opt`
 (VDFS) remains the known-blocked case.
 
-## Install (when you decide to)
+### Production run (installed on the target, 2026-11-04) — **working**
 
-Not run yet. Back up the stock hook first.
+The design is **installed and in service** on the TV:
+`/opt/etc/parseinfo.sh` (sha `c8d0e7b5…`) and `/opt/systemd/dropbear.service`,
+with the pristine hook kept at `/opt/etc/parseinfo.sh.orig` (sha `c6369e7d…`).
+Confirmed across multiple reboots:
+
+- `AT-HUB.service` ran the gawk hook at **~+17 s post-kernel**, exit status `0`;
+- the hook copied the unit into `/run/systemd/system` and
+  `systemctl restart dropbear.service` returned **`rc=0` with no
+  `daemon-reload`** (on-demand `LoadUnit`/`StartUnit`);
+- `dropbear.service` came up **`active (running)`** under systemd — own cgroup,
+  `NRestarts=0` — and is **listening on `:22`** at **~+23 s post-kernel**
+  (≈21 s *before* the TV finishes booting);
+- **root SSH login** works (`ssh root@192.0.2.10`);
+- `/run/at-hub-boot.log` shows `BEGIN` → `target_version=…` → `stage unit rc=0`
+  → `start dropbear rc=0`, and **nothing** is written to `/opt` (no flash
+  writes).
+
+The full boot path was also exercised without a reboot via
+`systemctl restart AT-HUB.service`, which re-ran the hook and re-started
+dropbear the same way.
+
+## Install
+
+Already installed on the target (see *Production run* above); these are the steps
+to reproduce it elsewhere. Back up the stock hook first.
 
 ```sh
 # 0. Snapshot the pristine hook (persistent backup on /opt + off-box copy)
@@ -129,4 +155,3 @@ systemctl daemon-reload
   `DefaultStandardError=null` and `systemd-journald` is inactive, so systemd
   discards both streams and `systemctl status AT-HUB.service` shows no program
   output.
-```
