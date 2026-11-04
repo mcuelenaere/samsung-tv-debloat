@@ -115,7 +115,7 @@ Notes:
 Practical consequence of `onlycap` being empty: **our root shell (label `User`,
 full capabilities) can read and write the whole SMACK policy live**
 (`load2`, `change-rule`, `revoke-subject`, …) — including revoking rules
-without touching any on-disk file.
+without touching any on-disk file. Verified hands-on in §9.
 
 ---
 
@@ -379,22 +379,81 @@ dtv-org.tizen.emanual-app    251/3,4,5,15,16
 * Stale-but-loaded rules are harmless (a rule for a label no process or file
   carries can never match), which is why debloat-by-file-deletion doesn't
   break the MAC policy.
-* As `User`-labeled root with `onlycap` empty we hold `CAP_MAC_ADMIN`, so live
-  policy surgery is possible without reboot: write to
-  `/sys/fs/smackfs/change-rule`, `revoke-subject`, or `load2`. (The boot-time
-  values in `/etc/init.d/smack_apply*` are on the read-only VDFS system
-  partition and can't be edited in place.)
-* To **audit** what some removed/renamed service is still trying to access:
-  `logging=1` already logs all denials; `smack-logger` collects SMACK audit
-  events into `/opt/var/log/smack`. Queries can be made without touching policy
-  via `/sys/fs/smackfs/access2` (`smackaccess S O rwx`).
 * The static files are tiny — the real policy is the **generated per-app
   matrix**. If you want a "before/after" diff of a debloat session, re-dump
   `load2` and diff: `ssh root@192.0.2.10 cat /sys/fs/smackfs/load2`.
 
 ---
 
-## 9. References
+## 9. Live policy surgery as root (verified hands-on)
+
+All of the below was **executed and verified on the unit** (2026-11-04, dummy
+labels, cleaned up afterwards). It works because our SSH root shell has
+`CapEff = 0x0000003fffffffff` (all capabilities, incl. `CAP_MAC_ADMIN` = 28,
+`CAP_MAC_OVERRIDE` = 27) **and `onlycap` is empty** — smackfs write permission
+checks nothing beyond `CAP_MAC_ADMIN` + the onlycap list.
+
+### 9.1 What works (commands as run on the unit)
+
+| Operation | Command | Verified result |
+|---|---|---|
+| Load rule(s) | `echo "S O rwxat" > /sys/fs/smackfs/load2` (one rule per write; `/bin/smackload file` for batches) | ✓ rule visible in `/sys/fs/smackfs/load2` instantly, enforced immediately |
+| Query a pair | `/usr/bin/smackaccess S O <access>` or write+read `access2` | ✓ returns `1`/`0`; **quirk:** the `access2` read must use the *same fd* as the write — a separate `cat` returns empty on this kernel |
+| Modify a rule bitwise | `echo "S O <grant> <strip>" > /sys/fs/smackfs/change-rule` | ✓ `rwxat` → `rat` after stripping `wx` |
+| Unload one rule | `echo "S O -" > /sys/fs/smackfs/load2` | ✓ rule disappears; **there is no true delete** — only overwrite with deny (zero-access rules are hidden from `load2` reads and can never match) |
+| Bulk unload a subject | `echo "S" > /sys/fs/smackfs/revoke-subject` | ✓ all rules with that subject label → 0 (sets access to `-`) |
+| Relabel own process | `echo "System::Privileged" > /proc/self/attr/current` | ✓ `User` → `System::Privileged` instantly, capabilities unchanged — instant domain escalation to *any* label |
+| Relabel any file | `chsmack -a <label> <path>` (also `SMACK64EXEC`, `SMACK64TRANSMUTE`, …) | not exercised; `CAP_MAC_ADMIN` verified present, and per kernel docs `SMACK64EXEC` runs a binary under the xattr's label |
+
+Access strings are normalized by the kernel: `r-x` is reported back as `rx`,
+`rw-at-` as `rwat`, etc.
+
+### 9.2 What cannot be unloaded
+
+Kernel built-ins — no rule change can override these:
+
+* **same-label access** is always permitted (can't lock a process out of its
+  own label),
+* read/execute on **`_` (floor)** objects is always permitted,
+* read/execute by **`^` (hat)** subjects is always permitted,
+* any access to **`*` (star)** objects is always permitted.
+
+### 9.3 Even without touching rules
+
+`CAP_MAC_OVERRIDE` (which root holds) lets a process **bypass MAC decisions
+outright** for most file/IPC accesses — as root we are effectively above the
+policy; loading/unloading rules is only needed to change what *other*
+(non-privileged) processes may do.
+
+### 9.4 Caveats
+
+1. **Changes are live-only and system-wide.** They bind all ~239 processes
+   instantly; removing a rule a running service depends on can break it *until
+   reboot* — and reboot is the safety net: boot fully regenerates the policy
+   from the security-manager DB, so nothing persists.
+2. **No persistence from `/etc/smack`**: the system root is a read-only VDFS
+   mount, so the static `.d` files can't be edited. Persisting custom rules
+   needs a boot-time hook on a writable mount (e.g. something under `/opt`).
+3. **`mode=2`** (the vendor enforce switch) is writable too, but values other
+   than 2 are undocumented vendor behavior with system-wide effect — stick to
+   per-rule control, which is precise and reversible.
+4. `smackfs` writes require `*ppos == 0` (one rule per write syscall) — plain
+   `echo … > file` works, appending does not.
+
+### 9.5 Debloat angle
+
+* **Unloading rules is mostly pointless** (see §8 — stale rules are inert).
+* **Loading is the interesting direction**: grant a domain extra access, or
+  use `chsmack` + `SMACK64EXEC` to run any executable under any label — e.g.
+  re-running a "removed" system service under its original domain needs only
+  its binary + label, not its package.
+* To audit what a tampered service is still trying to access, use
+  `smackaccess` queries and the existing denial logging (`logging = 1` →
+  kernel log / `smack-logger` → `/opt/var/log/smack`).
+
+---
+
+## 10. References
 
 * Upstream SMACK documentation: <https://docs.kernel.org/admin-guide/LSM/Smack.html>
 * Tizen three-domain model: <https://wiki.tizen.org/Security/Tizen_Smack>
