@@ -102,6 +102,10 @@ Layered, and the reason the root filesystem can't simply be edited:
   would brick/recover rather than persist.
 - Device/policy: `device-policy-manager`, `zone-manager` + `zone-security-manager`
   (Knox-style zones), `sfpmd` ("Smart Security Product daemon").
+- **UEP (kUEP)** — Samsung's unsigned-execution gate (built-in `uep` kernel
+  module + `libkUEPUser.so` + `sfpmd`), enforced at `execve` even for root;
+  separate from SMACK and secure boot. Documented in
+  [Samsung UEP on the TV](samsung-tv-uep.md).
 
 **Debug / root path:** `sdbd.service` = **Samsung Debug Bridge Daemon** (SDB,
 Samsung's ADB equivalent), listening via `sdbd_tcp.socket`. This is the channel

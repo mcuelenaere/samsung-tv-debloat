@@ -51,7 +51,8 @@ roots Samsung Tizen TVs via:
    This is the route the whole ecosystem runs on. It adapts a route first
    reported publicly on r/Tizen by u/motodrizzle (S90D owner =
    couchroot/splitcipher).
-4. Extras: volatile UEP disable (unsigned native execution), host daemon
+4. Extras: volatile UEP disable (unsigned native execution — see the
+   [UEP notes](samsung-tv-uep.md)), host daemon
    re-acquiring root at each TV boot, remote remap/observe, HDMI/source/
    picture controls, screenshots/overlays (QN90F), SWU firmware-key extraction.
 
