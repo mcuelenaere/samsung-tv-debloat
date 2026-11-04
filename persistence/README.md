@@ -1,111 +1,117 @@
-# Boot persistence via `AT-HUB.service` → `/opt/etc/parseinfo.sh`
+# Boot-persistent dropbear via `AT-HUB.service`, managed by systemd
 
-This directory holds an **example** replacement for the stock
-`/opt/etc/parseinfo.sh`, the one writable-storage script that a root,
-boot-enabled systemd service executes on this TV (Tizen 6.5, S95B/PontusM,
-build `T-PTMDEUC-1720.7`).
+This directory holds an **example** persistence design for the TV (Tizen 6.5,
+S95B/PontusM, build `T-PTMDEUC-1720.7`). **Nothing here is installed on the TV.**
+It is provided for review and a deliberate, reversible rollout.
 
-**Nothing here is installed on the TV.** The file is provided for review and a
-later, deliberate, reversible test.
+| File | Installs to | Purpose |
+|---|---|---|
+| `parseinfo.sh` | `/opt/etc/parseinfo.sh` | `#!/usr/bin/gawk -f` boot hook run by `AT-HUB.service` (root). Preserves the stock behaviour, then injects the unit below into `/run/systemd/system` and starts it. |
+| `dropbear.service` | `/opt/systemd/dropbear.service` | The actual dropbear unit. systemd (PID 1) owns spawning, respawn, cgroup and logging. |
 
-Background and evidence:
+Background and evidence: [`../docs/samsung-tv-secure-boot.md`](../docs/samsung-tv-secure-boot.md),
+[`../re/at-hub-persistence-analysis.md`](../re/at-hub-persistence-analysis.md),
+[`../re/dotnet-boot-persistence-analysis.md`](../re/dotnet-boot-persistence-analysis.md),
+[`../docs/samsung-tv-uep.md`](../docs/samsung-tv-uep.md).
 
-- [`../docs/samsung-tv-secure-boot.md`](../docs/samsung-tv-secure-boot.md) — boot
-  chain, secure boot, why `/opt` is the only useful writable surface (§6).
-- [`../re/at-hub-persistence-analysis.md`](../re/at-hub-persistence-analysis.md) —
-  full analysis: how systemd runs it, the UEP script-check internals, the ranked
-  candidate list, and the test plan.
-- [`../docs/samsung-tv-uep.md`](../docs/samsung-tv-uep.md) — UEP components.
+## Design
 
-## What the stock script does (and why the example keeps doing it)
+There is **no writable, non-volatile systemd unit path** on this box:
+`/etc/systemd/system` is on the read-only VDFS rootfs (`touch` → `EROFS`),
+`/run/systemd/system` is tmpfs, and `/opt` is not in systemd's `UnitPath`. So the
+*unit itself* cannot persist. What persists is:
 
-`/opt/etc/parseinfo.sh` is a 7-line `#!/bin/bash` script whose *entire* effect is:
-
-```sh
-echo "__${REPO}__${MODEL}" > /proc/target_version
+```
+/opt/etc/parseinfo.sh          (gawk boot hook, persistent)   -- runs every boot
+/opt/systemd/dropbear.service  (unit text, persistent)        -- copied into /run at boot
+        │
+        │  boot: cp unit -> /run/systemd/system, systemctl daemon-reload
+        │        systemctl restart dropbear.service
+        ▼
+     systemd (PID 1)  ── owns spawn / respawn / cgroup / logs
+        │
+        └─ dropbear.service  ExecStartPre: stage binary to /run, gen host key
+                             ExecStart:    /run/tv-sshd/dropbear … -p 22
 ```
 
-On this unit that yields `__TIZEN-TRUNK2022-PontusM-RELEASE_20260225.1__T-PTMDEUC`.
-A bounded grep for consumers of `target_version` under `/usr/bin`, `/usr/sbin`
-and `/usr/apps` found none, so it is probably consumed off-device (OTA /
-registration / MICOM). Its criticality looks low — nothing `Requires=` AT-HUB and
-a failure does not stall boot — but it is an identity/version surface, so the
-example reproduces it **exactly** before doing anything else.
+Why it works (three independent properties):
 
-## What the example does
+1. **The hook file is interpreted, not executed as an ELF.** A `#!/bin/bash`
+   script on writable `/opt` trips *bash's* userspace `uep_verify()`;
+   `/usr/bin/gawk` has no such check, and gawk's `system()` runs `sh -c "<string>"`
+   (an inline string, **not a script file**) so no RW-script UEP check applies to
+   our logic either.
+2. **The injection path is permitted.** The TV already creates transient units at
+   runtime (Samsung's `tv-restart-sdbd.*`), and the systemd D-Bus policy has
+   `<policy user="root"><allow send_destination="org.freedesktop.systemd1"/>`
+   with no polkit. `/run/systemd/system` is `System::Run transmute=TRUE`, so a
+   unit written there is readable by PID 1.
+3. **The payload ELF is executed from `/run`, not `/opt`.** The same binary
+   exec'd from `/opt` (VDFS) returns `EPERM`; from `/run` (tmpfs) it runs. That is
+   UEP, not SMACK (our `User` shell holds `rwxat` on both labels).
 
-1. Writes the same `__<BUILD>__<MODEL>` to `/proc/target_version` (stock parity).
-2. Copies the unsigned dropbear from persistent `/opt` staging to `/run`, then
-   starts it from there (`/run` is the placement that is known to work — see
-   below), logging to `/run/tv-sshd/dropbear.log`.
-3. Stays resident forever, because `AT-HUB.service` uses the default
-   `KillMode=control-group`: if the `ExecStart` process exits, systemd kills the
-   cgroup and takes dropbear with it.
+## What was validated on-device (2026-11-04)
 
-It works because of two separate UEP properties:
+A live test (then torn down) wrote a unit to `/run/systemd/system`, ran
+`daemon-reload` + `start`, and confirmed:
 
-- **The hook file is interpreted, not executed as an ELF.** A `#!/bin/bash`
-  script on writable `/opt` trips *bash's* userspace `uep_verify()`. `/usr/bin/gawk`
-  has no such check, so `#!/usr/bin/gawk -f` runs. gawk's `system()` then runs
-  `sh -c "<string>"` — an inline string, **not a script file** — so no RW-script
-  UEP check applies to our logic either.
-- **The payload ELF is executed from `/run`, not `/opt`.** The same binary
-  executed from `/opt` (VDFS) returns `EPERM`; from `/run` (tmpfs, `System::Run`)
-  it runs. That difference is **UEP, not SMACK** — our shell (`User`) holds
-  `rwxat` on both the `User::App::Shared` (`/opt`) and `System::Run` (`/run`)
-  labels.
+- unit **loaded from `/run/systemd/system`** after `daemon-reload`;
+- running as **uid 0**, SMACK `System::Privileged`, in its **own cgroup**
+  `/system.slice/…`;
+- **logged in as root** on an alternate port via `ssh`;
+- **respawned by systemd** after `kill` of the main PID (`NRestarts=1`), port
+  re-bound;
+- `ExecStartPre`'s inline `sh -c` copy from `/opt` → `/run` ran with **no UEP
+  script denial**.
 
-## The open question
+That test also de-risks the earlier open question: a process **freshly spawned by
+PID 1** exec'd an unsigned ELF **from `/run`** with no UEP block — i.e. the
+boot-time context behaves the same as the interactive one. Exec from `/opt`
+(VDFS) remains the known-blocked case.
 
-`docs/`/`re/` established that `samsung-tv-root` does **not** disable UEP (its
-UEP toggle is the separate, build-gated `qn90b uep disable` command, refused on
-this build; the root flows never call it). So the running dropbear is unsigned
-*yet* executes — because it is placed where UEP permits execution, not because
-UEP is off.
+## Install (when you decide to)
 
-What is **not** yet proven: whether that placement rule still holds for a process
-started fresh from PID 1 by systemd (as this hook would be), versus a process in
-the root toolkit's own tree. The evidence (UEP appears to key on the path/label,
-`SecureZoneContext` / `zone_verify_uep_level`) suggests it should, but the one
-decisive experiment below settles it.
-
-## If/when you want to test (reversible, one reboot)
-
-Not run — provided for a later, explicit decision.
+Not run yet. Back up the stock hook first.
 
 ```sh
-# 0. Snapshot the pristine file (persistent backup on /opt + keep it out-of-band)
-sha256sum /opt/etc/parseinfo.sh          # expect c6369e7dec69408e176daa252d436acf6f8e265f560504d8bd831c8023c71d61
+# 0. Snapshot the pristine hook (persistent backup on /opt + off-box copy)
+sha256sum /opt/etc/parseinfo.sh     # expect c6369e7dec69408e176daa252d436acf6f8e265f560504d8bd831c8023c71d61
 cp -p /opt/etc/parseinfo.sh /opt/etc/parseinfo.sh.orig
-ssh root@192.0.2.10 'cat /opt/etc/parseinfo.sh' > parseinfo.sh.orig   # off-box copy
+ssh root@192.0.2.10 'cat /opt/etc/parseinfo.sh' > parseinfo.sh.orig
 
-# 1. Install the example (edit-in-place keeps the file's SMACK label)
-cat persistence/parseinfo.sh > /opt/etc/parseinfo.sh    # (pushed over scp/sdb)
+# 1. Install the unit template and the hook (edit-in-place keeps the file's label)
+mkdir -p /opt/systemd
+cp dropbear.service  /opt/systemd/dropbear.service
+cat parseinfo.sh   > /opt/etc/parseinfo.sh        # (push over scp/sdb)
 
 # 2. Reboot, then observe
-cat /proc/target_version                 # expect the same stock value
-cat /opt/at-hub-boot.log                 # did gawk run? did dropbear start?
-cat /run/tv-sshd/dropbear.log
+cat /proc/target_version                 # same stock value
+cat /opt/at-hub-boot.log                 # gawk ran; stage/reload/start rcs
+systemctl status dropbear.service        # active (running), own cgroup
 netstat -tln | grep ':22 '
-ps -Z | grep -E 'gawk|dropbear'
-dmesg | grep -iE 'SfdUep|uep|Blocked'    # any UEP denial?
+ssh root@192.0.2.10                    # login as root
 
-# 3. Rollback if needed (no reboot required if a shell is still reachable)
+# 3. Rollback
 cp -p /opt/etc/parseinfo.sh.orig /opt/etc/parseinfo.sh && sync
-systemctl restart AT-HUB.service         # optional, to observe faster
+systemctl stop dropbear.service
+rm -f /run/systemd/system/dropbear.service /opt/systemd/dropbear.service
+systemctl daemon-reload
 ```
-
-If dropbear fails to start at boot but works from an interactive root shell, the
-difference is the boot-process UEP state, and the fallback is a `.NET`-IL
-boot hook (`../re/dotnet-boot-persistence-analysis.md`) or a startup-slot TPK.
 
 ## Caveats
 
-- Keep `authorized_keys` present at `/opt/tv-sshd/authorized_keys` (mode 0600) —
-  dropbear uses `-D /opt/tv-sshd`.
-- The dropbear binary must exist at the staging path
-  `/home/owner/share/tmp/sdk_tools/dropbear` (see [`../dropbear/`](../dropbear/)).
-- `KillMode=control-group` means any restart of `AT-HUB.service` also restarts
-  dropbear; the keep-alive loop is intentional.
-- This hook runs **before** most of the stack (it is `WantedBy=starter.target`);
-  keep it fast and dependency-free.
+- **Port collision:** if the interactive launcher
+  ([`../dropbear/tv-start-sshd.sh`](../dropbear/tv-start-sshd.sh)) is also running
+  a dropbear on 22, this unit won't bind and will retry forever
+  (`StartLimitIntervalSec=0`). Pick one: use the unit, or the manual launcher.
+- **`authorized_keys`** must exist at `/opt/tv-sshd/authorized_keys` (mode 0600);
+  the unit uses `-D /opt/tv-sshd`. The unit's `ExecStartPre` generates the host
+  key if missing but does not create `authorized_keys`.
+- **The binary source path** is hard-coded to the staging location
+  `/home/owner/share/tmp/sdk_tools/dropbear`; adjust if you relocate it.
+- A systemd-managed dropbear runs as SMACK `System::Privileged` (vs `User` for the
+  interactive launcher) — more privileged label-wise, still uid 0 either way.
+- Everything under `/run` (the unit, the staged binary) is recreated each boot by
+  the hook; nothing in this design writes to the signed rootfs or to `/opt`
+  systemd paths.
+```

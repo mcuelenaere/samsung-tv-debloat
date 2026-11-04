@@ -1,0 +1,32 @@
+# Example dropbear unit — install as /opt/systemd/dropbear.service
+#
+# This file is NOT enabled the normal way (the config dir /etc/systemd/system is
+# on the read-only VDFS rootfs, and /opt is not in systemd's UnitPath). Instead,
+# the gawk boot hook (./parseinfo.sh) copies it into /run/systemd/system at each
+# boot and runs `systemctl daemon-reload && systemctl restart dropbear.service`.
+#
+# Tested on-device 2026-11-04 (S95B / T-PTMDEUC-1720.7): unit loaded from
+# /run/systemd/system, started as uid 0 / SMACK System::Privileged in its own
+# cgroup, logged in as root, and respawned by systemd after a kill.
+
+[Unit]
+Description=Dropbear SSH server
+After=network.target
+# Unlimited respawns. In systemd 244 these are [Unit] settings.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Stage the (unsigned) dropbear multi-call binary onto tmpfs and prepare the host
+# key. Executed by /bin/sh -c as an INLINE command string (not a script file), so
+# bash's RW-script UEP check never fires. The binary is then exec'd from /run
+# (tmpfs), the placement UEP permits; exec from /opt (VDFS) returns EPERM.
+ExecStartPre=/bin/sh -c "mkdir -p /run/tv-sshd /opt/tv-sshd && cp -f /home/owner/share/tmp/sdk_tools/dropbear /run/tv-sshd/dropbearmulti && chmod 755 /run/tv-sshd/dropbearmulti && ln -sf /run/tv-sshd/dropbearmulti /run/tv-sshd/dropbear && ln -sf /run/tv-sshd/dropbearmulti /run/tv-sshd/dropbearkey && { [ -s /opt/tv-sshd/dropbear_ed25519_host_key ] || /run/tv-sshd/dropbearkey -t ed25519 -f /opt/tv-sshd/dropbear_ed25519_host_key; } && chmod 600 /opt/tv-sshd/dropbear_ed25519_host_key"
+ExecStart=/run/tv-sshd/dropbear -F -E -D /opt/tv-sshd -r /opt/tv-sshd/dropbear_ed25519_host_key -s -p 22
+Restart=always
+RestartSec=2
+
+[Install]
+# Inert here: the unit is started by the boot hook, never "enabled" (which would
+# need a writable /etc/systemd/system/*.wants). Kept for documentation.
+WantedBy=multi-user.target
