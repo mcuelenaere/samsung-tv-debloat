@@ -3,7 +3,8 @@
 # This file is NOT enabled the normal way (the config dir /etc/systemd/system is
 # on the read-only VDFS rootfs, and /opt is not in systemd's UnitPath). Instead,
 # the gawk boot hook (./parseinfo.sh) copies it into /run/systemd/system at each
-# boot and runs `systemctl daemon-reload && systemctl restart dropbear.service`.
+# boot and runs `systemctl restart dropbear.service`; systemd loads the new unit
+# on demand over D-Bus, so no full `daemon-reload` is needed.
 #
 # Tested on-device 2026-11-04 (S95B / T-PTMDEUC-1720.7): unit loaded from
 # /run/systemd/system, started as uid 0 / SMACK System::Privileged in its own

@@ -13,9 +13,10 @@
 #   1. Reproduces the stock behaviour exactly (writes __<BUILD>__<MODEL> to
 #      /proc/target_version) so nothing downstream notices the swap.
 #   2. Injects ./dropbear.service into the runtime systemd unit path
-#      (/run/systemd/system), then `daemon-reload` + `restart`. systemd (PID 1)
-#      then owns dropbear: spawning, respawn (Restart=always), its own cgroup,
-#      and logging. The hook itself can exit (no keep-alive needed).
+#      (/run/systemd/system) and starts it. systemd resolves the *new* unit on
+#      demand over D-Bus (`StartUnit`/`LoadUnit`), so NO full `daemon-reload` is
+#      needed. systemd (PID 1) then owns dropbear: spawning, respawn
+#      (Restart=always), its own cgroup, and logging. The hook can just exit.
 #
 # WHY GAWK (not bash, not a binary)
 #   * systemd execs this file directly; the kernel #! handler runs the
@@ -30,9 +31,10 @@
 # WHY THIS UNIT/SYSTEMD APPROACH IS FEASIBLE (validated on-device 2026-11-04)
 #   * The TV already creates transient units at runtime (Samsung's
 #     tv-restart-sdbd.*), and the systemd D-Bus policy lets uid 0 do anything
-#     (no polkit). A live test wrote a unit to /run/systemd/system, did
-#     `daemon-reload` + `start`, logged in on an alternate port as uid 0, and
-#     confirmed systemd respawned it after kill. See ./README.md.
+#     (no polkit). A live test wrote a unit to /run/systemd/system, started it,
+#     logged in on an alternate port as uid 0, and confirmed systemd respawned
+#     it after kill. A second test confirmed that `LoadUnit`/`StartUnit` load a
+#     freshly-written unit WITHOUT a full `daemon-reload`. See ./README.md.
 #
 # NOTE the payload is still an unsigned ELF, so the unit's ExecStart execs it
 # from /run (tmpfs) — the placement UEP permits; /opt (VDFS) exec returns EPERM.
@@ -77,10 +79,20 @@ BEGIN {
     rc = system("/bin/cp -f /opt/systemd/dropbear.service /run/systemd/system/dropbear.service")
     system("echo '" ts " parseinfo(gawk): stage unit rc=" rc "' >> " LOG)
 
-    rc = system("/usr/bin/systemctl daemon-reload")
-    system("echo '" ts " parseinfo(gawk): daemon-reload rc=" rc "' >> " LOG)
-
+    # Load + start just this unit over D-Bus. For a *newly written* unit file
+    # systemd resolves it on demand (equivalent to Manager.LoadUnit), so the
+    # heavy `daemon-reload` is not required; that is only needed to re-read units
+    # which are already loaded. Verified on-device (systemd 244):
+    #   busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+    #     org.freedesktop.systemd1.Manager LoadUnit s dropbear.service   -> ok
+    #   systemctl restart <brand-new unit>                               -> rc=0
     rc = system("/usr/bin/systemctl restart dropbear.service")
+    if (rc != 0) {
+        # Fallback for any systemd build that does not resolve it on demand.
+        system("echo '" ts " parseinfo(gawk): on-demand load failed (rc=" rc "); daemon-reload fallback' >> " LOG)
+        system("/usr/bin/systemctl daemon-reload")
+        rc = system("/usr/bin/systemctl restart dropbear.service")
+    }
     system("echo '" ts " parseinfo(gawk): start dropbear rc=" rc "' >> " LOG)
 
     # ── (3) DONE ─────────────────────────────────────────────────────────────

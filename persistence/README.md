@@ -1,8 +1,8 @@
 # Boot-persistent dropbear via `AT-HUB.service`, managed by systemd
 
-This directory holds an **example** persistence design for the TV (Tizen 6.5,
-S95B/PontusM, build `T-PTMDEUC-1720.7`). **Nothing here is installed on the TV.**
-It is provided for review and a deliberate, reversible rollout.
+This directory holds a persistence design for the TV (Tizen 6.5, S95B/PontusM,
+build `T-PTMDEUC-1720.7`). It was validated live on the target (see below) and is
+fully reversible — keep the stock-hook backup before rolling it out.
 
 | File | Installs to | Purpose |
 |---|---|---|
@@ -25,8 +25,8 @@ There is **no writable, non-volatile systemd unit path** on this box:
 /opt/etc/parseinfo.sh          (gawk boot hook, persistent)   -- runs every boot
 /opt/systemd/dropbear.service  (unit text, persistent)        -- copied into /run at boot
         │
-        │  boot: cp unit -> /run/systemd/system, systemctl daemon-reload
-        │        systemctl restart dropbear.service
+        │  boot: cp unit -> /run/systemd/system
+        │        systemctl restart dropbear.service   (loads the new unit on demand)
         ▼
      systemd (PID 1)  ── owns spawn / respawn / cgroup / logs
         │
@@ -49,13 +49,21 @@ Why it works (three independent properties):
 3. **The payload ELF is executed from `/run`, not `/opt`.** The same binary
    exec'd from `/opt` (VDFS) returns `EPERM`; from `/run` (tmpfs) it runs. That is
    UEP, not SMACK (our `User` shell holds `rwxat` on both labels).
+4. **A new unit file is loaded on demand — no full reload.** systemd resolves a
+   not-yet-loaded unit by name (`Manager.LoadUnit`), which `StartUnit` /
+   `systemctl restart` also do implicitly. So writing the file and calling
+   `systemctl restart dropbear.service` is enough; `daemon-reload` is only needed
+   to re-read units that are *already loaded* (and to re-run generators /
+   re-scan enablement). Verified on-device: `systemctl restart <brand-new unit>`
+   → `rc=0`, and `busctl call … LoadUnit s <unit>` returned its object path.
 
 ## What was validated on-device (2026-11-04)
 
-A live test (then torn down) wrote a unit to `/run/systemd/system`, ran
-`daemon-reload` + `start`, and confirmed:
+A live test wrote a unit to `/run/systemd/system`, started it, and confirmed:
 
-- unit **loaded from `/run/systemd/system`** after `daemon-reload`;
+- unit **loaded from `/run/systemd/system`**;
+- a freshly-written unit was loaded **without `daemon-reload`** (both
+  `busctl … LoadUnit` and plain `systemctl start`/`restart` worked);
 - running as **uid 0**, SMACK `System::Privileged`, in its **own cgroup**
   `/system.slice/…`;
 - **logged in as root** on an alternate port via `ssh`;
@@ -86,7 +94,7 @@ cat parseinfo.sh   > /opt/etc/parseinfo.sh        # (push over scp/sdb)
 
 # 2. Reboot, then observe
 cat /proc/target_version                 # same stock value
-cat /opt/at-hub-boot.log                 # gawk ran; stage/reload/start rcs
+cat /opt/at-hub-boot.log                 # gawk ran; stage/start rcs
 systemctl status dropbear.service        # active (running), own cgroup
 netstat -tln | grep ':22 '
 ssh root@192.0.2.10                    # login as root
