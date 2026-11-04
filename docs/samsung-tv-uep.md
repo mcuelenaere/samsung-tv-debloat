@@ -1,7 +1,8 @@
 # Samsung UEP on the TV — Setup & Capabilities
 
 *Target: `root@192.0.2.10` · Tizen 6.5.0 · build `T-PTMDEUC-REL-202602250226`
-(QE55S95BATXXH / S95B, PontusM) · investigated 2026-11-04 (read-only).*
+(QE55S95BATXXH / S95B, PontusM) · investigated 2026-11-04 (read-only); UEP gate
+re-derived and tested 2026-11-05.*
 
 This note documents **UEP** ("Unsigned Execution Prevention" / Samsung *kUEP*) as
 it is actually deployed on this TV: the kernel module, the userspace verification
@@ -33,8 +34,8 @@ cooperating pieces:
 The gate is therefore **volatile by design** (a reboot restores it), and the only
 *authorized* way to clear it is a Samsung-signed USB certificate. The community
 root toolkit works around this by flipping the same gate word in RAM through a
-kernel-memory primitive — but on **this** exact build that path is deliberately
-refused (see §8).
+kernel-memory primitive. On **this** exact build that word was re-derived from
+the live kernel and flipped successfully (see §8).
 
 ---
 
@@ -95,10 +96,10 @@ The naming that appears on the box:
 - It owns a single 32-bit **gate word**: `1` = UEP closed/on, `0` = open/off.
   Samsung's own handler `SfdUepPacketHandler` clears it (`1 → 0`) after accepting
   a valid device-specific UEP-disable certificate.
-- For this PontusM family the toolkit's RE places that word at **virtual
-  `0xc08c26c4` / physical `0x208c26c4`,** and describes the transition as a
-  compare-before-write (verify surrounding state, write, verify read-back).
-  See §8 for the caveat that applies to this exact build.
+- For this PontusM family the word is at **virtual `0xc08c26c4` / physical
+  `0x208c26c4`,** and the transition is a compare-before-write (verify
+  surrounding state, write, verify read-back). This was confirmed on this exact
+  build; see §8.
 
 Because the state lives only in RAM, any disable is **lost on reboot**, which is
 why every project in this space pairs "root" with "re-acquire after boot".
@@ -247,21 +248,39 @@ samsung-tv-root qn90b uep <tv> disable   # 1 -> 0, volatile
 It reads/writes the fixed physical address `0x208c26c4` through the FDET
 physical-memory primitive, and the transition is lost on reboot.
 
-**Important caveat for this exact TV.** The fixed UEP address is gated behind the
-toolkit's `require_tested()` check, which only passes on the *tested* QN90B build
-`T-PTMAKUC-REL-202310071804`. Our build
-`T-PTMDEUC-REL-202602250226` (S95B / PontusM) is only *compatible* — it is
-accepted for the FDET root route, but `uep disable` **fails closed** with
-*"…uses build-specific addresses and requires the tested builds …"*. In other
-words, on this unit the toolkit will not flip the gate until the address is
-re-verified for this build. (See `compatibility.py` next to
-`QN90B_REPRODUCTION.md` §UEP in the toolkit checkout.)
+**Resolved on this build (2026-11-05).** The earlier caveat was that the fixed
+address was gated behind the toolkit's `require_tested()` check, which only
+accepted `T-PTMAKUC-REL-202310071804`; our build was root-compatible but
+`uep disable` failed closed. The address is in fact unchanged:
 
-This is consistent with the general rule: **UEP disable is per-firmware RE**, not
-a portable primitive. Any future work here — including the `AT-HUB.service` →
-`/opt/etc/parseinfo.sh` boot-persistence lead noted in
-[`re/qn90b-core-daemons`](../re/qn90b-core-daemons/README.md) — must re-derive the
-gate address for `T-PTMDEUC-1720.7` before relying on it.
+- The active image is an uncompressed ARM `Image` in `mmcblk0p6` (u-boot uImage,
+  `Linux-5.4.77`). Its `linux_banner` string sits exactly at the start of
+  `Kernel rodata` (`0x206da000` per `/proc/iomem`), which fixes the mapping
+  virtual `0xc0008000` ↔ physical `0x20008000`.
+- `SfdUepPacketHandler` at `0xc0283048` clears the word with
+  `movw r3,#0x26c0; movt r3,#0xc08c; str r2,[r3,#4]` (`r2=0`), i.e. virtual
+  `0xc08c26c4` / physical `0x208c26c4`.
+- `SfdUepVerifyFileSignature` at `0xc0282088` reads the same word (`[base+4]`);
+  when it is `0` the function takes the skip-verification branch.
+- A read-only physical read through the already-staged `FdetProbe.dll`
+  (`rw 0x208c26c4 1`) observed `1`; `wwi 0x208c26c4 0 0x1 0x0` performed the
+  compare-before-write `1 -> 0`, and a readback observed `0` with the rest of
+  the 24-word neighbourhood unchanged.
+
+The toolkit now lists `T-PTMDEUC-REL-202602250226` in the QN90B
+`additional_tested_builds`, so `uep status` and `uep disable` work on this unit:
+
+```console
+samsung-tv-root qn90b uep status
+samsung-tv-root qn90b uep disable
+```
+
+The transition is still volatile: a reboot restores `1`, so it must be repeated
+each boot (the controller does this when `disable_native_execution_policy =
+true`). It opens unsigned **native ELF** execution only; the userspace script
+checks in `bash`/`node` are a separate path (§6). Other builds still need the
+same per-image check: **UEP disable is per-firmware RE**, not a portable
+primitive.
 
 ---
 
@@ -283,9 +302,9 @@ What it **cannot** see without a kernel-memory primitive:
 - The **module's symbols** (`/proc/kallsyms` absent; module built-in).
 - **Physical memory** at will (`/dev/mem` is not present).
 
-The gate value on this TV is therefore only readable via the toolkit's
-`qn90b uep status`, which on this build is refused (§8); otherwise it would need
-the same address re-derived.
+The gate value on this TV is therefore only readable through the FDET
+physical-memory primitive: via the toolkit's `qn90b uep status`, or directly as
+`FdetProbe.dll rw 0x208c26c4 1` (§8).
 
 ---
 
@@ -293,7 +312,8 @@ the same address re-derived.
 
 All facts above were gathered **read-only** over SSH (and by extracting
 `/usr/lib/libkUEPUser.so` and `/opt/etc/parseinfo.sh` for offline `strings`/`nm`
-analysis). No files were changed on the TV. Key sources:
+analysis). No files were changed on the TV; the only on-device state change was
+the volatile UEP gate write on 2026-11-05 (§8). Key sources:
 
 - On-TV: `/sys/module/uep/version`, `/proc/cmdline`, `/proc/version`, `/proc/devices`,
   `/proc/misc`, `/proc/self/zone`, `dmesg`, `ls -l /run`, `/etc/prd_info.ini`,
@@ -302,6 +322,9 @@ analysis). No files were changed on the TV. Key sources:
 - Binaries: `/usr/lib/libkUEPUser.so`, `/usr/bin/sfpmd`, `/usr/bin/bash`,
   `/usr/bin/node`, `/usr/bin/tzdaemon`, `/usr/bin/zone-template-launcher`,
   `/usr/bin/fw-update-service`, `/usr/bin/fw-usb-update-service`.
+- Kernel image: raw dump of `mmcblk0p6` (uncompressed ARM `Image`), disassembled
+  with Capstone; `SfdUepPacketHandler` and `SfdUepVerifyFileSignature` at the
+  addresses in §8.
 - Offline toolkit checkout: `~/Projects/personal/samsung-tv-root` —
   `docs/research-notes/EXPLOIT_CHAIN.md` §"UEP bypass",
   `docs/research-notes/QN90B_REPRODUCTION.md` §"UEP",
@@ -325,7 +348,8 @@ analysis). No files were changed on the TV. Key sources:
    (b) scripts, or split differently.
 3. The precise `_UepSigMeta` blob layout (header/type byte + signature) for the
    `##UEP…:UEP` script marker.
-4. The gate-word address for `T-PTMDEUC-1720.7` (needed if UEP disable is ever
-   wanted on this build).
+4. ~~The gate-word address for `T-PTMDEUC-1720.7` (needed if UEP disable is ever
+   wanted on this build).~~ **Resolved 2026-11-05:** the word is at physical
+   `0x208c26c4`, the same as the tested QN90B; see §8.
 5. Whether the patched `bash`/`node` `uep_verify` can be told to skip via vconf or
    an environment flag ("Disable Script UEP" string in `libkUEPUser.so`).

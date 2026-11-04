@@ -361,7 +361,9 @@ here:
 - `sfpmd` can clear the gate for one boot when it sees a Samsung-signed `VDUEPOFF.*`
   certificate on USB,
 - the gate is **RAM-only and lost on reboot**; the community flips it by kernel
-  memory write.
+  memory write. On build `T-PTMDEUC-REL-202602250226` the word is physical
+  `0x208c26c4`, verified from the `mmcblk0p6` image and flipped on-device
+  ([UEP notes](samsung-tv-uep.md) §8).
 
 **Key distinction for persistence:** UEP is a *file*-level check at `execve`/interp
 startup. It is **not** applied to (a) ELF code mapped and executed from memory
