@@ -21,12 +21,14 @@ The main components are:
 | Component | Proposed language | Purpose |
 |---|---|---|
 | `tv-authd` | **Rust** | Persistent root broker, caller identity, grants, prompts, shell execution |
-| Approval/manager UI | **Rust with minimal EFL FFI** | On-TV prompt and grant revocation, running without root |
+| Approval/manager UI | **Managed C#/.NET with minimal EFL P/Invoke** | On-TV prompt and grant revocation, running without root |
 | Vetro adapter | **JavaScript in Vetro's existing Node process** | Replace root-agent transport with direct Unix-socket calls |
 | Wire protocol | Newline-delimited JSON over a Unix stream socket | Easy interoperation between Rust and Node |
 | Boot integration | Existing gawk hook plus a systemd unit | Start and restart the daemon independently of Vetro/SDB |
 
-Rust is a good fit for both new executables: memory safety is especially valuable in the privileged daemon, and a small safe wrapper can isolate the UI's unavoidable EFL FFI. Keep the dependency set small and do not use async runtimes. The root daemon targets static musl; the UI links the TV's glibc/EFL libraries. The UI spike must validate the small amount of unsafe lifecycle/callback glue rather than assume that a ready-made EFL crate fits this firmware.
+Rust remains the choice for the privileged daemon: it can be built as a static ARMv7 binary and run from `/run` with systemd, as validated on the target.
+
+The approval UI cannot use a custom native ELF packaged in `/opt/usr/apps`: UEP prevents launchpad from executing unsigned native binaries from writable app storage, even when the TPK itself has valid author/distributor signatures. The UI must therefore be a managed Tizen .NET application (`netcoreapp3.1`, `type="dotnet"`), which runs through Samsung's signed apphost. Its small C# layer calls the required EFL functions directly; this path was installed, launched, and displayed above YouTube on the target.
 
 ## 2. Goals and non-goals
 
@@ -95,7 +97,7 @@ Source: [polkit architecture](https://www.freedesktop.org/software/polkit/docs/0
                        │ fixed AUL launch
                        ▼
               ┌──────────────────┐
-              │  tv-auth-ui      │  UID 5001, native EFL, not root
+              │  tv-auth-ui      │  UID 5001, managed .NET/EFL, not root
               │  approval prompt │
               │  grant manager   │
               └────────┬─────────┘
@@ -121,7 +123,7 @@ Use newline-delimited JSON (NDJSON): each compact JSON object is followed by `\n
 
 A length prefix would also work, but is unnecessary here. `SOCK_STREAM` does not preserve message boundaries, even when using `sendmsg()`/`recvmsg()`; those APIs add scatter/gather I/O and ancillary data such as file descriptors or credentials, not record framing.
 
-Linux also has `SOCK_SEQPACKET` and `SOCK_DGRAM`, which do preserve message boundaries. They are a poor fit for this project because Node's built-in Unix-socket support is stream-only. Using them would require a native Node add-on, a helper process, or separate transports for Vetro and the Rust UI. NDJSON over one stream socket is simpler, remains easy to inspect with ordinary socket tools, and works with Node's standard library.
+Linux also has `SOCK_SEQPACKET` and `SOCK_DGRAM`, which do preserve message boundaries. They are a poor fit for this project because Node's built-in Unix-socket support is stream-only. Using them would require a native Node add-on, a helper process, or separate transports for Vetro and the UI. NDJSON over one stream socket is simpler, remains easy to inspect with ordinary socket tools, and works with Node's standard library.
 
 The version-1 request API needs only:
 
@@ -205,13 +207,7 @@ The label must be an installed package-specific `User::Pkg::<pkgid>` label. UID 
 
 The MVP grant key is the exact SMACK package label, relying on Tizen's package manager and security-manager to maintain package identity. Revalidate that the package is still installed. Test same-package upgrades, uninstall/reinstall, and different-signer replacement before relying on persistent grants. If security-manager exposes a signing-author label through a straightforward trusted query, record and compare it as an additional check; do not build a certificate-management subsystem.
 
-An early spike must verify that `SO_PEERSEC` returns the expected package label for:
-
-1. two different sideloaded applications sharing UID 5001;
-2. Vetro's actual service process;
-3. the approval UI.
-
-Missing or unexpected labels fail closed.
+The M0 spike verified `SO_PEERSEC` on the TV for two separately installed UID-5001 managed applications: the server observed `User::Pkg::org.tvauth.spike.peerone` and `User::Pkg::org.tvauth.spike.peertwo`. The same check must be repeated for Vetro's actual service process and the final approval UI. Missing or unexpected labels fail closed.
 
 ### Stored decisions
 
@@ -246,31 +242,45 @@ If an app chooses “Always allow” on its first request, later commands run wi
 
 ## 7. Approval UI
 
-Write a small native **Rust** application using EFL through a deliberately small FFI module. Do not put Wayland/EFL code in the root daemon and do not run the UI as root.
+Write the approval UI as a small **managed Tizen .NET application** (`.NET Core 3.1`, `type="dotnet"` in the TPK manifest). Do not put Wayland/EFL code in the root daemon and do not run the UI as root.
 
-Rust does not require a complete safe EFL binding. Declare only the needed Tizen app-lifecycle, Ecore/Elementary, notification-level, key-grab, and window functions, then isolate `unsafe` code and C string/callback handling in one `efl` module with a small safe interface for the rest of the UI. This is preferable to scattering raw FFI throughout the application. The spike must verify ABI layouts and callback/lifecycle behavior on the TV.
+### Why the native ELF path was rejected
 
-The existing [`efl` crate](https://crates.io/crates/efl) is not currently a good shortcut: its README requires EFL >= 1.26 and libclang, while this TV has EFL 1.25.1. Hand-writing the few declarations avoids both the version mismatch and a large bindgen/libclang build dependency. C remains a fallback only if the Rust lifecycle/FFI spike reveals a concrete platform blocker; C is not inherently the safer UI language.
+The first UI spike was a Rust executable cross-linked against the TV's soft-float EFL libraries. The TPK installed successfully, but launchpad never mapped the executable: only `launchpad-loader` appeared in the process maps and the app entry point never ran. UEP blocks unsigned native ELF execution from writable app storage even when the TPK has valid author and distributor signatures.
 
-Build the UI for `armv7-unknown-linux-gnueabihf`, because it must dynamically link the TV's glibc-based EFL stack. This differs intentionally from the root daemon's static musl target. The UI remains installed under its Tizen package directory in `/opt/usr/apps`; it is not copied to `/run`.
+System native apps work because they live on the read-only rootfs. A custom native approval app would therefore require UEP signing/bypass or a root-staged read-only-view workaround, neither of which is acceptable for the normal installed UI. The Rust UI source remains as negative-path evidence; it is not the production direction.
 
-The live TV provides a useful precedent: Samsung's `libsyspopup` uses an EFL/Wayland notification window, `efl_util_set_notification_window_level`, and key grabbing. Root launchers also start ordinary UID-5001 UI apps through `app_launcher`.
+### Validated managed path
+
+A managed .NET assembly has no custom native ELF. Tizen's signed `dotnet-launcher` loads it while UEP remains enforced. On the target, the managed UI package:
+
+- installed as a normal signed TPK;
+- launched through `app_launcher`;
+- ran as `User::Pkg::org.tvauth.spike.popupdotnet`, UID 5001;
+- loaded Elementary, EFL extension, and `capi-ui-efl-util`;
+- set the Wayland surface type to notification;
+- reported `notification level TOP accepted`;
+- displayed above YouTube;
+- dismissed cleanly with OK/RETURN.
+
+The C# layer uses direct P/Invoke for the Tizen app lifecycle, Elm/Evas widgets, `efl_util_set_notification_window_level`, and Eext key grabbing. This is a small platform binding, not a dependency on a large UI framework.
 
 The UI should:
 
 1. be launched by the daemon through a fixed AUL/`app_launcher` command;
-2. create a notification-type EFL window at the highest usable notification level;
-3. grab only the remote keys needed for navigation and confirmation;
-4. connect to `broker.sock` and register with `ui.hello`;
-5. display the daemon-resolved app name and full-root warning;
-6. return a decision with the pending request ID and prompt nonce;
-7. exit when idle, or remain open when the user is managing grants.
+2. create a notification-type EFL/Wayland window at the highest usable notification level;
+3. set the underlying surface type to notification before showing it;
+4. grab only the remote keys needed for navigation and confirmation;
+5. connect to `broker.sock` and register with `ui.hello`;
+6. display the daemon-resolved app name and full-root warning;
+7. return a decision with the pending request ID and prompt nonce;
+8. exit when idle, or remain open when the user is managing grants.
 
 Initially, call the EFL notification mechanisms directly. Do not modify `/opt/dbspace/.syspopup.db` or depend on Samsung's alert-syspopup package.
 
 Fallback if notification priority/key-grab fails for a developer-signed app:
 
-1. try a normal full-screen EFL app;
+1. try a normal full-screen .NET/EFL app;
 2. if necessary, require the user to open the manager manually to review pending requests.
 
 The UI is a **best-effort consent interface**, not yet a proven secure-attention path. Notification level and key grab do not prove that another app cannot imitate or obscure the prompt. Test spoofing, occlusion, focus loss, held/repeated keys, and compositor restart. Failure or ambiguity always denies.
@@ -322,25 +332,26 @@ The live TV currently has `/opt/systemd` labeled `User` and mode `0777`, and the
 
 Before presenting `tv-authd` as a security feature, place its unit, binary, and grants in the root-only layout above. Harden Dropbear's boot inputs as well; otherwise an unprivileged app can bypass the broker by altering a future root boot payload.
 
-## 10. Rust implementation and binary-size guidance
+## 10. Implementation and binary-size guidance
+
+### Rust daemon
 
 A reasonable baseline is:
 
 - `serde` and `serde_json` for protocol/grants;
-- `libc` for Unix credentials, process-group operations, and the UI's EFL declarations.
+- `libc` for Unix credentials and process-group operations.
 
-This is not a prohibition on other useful crates. Prefer small, focused, maintained dependencies and use them where they avoid reinventing nontrivial code. For example, `getrandom`, `nix`/`rustix`, `time`, or `clap` are all reasonable if the implementation actually needs them. Check transitive dependencies, enabled features, and measured artifact impact rather than optimizing dependency count at the expense of correctness. In particular, do not hand-roll unsafe syscall or random-number code merely to save a few KiB.
+This is not a prohibition on other useful crates. Prefer small, focused, maintained dependencies and use them where they avoid reinventing nontrivial code. `getrandom`, `nix`/`rustix`, `time`, or `clap` are reasonable if actually needed. Check transitive dependencies, enabled features, and measured artifact impact rather than optimizing dependency count at the expense of correctness. Do not hand-roll unsafe syscall or random-number code merely to save a few KiB.
 
-Avoid large frameworks and infrastructure that solve problems this project does not have: no Tokio/other async runtime, web framework, ORM/database engine, or TLS stack. Use a small blocking design with bounded worker threads, sufficient for a handful of local clients. Keep protocol framing, identity, grants, prompting, execution, and EFL FFI in separate modules, but do not create a plugin architecture.
+Avoid large frameworks and infrastructure that solve problems this project does not have: no Tokio/other async runtime, web framework, ORM/database engine, or TLS stack. Use a small blocking design with bounded worker threads. Keep protocol framing, identity, grants, prompting, and execution in separate modules, but do not create a plugin architecture.
 
-Build targets:
+Build target:
 
 ```text
-tv-authd:  armv7-unknown-linux-musleabihf   (static, copied to /run)
-tv-auth-ui: armv7-unknown-linux-gnueabihf   (dynamic glibc/EFL, stays in app package)
+tv-authd: armv7-unknown-linux-musleabihf   (static, copied to /run)
 ```
 
-Use the existing Docker/QEMU approach as a model. Start with a size-conscious release profile and measure the actual artifacts rather than adding extreme size optimizations blindly:
+Start with a size-conscious release profile and measure the actual artifact:
 
 ```toml
 [profile.release]
@@ -352,7 +363,17 @@ strip = "symbols"
 debug = 0
 ```
 
-Only the root executable must be copied into RAM-backed `/run`, so that artifact gets the strictest size scrutiny. Track stripped binary size and runtime RSS in the validation notes. The first build spike must prove that both the static Rust ARMv7 daemon test binary and the glibc/EFL Rust UI test binary run on this exact TV.
+Only the root executable must be copied into RAM-backed `/run`, so that artifact gets the strictest size scrutiny. Track stripped binary size and runtime RSS in validation notes.
+
+### Managed UI
+
+The UI is a `netcoreapp3.1` managed assembly packaged as a Tizen `dotnet` application. It requires no custom ARM ELF and therefore bypasses the UEP wall while still running as UID 5001 with a package-specific SMACK label. Keep native calls in one small interop class and keep UI/protocol logic managed. Measure the DLL and signed TPK size, process RSS, and launch time.
+
+### Validated M0 evidence
+
+- static ARMv7 Rust hello: runs directly and under a transient systemd unit from `/run`;
+- .NET peer probes: two package processes expose distinct `User::Pkg::*` labels over `SO_PEERSEC`;
+- managed .NET UI: installs, launches from AUL, sets notification TOP, appears over YouTube, and dismisses with OK/RETURN.
 
 ## 11. Vetro integration
 
@@ -398,9 +419,9 @@ Freeze the small wire protocol and package/label names before parallel implement
 
 | Workstream | Ownership | Deliverable |
 |---|---|---|
-| A. Platform spikes | `root-broker/docs/spikes/` and small test programs | Rust ARMv7 execution, `SO_PEERSEC`, EFL popup evidence |
+| A. Platform spikes | `root-broker/spikes/` and small test programs | Rust ARMv7 execution, `SO_PEERSEC`, EFL popup evidence |
 | B. Daemon | `root-broker/daemon/` | Rust broker, protocol, grants, execution, unit tests |
-| C. Approval UI | `root-broker/ui/` | Rust prompt/grant manager with isolated EFL FFI |
+| C. Approval UI | `root-broker/ui/` | Managed .NET prompt/grant manager with isolated EFL P/Invoke |
 | D. Vetro adapter | Separate Vetro worktree only | Same-process, dependency-free Unix-socket implementation behind `platform.execute()` |
 | E. Persistence/build | `root-broker/systemd/`, `root-broker/build/`, minimal `persistence/` edits | Reproducible ARMv7 build and boot integration |
 | F. End-to-end tests | `root-broker/tests/` | Multi-app, failure, reboot, and Vetro acceptance tests |
@@ -409,13 +430,13 @@ Avoid having multiple agents edit the protocol definition or the same persistenc
 
 ## 13. Milestones and acceptance tests
 
-### M0 — Three small spikes
+### M0 — Three small spikes (validated 2026-11-04/05)
 
-1. Execute a static Rust ARMv7 “hello” binary from `/run` under systemd, and record its stripped size.
-2. Distinguish two same-UID test apps with `SO_PEERSEC`.
-3. Display and dismiss a harmless Rust/EFL prompt launched through AUL, and record its stripped size.
+1. **Passed:** a static Rust ARMv7 hello ran directly and under a transient systemd unit from `/run`; stripped size 323,652 bytes.
+2. **Passed:** two separately packaged managed apps connected from UID 5001 and the server observed `User::Pkg::org.tvauth.spike.peerone` and `User::Pkg::org.tvauth.spike.peertwo` over `SO_PEERSEC`.
+3. **Passed with managed .NET:** the native Rust/EFL UI cross-linked and installed but UEP prevented launchpad from executing its ELF. A managed `.NET`/EFL app installed, launched through AUL, set notification TOP, appeared over YouTube, and dismissed with OK/RETURN.
 
-Do not start the full implementation if any of these fails; solve the platform issue first.
+The native-UI failure is why the design now uses managed .NET for the approval UI. Root daemon execution from `/run` remains native Rust.
 
 ### M1 — Headless broker
 
@@ -459,6 +480,7 @@ Do not start the full implementation if any of these fails; solve the platform i
 - No D-Bus service/policy integration.
 - No Tokio, SQLite, dynamic providers, or certificate-management subsystem in the MVP.
 - No root Wayland client and no root UI.
+- No custom native ELF for the approval UI; use a managed .NET TPK to stay compatible with UEP.
 - No need to port Vetro feature modules; replace only its transport adapter.
 
 This should provide the requested safety—users know which app receives root and can revoke it—without turning the project into a general-purpose authorization framework.
@@ -472,4 +494,11 @@ Treat the spike results and integration measurements as inputs to this document,
 - reconcile the wire protocol, workstream ownership, and acceptance tests with what was actually built;
 - link the relevant validation logs/source instead of claiming unverified behavior.
 
-Until then, all proposed constants, paths, ABI declarations, and fallback choices remain subject to validation.
+M0 was completed on 2026-11-04/05. The plan now reflects the observed soft-float EFL ABI, successful `SO_PEERSEC` package labels, native-ELF UEP rejection, and the validated managed .NET notification popup. Raw evidence and build commands live in:
+
+- `root-broker/spikes/armv7-hello/`
+- `root-broker/spikes/peer-identity/`
+- `root-broker/spikes/efl-popup/`
+- `root-broker/sysroot/`
+
+Future milestones should continue updating this document rather than preserving superseded assumptions.

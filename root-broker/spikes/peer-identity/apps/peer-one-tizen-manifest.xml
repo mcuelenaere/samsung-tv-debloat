@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://tizen.org/ns/packages" package="org.tvauth.spike.peerone" version="0.1.3" api-version="6.5">
+  <profile name="tv"/>
+  <ui-application appid="org.tvauth.spike.peerone" exec="peer-client-app" type="capp" multiple="false" taskmanage="false" nodisplay="false" launch_mode="single">
+    <label>tv-auth peer probe one</label>
+    <icon>org.tvauth.spike.peerone.png</icon>
+  </ui-application>
+</manifest>

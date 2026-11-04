@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://tizen.org/ns/packages"
+          package="org.tvauth.spike.popup"
+          version="0.1.0"
+          api-version="6.5">
+  <profile name="tv"/>
+  <ui-application appid="org.tvauth.spike.popup"
+                  exec="efl-popup"
+                  type="capp"
+                  multiple="false"
+                  taskmanage="false"
+                  nodisplay="true"
+                  launch_mode="single">
+    <label>Harmless EFL popup spike</label>
+  </ui-application>
+  <privileges>
+    <privilege>http://tizen.org/privilege/window.priority.set</privilege>
+  </privileges>
+</manifest>

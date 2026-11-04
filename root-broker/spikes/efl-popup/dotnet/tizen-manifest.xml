@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://tizen.org/ns/packages" package="org.tvauth.spike.popupdotnet" version="0.1.1" api-version="6.5">
+  <profile name="tv"/>
+  <ui-application appid="org.tvauth.spike.popupdotnet" exec="EflPopupDotnet.dll" type="dotnet" multiple="false" taskmanage="false" nodisplay="false" launch_mode="single">
+    <label>Harmless .NET EFL popup spike</label>
+    <icon>org.tvauth.spike.popupdotnet.png</icon>
+  </ui-application>
+  <privileges>
+    <privilege>http://tizen.org/privilege/window.priority.set</privilege>
+  </privileges>
+</manifest>

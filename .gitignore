@@ -1,1 +1,6 @@
 dropbear/out/
+root-broker/**/target/
+root-broker/**/out/
+root-broker/**/bin/
+root-broker/**/obj/
+root-broker/sysroot/tv-6.5/
