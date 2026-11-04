@@ -1,13 +1,13 @@
 #!/usr/bin/gawk -f
 # ─────────────────────────────────────────────────────────────────────────────
-# EXAMPLE drop-in replacement for /opt/etc/parseinfo.sh  (run by AT-HUB.service)
+# Drop-in replacement for /opt/etc/parseinfo.sh  (run by AT-HUB.service)
 #
 #   AT-HUB.service:
 #     ExecStart=/opt/etc/parseinfo.sh &      # no User=  -> root
 #     WantedBy=starter.target                # runs every boot
 #
-# ⚠  Review before installing, test it reversibly (see ./README.md), and keep a
-#    backup of the stock file (`/opt/etc/parseinfo.sh.orig`).
+# ⚠  Keep the stock backup (`/opt/etc/parseinfo.sh.orig`) so the change stays
+#    reversible. Install/rollback and validation: see ./README.md.
 #
 # WHAT IT DOES
 #   1. Reproduces the stock behaviour exactly (writes __<BUILD>__<MODEL> to

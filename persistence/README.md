@@ -81,10 +81,10 @@ boot-time context behaves the same as the interactive one. Exec from `/opt`
 
 ### Production run (installed on the target, 2026-11-04) — **working**
 
-The design is **installed and in service** on the TV:
-`/opt/etc/parseinfo.sh` (sha `c8d0e7b5…`) and `/opt/systemd/dropbear.service`,
-with the pristine hook kept at `/opt/etc/parseinfo.sh.orig` (sha `c6369e7d…`).
-Confirmed across multiple reboots:
+The design is **installed and in service** on the TV: `/opt/etc/parseinfo.sh` and
+`/opt/systemd/dropbear.service`, with the pristine stock hook kept at
+`/opt/etc/parseinfo.sh.orig` (see step 0 below for its checksum). Confirmed
+across multiple reboots:
 
 - `AT-HUB.service` ran the gawk hook at **~+17 s post-kernel**, exit status `0`;
 - the hook copied the unit into `/run/systemd/system` and
