@@ -4,8 +4,14 @@
 # (/opt/etc/parseinfo.sh) copies every *.service from /opt/tv-units into
 # /run/systemd/system and starts it. /opt/tv-units must be root-owned 0700.
 #
-# The executable source is now root-only (but still staged to /run because UEP
-# rejects direct execution from writable VDFS).
+# The executable lives on the signed /opt VDFS, where the kernel UEP gate rejects
+# unsigned ELFs. Rather than copy it into /run, this unit bind-mounts its
+# directory under /run for the service only (BindReadOnlyPaths=). /run is outside
+# UEP's checked prefixes (/opt:/tmp:/var:/home), so exec from the mount is not
+# verified. The mount lives in the service's private mount namespace and is torn
+# down when the service stops: no copy, nothing leaked to the host or other
+# units. Requires a *relative* multi-call symlink next to the binary:
+#   /opt/tv-sshd/bin/dropbearkey -> dropbear
 
 [Unit]
 Description=Dropbear SSH server
@@ -14,8 +20,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c "mkdir -p /run/tv-sshd /opt/tv-sshd && cp -f /opt/tv-sshd/bin/dropbear /run/tv-sshd/dropbearmulti && chmod 755 /run/tv-sshd/dropbearmulti && ln -sf /run/tv-sshd/dropbearmulti /run/tv-sshd/dropbear && ln -sf /run/tv-sshd/dropbearmulti /run/tv-sshd/dropbearkey && { [ -s /opt/tv-sshd/dropbear_ed25519_host_key ] || /run/tv-sshd/dropbearkey -t ed25519 -f /opt/tv-sshd/dropbear_ed25519_host_key; } && chmod 600 /opt/tv-sshd/dropbear_ed25519_host_key"
-ExecStart=/run/tv-sshd/dropbear -F -E -D /opt/tv-sshd -r /opt/tv-sshd/dropbear_ed25519_host_key -s -p 22
+BindReadOnlyPaths=/opt/tv-sshd:/run/opt/tv-sshd
+ExecStartPre=/bin/sh -c "{ [ -s /opt/tv-sshd/dropbear_ed25519_host_key ] || /run/opt/tv-sshd/bin/dropbearkey -t ed25519 -f /opt/tv-sshd/dropbear_ed25519_host_key; } && chmod 600 /opt/tv-sshd/dropbear_ed25519_host_key"
+ExecStart=/run/opt/tv-sshd/bin/dropbear -F -E -D /opt/tv-sshd -r /opt/tv-sshd/dropbear_ed25519_host_key -s -p 22
 Restart=always
 RestartSec=2
 

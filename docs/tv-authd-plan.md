@@ -365,8 +365,10 @@ Validated layout:
     authorized_keys
     dropbear_ed25519_host_key
 
+/run/opt/tv-auth/            per-service read-only bind mount of /opt/tv-auth
+    tv-authd
+
 /run/tv-auth/
-    tv-authd                 executable staged on tmpfs
     broker.sock
     tv-authd.log
 ```
@@ -380,8 +382,12 @@ stay bounded in `/run`; do not log command output by default.
 
 The previous app-writable `/opt/systemd` directory and the app-shared Dropbear
 staging binary were retired. `/opt/systemd` was removed; Dropbear now executes a
-root-only source at `/opt/tv-sshd/bin/dropbear`. This was validated across a cold
-boot. The stock behavior and old unit/hook were backed up before deployment.
+root-only source at `/opt/tv-sshd/bin/dropbear`. Payloads are exposed to each
+unit with a private read-only bind mount under `/run/opt/<service>`
+(`BindReadOnlyPaths=`) instead of being copied into `/run`; the mount is outside
+UEP's `/opt:/tmp:/var:/home` path scope, so exec is not signature-checked. This
+was validated across a cold boot. The stock behavior and old unit/hook were
+backed up before deployment.
 
 ## 10. Implementation and binary-size guidance
 

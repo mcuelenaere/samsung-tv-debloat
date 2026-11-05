@@ -22,6 +22,39 @@ PID 1-owned services (own cgroups, restart policy, logs)
 systemd search path. It is a **privileged extension point**: a unit placed there
 runs as root. It must remain root-owned, mode `0700`, and non-app-writable.
 
+Only the unit *text* is copied into `/run`. The **executables are not copied**;
+they stay on `/opt` and each unit exposes them under `/run/opt/<service>` with a
+private read-only bind mount. See the next section.
+
+## Executables: bind mount, not copy
+
+`/opt` is a writable VDFS mount, and the kernel **UEP** gate rejects execution of
+unsigned ELFs whose path falls under `/opt`, `/tmp`, `/var`, or `/home`. The check
+is **path-scoped** (built with `d_path()`), so the same file reached through a
+bind mount under `/run` — outside those prefixes — is not verified. See
+[`../docs/samsung-tv-uep.md`](../docs/samsung-tv-uep.md).
+
+So instead of copying the payload into `/run` at boot, each unit declares:
+
+```ini
+BindReadOnlyPaths=/opt/<service>:/run/opt/<service>
+ExecStart=/run/opt/<service>/<binary> …
+```
+
+systemd creates that bind mount inside the unit's **private mount namespace** and
+tears it down when the unit stops. Consequences:
+
+- Nothing is copied into `/run` for the executable, and nothing is ever written
+  to the signed rootfs.
+- The mount is invisible to the host and to other units (`findmnt` from a shell
+  will not show it); the service still shares the `/run` tmpfs for sockets/logs.
+- The source directory stays writable at its real `/opt` path — the broker still
+  rewrites its sibling `grants.json` — only the `/run/opt/...` view is read-only.
+- `BindReadOnlyPaths=` requires systemd ≥ 233 (this firmware is 244).
+- A multi-call helper symlink must be **relative** (e.g.
+  `/opt/tv-sshd/bin/dropbearkey -> dropbear`); an absolute symlink would resolve
+  back to `/opt/...` and be rejected again.
+
 ## Current deployment
 
 Deployed and live-tested on 2026-11-05:
@@ -37,11 +70,13 @@ Deployed and live-tested on 2026-11-05:
 | `/opt/tv-auth/grants.json` | `0600` | Exact package-label grants |
 | `/opt/tv-sshd/` | `0700`, root | SSH keys and root-only Dropbear source |
 | `/opt/tv-sshd/bin/dropbear` | `0755`, `System::Shared` | Root-only Dropbear source |
+| `/opt/tv-sshd/bin/dropbearkey` | symlink → `dropbear` | Multi-call keygen alias (relative) |
 
 The previous app-writable `/opt/systemd` directory was removed. The root-only
-Dropbear copy replaces `/home/owner/share/tmp/sdk_tools/dropbear` as the boot
-payload source, so an unprivileged app can no longer replace a binary that root
-executes at boot.
+Dropbear source at `/opt/tv-sshd/bin/dropbear` replaces
+`/home/owner/share/tmp/sdk_tools/dropbear`, so an unprivileged app can no longer
+replace a binary that root executes at boot. Each unit reaches it through a
+read-only bind mount under `/run/opt/<service>` rather than a copy.
 
 M2 also installs the managed `org.tvauth.ui` package. It connects directly to the
 broker as `User::Pkg::org.tvauth.ui`, is the only package allowed to use the UI
@@ -49,8 +84,9 @@ methods, and updates `/opt/tv-auth/grants.json` live for Always allow and revoke
 The unit source explicitly sets `XDG_RUNTIME_DIR=/run` and `HOME=/root` so the
 broker's fixed `app_launcher` call works from systemd.
 
-`/run/tv-auth/` is recreated each boot. It contains the staged executable,
-`broker.sock` (`0660 root:users`) and the bounded daemon log.
+`/run/tv-auth/` is recreated each boot. It contains `broker.sock`
+(`0660 root:users`) and the bounded daemon log; the executable is bind-mounted at
+`/run/opt/tv-auth/tv-authd`, not copied here.
 
 ## Hook behavior
 
@@ -127,6 +163,9 @@ existing alternate recovery channels available until the cold boot is verified.
   ownership or mode.
 - `systemd-journald` is inactive; unit stdout/stderr are discarded. Use
   `/run/tv-auth/tv-authd.log` and `/run/at-hub-boot.log`.
+- Each unit exposes its payload via a **private read-only bind mount** under
+  `/run/opt/<service>` (`BindReadOnlyPaths=`), not by copying into `/run`; the
+  mount is invisible from the host shell and disappears when the unit stops.
 - M2's approval UI updates `/opt/tv-auth/grants.json` live through the daemon
   and does not require a restart. Manually edited grants are still only read at
   daemon startup, so restart `tv-authd.service` after external edits.

@@ -11,8 +11,14 @@ Type=simple
 # systemd currently supplies it on this firmware.
 Environment=XDG_RUNTIME_DIR=/run
 Environment=HOME=/root
-ExecStartPre=/bin/sh -c "mkdir -p /run/tv-auth && cp -f /opt/tv-auth/tv-authd /run/tv-auth/tv-authd.new && chmod 0755 /run/tv-auth/tv-authd.new && mv -f /run/tv-auth/tv-authd.new /run/tv-auth/tv-authd"
-ExecStart=/run/tv-auth/tv-authd --socket /run/tv-auth/broker.sock --grants /opt/tv-auth/grants.json --log /run/tv-auth/tv-authd.log --socket-gid 100
+ExecStartPre=/bin/sh -c "mkdir -p /run/tv-auth"
+# /opt is on the signed VDFS, where the kernel UEP gate rejects unsigned ELFs.
+# Expose the broker binary under /run (outside UEP's checked prefixes) with a
+# per-service read-only bind mount instead of copying it in. The daemon still
+# reads and rewrites grants.json at its real path (/opt/tv-auth), which stays
+# writable; only the /run/opt/... view is read-only.
+BindReadOnlyPaths=/opt/tv-auth:/run/opt/tv-auth
+ExecStart=/run/opt/tv-auth/tv-authd --socket /run/tv-auth/broker.sock --grants /opt/tv-auth/grants.json --log /run/tv-auth/tv-authd.log --socket-gid 100
 Restart=always
 RestartSec=1
 

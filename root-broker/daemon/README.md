@@ -118,16 +118,19 @@ service after external edits.
     tv-authd
     grants.json
 
-/run/tv-auth/
+/run/opt/tv-auth/          # per-service read-only bind mount of /opt/tv-auth
     tv-authd
+
+/run/tv-auth/
     broker.sock
     tv-authd.log
 ```
 
-The systemd unit stages the root-only binary into `/run/tv-auth` and runs it
-from there. The socket is mode `0660`, owner `root:users` (gid 100 on this TV),
-so UID-5001 apps in the `users` group can connect; package identity is still
-enforced by the daemon.
+The systemd unit **bind-mounts** the root-only binary at `/run/opt/tv-auth`
+(a private read-only mount, outside UEP's checked prefixes) and runs it from
+there — nothing is copied into `/run`. The socket is mode `0660`, owner
+`root:users` (gid 100 on this TV), so UID-5001 apps in the `users` group can
+connect; package identity is still enforced by the daemon.
 
 ## Approval UI
 
