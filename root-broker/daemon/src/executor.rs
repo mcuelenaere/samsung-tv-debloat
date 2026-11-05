@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -23,18 +24,20 @@ pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
     } else {
         "/bin/setsid"
     };
-    let mut child = Command::new(setsid)
-        .arg("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("HOME", "/root")
-        .env("LANG", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = ChildGuard(Some(
+        Command::new(setsid)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("HOME", "/root")
+            .env("LANG", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
 
     let stdout = child
         .stdout
@@ -203,6 +206,47 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Guarantees the child is reaped on every exit path (including `?` errors).
+/// If it is still unreaped on drop (e.g. D-state), kill it and hand it to a
+/// detached thread that blocks in `wait()`, so the request never blocks on it.
+struct ChildGuard(Option<Child>);
+
+impl Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.0.as_ref().expect("child present until drop")
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child present until drop")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        kill_process_group(&child);
+        let _ = child.kill();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // If the thread cannot be spawned the closure (and child) is dropped;
+        // nothing more can be done.
+        let _ = thread::Builder::new()
+            .name("child-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
 }
 
 fn kill_process_group(child: &Child) {

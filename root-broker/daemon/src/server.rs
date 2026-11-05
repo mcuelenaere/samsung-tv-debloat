@@ -9,11 +9,15 @@ use crate::protocol::{
     MAX_REQUEST_BYTES,
 };
 use std::collections::HashSet;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often a blocked exec checks whether its client hung up.
+const HANGUP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct Broker {
     pub grants: Arc<Mutex<GrantStore>>,
@@ -39,7 +43,10 @@ impl Broker {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Concurrent ordinary-app connections.
     pub max_connections: usize,
+    /// Separate allowance for the approval UI so apps cannot lock it out.
+    pub max_ui_connections: usize,
     pub max_requests_per_connection: usize,
     pub ui_label: String,
     pub ui_uid: u32,
@@ -50,11 +57,69 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 16,
+            max_ui_connections: 2,
             max_requests_per_connection: 1024,
             ui_label: "User::Pkg::org.tvauth.ui".into(),
             ui_uid: 5001,
             approval_wait_timeout: Duration::from_secs(300),
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn is_ui(&self, identity: &PeerIdentity) -> bool {
+        identity.label == self.ui_label && identity.uid == self.ui_uid
+    }
+}
+
+/// Reader that enforces an absolute deadline across all underlying reads, so
+/// a peer trickling bytes cannot extend a message's idle timeout forever.
+struct DeadlineReader {
+    stream: UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "message deadline"));
+            }
+            // macOS rejects setsockopt (EINVAL) once the peer has closed; the
+            // read below then reports EOF immediately.
+            match self.stream.set_read_timeout(Some(remaining)) {
+                Err(error) if error.kind() != io::ErrorKind::InvalidInput => return Err(error),
+                _ => {}
+            }
+        }
+        self.stream.read(buf)
+    }
+}
+
+/// True if the peer has closed its end (non-consuming check).
+fn peer_closed(writer: &Arc<Mutex<UnixStream>>) -> bool {
+    let fd = writer
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_raw_fd();
+    let mut byte = 0_u8;
+    // SAFETY: `fd` is a live socket owned by `writer`; `byte` is a valid 1-byte buffer.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match n {
+        0 => true,
+        n if n > 0 => false,
+        _ => !matches!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
     }
 }
 
@@ -64,23 +129,27 @@ pub fn handle_connection(
     broker: Arc<Broker>,
     config: &ServerConfig,
 ) -> io::Result<()> {
-    let is_ui = identity.label == config.ui_label && identity.uid == config.ui_uid;
+    let is_ui = config.is_ui(&identity);
     let idle_timeout = if is_ui {
         Duration::from_secs(600)
     } else {
         Duration::from_secs(30)
     };
-    stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     let reader_stream = stream.try_clone()?;
     let control = stream.try_clone()?;
-    let mut reader = BufReader::new(reader_stream);
+    let mut reader = BufReader::new(DeadlineReader {
+        stream: reader_stream,
+        deadline: None,
+    });
     let writer = Arc::new(Mutex::new(stream));
     let mut request_ids = HashSet::new();
     let mut ui_token: Option<u64> = None;
 
     let result = loop {
+        // The whole message must arrive within the idle timeout.
+        reader.get_mut().deadline = Some(Instant::now() + idle_timeout);
         let line = match read_message(&mut reader, MAX_REQUEST_BYTES) {
             Ok(line) => line,
             Err(error) if is_idle_or_closed(&error) => break Ok(()),
@@ -121,13 +190,21 @@ pub fn handle_connection(
             let _ = send(&writer, &Response::error("", "error", "invalid_request_id"));
             continue;
         }
-        if !request_ids.insert(response_id.clone()) {
+        if request_ids.contains(&response_id) {
             let _ = send(
                 &writer,
                 &Response::error(&response_id, "error", "duplicate_request_id"),
             );
             continue;
         }
+        if request_ids.len() >= config.max_requests_per_connection {
+            let _ = send(
+                &writer,
+                &Response::error(&response_id, "error", "too_many_requests"),
+            );
+            break Ok(());
+        }
+        request_ids.insert(response_id.clone());
 
         let result = if is_ui {
             handle_ui_request(
@@ -311,16 +388,7 @@ fn handle_app_request(
 ) -> io::Result<()> {
     match request {
         Request::Exec(request) => handle_exec(writer, identity, broker, config, request),
-        Request::UiHello(request) => send(writer, &Response::error(&request.id, "error", "not_ui")),
-        Request::UiDecision(request) => {
-            send(writer, &Response::error(&request.id, "error", "not_ui"))
-        }
-        Request::GrantsList(request) => {
-            send(writer, &Response::error(&request.id, "error", "not_ui"))
-        }
-        Request::GrantsRevoke(request) => {
-            send(writer, &Response::error(&request.id, "error", "not_ui"))
-        }
+        other => send(writer, &Response::error(other.id(), "error", "not_ui")),
     }
 }
 
@@ -359,20 +427,61 @@ fn handle_exec(
         );
         let (reply, decisions) = mpsc::channel();
         let approval = ApprovalRequest {
+            ticket: 0,
             request_id: request.id.clone(),
             label: identity.label.clone(),
             command: request.command.clone(),
             reply,
         };
-        if broker.approvals.request(approval).is_err() {
-            send(
-                writer,
-                &Response::error(&request.id, "ui_unavailable", "approval_unavailable"),
-            )?;
-            return Ok(());
-        }
-        match decisions.recv_timeout(config.approval_wait_timeout) {
-            Ok(ApprovalResult::AllowOnce) | Ok(ApprovalResult::AllowAlways) => {
+        let ticket = match broker.approvals.request(approval) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                send(
+                    writer,
+                    &Response::error(&request.id, "ui_unavailable", "approval_unavailable"),
+                )?;
+                return Ok(());
+            }
+        };
+        // Wait in short slices so a client hangup cancels the prompt instead
+        // of leaving it to be approved for a dead peer.
+        let deadline = Instant::now() + config.approval_wait_timeout;
+        let decision = loop {
+            match decisions.recv_timeout(HANGUP_CHECK_INTERVAL) {
+                Ok(result) => break Some(result),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if peer_closed(writer) {
+                        let _ = broker.approvals.cancel(ticket);
+                        log(
+                            broker,
+                            &format!(
+                                "requester={} request={} approval=cancelled client_gone",
+                                identity.label, request.id
+                            ),
+                        );
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = broker.approvals.cancel(ticket);
+                        break None;
+                    }
+                }
+            }
+        };
+        match decision {
+            Some(ApprovalResult::AllowOnce) | Some(ApprovalResult::AllowAlways) => {
+                // A decision may race with a hangup; never run for a closed client.
+                if peer_closed(writer) {
+                    log(
+                        broker,
+                        &format!(
+                            "requester={} request={} approval=allowed_but_client_gone",
+                            identity.label, request.id
+                        ),
+                    );
+                    return Ok(());
+                }
                 log(
                     broker,
                     &format!(
@@ -381,7 +490,7 @@ fn handle_exec(
                     ),
                 );
             }
-            Ok(ApprovalResult::Denied(status, error)) => {
+            Some(ApprovalResult::Denied(status, error)) => {
                 log(
                     broker,
                     &format!(
@@ -392,7 +501,7 @@ fn handle_exec(
                 send(writer, &Response::error(&request.id, status, error))?;
                 return Ok(());
             }
-            Err(_) => {
+            None => {
                 log(
                     broker,
                     &format!(
@@ -490,6 +599,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(Duration::from_millis(500))
+    }
+
+    fn fixture_with(prompt_timeout: Duration) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("grants.json");
         std::fs::write(
@@ -500,10 +613,9 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let grants = Arc::new(Mutex::new(GrantStore::load(&path).unwrap()));
         let approval_config = ApprovalConfig {
-            ui_label: "User::Pkg::org.tvauth.ui".into(),
             ui_app_id: "org.tvauth.ui".into(),
             app_launcher: PathBuf::from("/nonexistent/tv-auth-launcher"),
-            prompt_timeout: Duration::from_millis(500),
+            prompt_timeout,
             ui_launch_timeout: Duration::from_millis(50),
             launch_cooldown: Duration::from_millis(10),
             prompt_queue_max: 4,
@@ -513,6 +625,7 @@ mod tests {
         let broker = Arc::new(Broker::new(grants, manager.handle(), None));
         let config = ServerConfig {
             max_connections: 16,
+            max_ui_connections: 2,
             max_requests_per_connection: 16,
             ui_label: "User::Pkg::org.tvauth.ui".into(),
             ui_uid: 5001,
@@ -719,5 +832,79 @@ mod tests {
         assert_eq!(response["error"], "malformed_request");
         drop(client);
         assert!(handle.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn too_many_requests_closes_the_connection() {
+        let mut fixture = fixture();
+        fixture.config.max_requests_per_connection = 2;
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
+        for id in ["list-1", "list-2"] {
+            client.send(json!({"version": 1, "id": id, "method": "grants.list"}));
+            assert_eq!(client.read()["error"], "not_ui");
+        }
+        // Duplicates do not count against the limit.
+        client.send(json!({"version": 1, "id": "list-2", "method": "grants.list"}));
+        assert_eq!(client.read()["error"], "duplicate_request_id");
+        client.send(json!({"version": 1, "id": "list-3", "method": "grants.list"}));
+        assert_eq!(client.read()["error"], "too_many_requests");
+        handle.join().unwrap().unwrap();
+        let mut rest = String::new();
+        assert_eq!(client.reader.read_line(&mut rest).unwrap(), 0);
+    }
+
+    #[test]
+    fn trickled_message_hits_the_absolute_deadline() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(DeadlineReader {
+            stream: server,
+            deadline: Some(Instant::now() + Duration::from_millis(400)),
+        });
+        let trickle = thread::spawn(move || {
+            let mut client = client;
+            for _ in 0..20 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        let error = read_message(&mut reader, MAX_REQUEST_BYTES).unwrap_err();
+        assert!(is_idle_or_closed(&error), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(reader);
+        trickle.join().unwrap();
+    }
+
+    #[test]
+    fn client_hangup_cancels_pending_approval() {
+        let fixture = fixture_with(Duration::from_secs(10));
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 1, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.unknown", 5001);
+        client.send(exec_request("exec-1", "printf should-not-run"));
+        let prompt = ui.read();
+        assert_eq!(prompt["type"], "ui.prompt");
+        drop(client);
+        let started = Instant::now();
+        handle.join().unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // The cancel was queued before the connection thread returned, so a
+        // late decision is stale.
+        ui.send(json!({
+            "version": 1,
+            "id": "decision-1",
+            "method": "ui.decision",
+            "prompt_id": prompt["prompt_id"],
+            "nonce": prompt["nonce"],
+            "decision": "once"
+        }));
+        assert_eq!(ui.read()["error"], "stale_prompt");
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
     }
 }

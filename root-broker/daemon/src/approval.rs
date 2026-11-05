@@ -6,6 +6,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,9 +14,13 @@ use std::time::{Duration, Instant};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How many times a prompt is re-shown after the UI disconnected while it was
+/// active (the UI exits shortly after each decision, which can race with the
+/// next queued prompt).
+const MAX_PROMPT_UI_RETRIES: u8 = 2;
+
 #[derive(Debug, Clone)]
 pub struct ApprovalConfig {
-    pub ui_label: String,
     pub ui_app_id: String,
     pub app_launcher: PathBuf,
     pub prompt_timeout: Duration,
@@ -27,8 +32,9 @@ pub struct ApprovalConfig {
 
 impl ApprovalConfig {
     pub fn approval_wait_timeout(&self) -> Duration {
-        self.prompt_timeout * (self.prompt_queue_max as u32 + 1)
-            + self.ui_launch_timeout * (self.max_launch_attempts as u32)
+        let retries = u32::from(MAX_PROMPT_UI_RETRIES);
+        self.prompt_timeout * (self.prompt_queue_max as u32 + 1 + retries)
+            + self.ui_launch_timeout * (self.max_launch_attempts as u32) * (1 + retries)
             + Duration::from_secs(30)
     }
 }
@@ -41,6 +47,8 @@ pub enum ApprovalResult {
 }
 
 pub struct ApprovalRequest {
+    /// Unique internal id, assigned by `ApprovalHandle::request`.
+    pub ticket: u64,
     pub request_id: String,
     pub label: String,
     pub command: String,
@@ -58,6 +66,10 @@ enum ApprovalCommand {
     DetachUi {
         token: u64,
     },
+    /// The requester went away: drop its queued or active prompt.
+    Cancel {
+        ticket: u64,
+    },
     Decision {
         token: u64,
         id: String,
@@ -70,12 +82,21 @@ enum ApprovalCommand {
 
 #[derive(Clone)]
 pub struct ApprovalHandle {
-    tx: Arc<Mutex<Sender<ApprovalCommand>>>,
+    tx: Sender<ApprovalCommand>,
+    next_ticket: Arc<AtomicU64>,
 }
 
 impl ApprovalHandle {
-    pub fn request(&self, request: ApprovalRequest) -> io::Result<()> {
-        self.send(ApprovalCommand::Request(request))
+    /// Queue a request; returns its ticket (the `ticket` field is overwritten).
+    pub fn request(&self, mut request: ApprovalRequest) -> io::Result<u64> {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        request.ticket = ticket;
+        self.send(ApprovalCommand::Request(request))?;
+        Ok(ticket)
+    }
+
+    pub fn cancel(&self, ticket: u64) -> io::Result<()> {
+        self.send(ApprovalCommand::Cancel { ticket })
     }
 
     pub fn attach_ui(
@@ -116,8 +137,6 @@ impl ApprovalHandle {
 
     fn send(&self, command: ApprovalCommand) -> io::Result<()> {
         self.tx
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
             .send(command)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "approval manager stopped"))
     }
@@ -136,7 +155,8 @@ impl ApprovalManager {
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let handle = ApprovalHandle {
-            tx: Arc::new(Mutex::new(tx)),
+            tx,
+            next_ticket: Arc::new(AtomicU64::new(1)),
         };
         let thread_handle = thread::Builder::new()
             .name("tv-auth-approval".into())
@@ -154,12 +174,7 @@ impl ApprovalManager {
 
 impl Drop for ApprovalManager {
     fn drop(&mut self) {
-        let _ = self
-            .handle
-            .tx
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .send(ApprovalCommand::Shutdown);
+        let _ = self.handle.tx.send(ApprovalCommand::Shutdown);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -174,12 +189,14 @@ struct UiClient {
 
 struct PendingRequest {
     request: ApprovalRequest,
+    ui_retries: u8,
 }
 
 struct ActivePrompt {
     prompt_id: String,
     nonce: String,
     request: ApprovalRequest,
+    ui_retries: u8,
     expires_at: Instant,
     ui_token: u64,
 }
@@ -248,6 +265,7 @@ impl Manager {
                 control,
             } => self.handle_attach(token, label, writer, control),
             ApprovalCommand::DetachUi { token } => self.handle_detach(token),
+            ApprovalCommand::Cancel { ticket } => self.handle_cancel(ticket),
             ApprovalCommand::Decision {
                 token,
                 id,
@@ -280,7 +298,10 @@ impl Manager {
             request.request_id,
             request.command.len()
         ));
-        self.queue.push_back(PendingRequest { request });
+        self.queue.push_back(PendingRequest {
+            request,
+            ui_retries: 0,
+        });
         self.ensure_prompt();
     }
 
@@ -301,6 +322,7 @@ impl Manager {
         if let Some(active) = self.active.take() {
             self.queue.push_front(PendingRequest {
                 request: active.request,
+                ui_retries: active.ui_retries,
             });
             self.log("prompt_requeued_after_ui_attach");
         }
@@ -321,17 +343,41 @@ impl Manager {
         self.ui = None;
         self.log(&format!("ui_detached token={token}"));
         if let Some(active) = self.active.take() {
-            self.reply(
-                active.request,
-                ApprovalResult::Denied("ui_unavailable", "ui_disconnected"),
-            );
-            self.log("prompt_cancelled=ui_disconnected");
+            if active.ui_retries < MAX_PROMPT_UI_RETRIES {
+                // The UI may simply have been exiting after the previous
+                // decision; show the prompt again via a fresh UI.
+                self.queue.push_front(PendingRequest {
+                    request: active.request,
+                    ui_retries: active.ui_retries + 1,
+                });
+                self.log("prompt_requeued_after_ui_disconnect");
+            } else {
+                self.reply(
+                    active.request,
+                    ApprovalResult::Denied("ui_unavailable", "ui_disconnected"),
+                );
+                self.log("prompt_cancelled=ui_disconnected");
+            }
         }
         self.launch = LaunchState {
             attempts: 0,
             last_attempt: Some(Instant::now()),
             awaiting_until: None,
         };
+    }
+
+    fn handle_cancel(&mut self, ticket: u64) {
+        self.queue
+            .retain(|pending| pending.request.ticket != ticket);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.request.ticket == ticket)
+        {
+            self.active = None;
+            self.log("prompt_cancelled=requester_gone");
+        }
+        self.ensure_prompt();
     }
 
     fn handle_decision(
@@ -477,6 +523,7 @@ impl Manager {
                     prompt_id,
                     nonce,
                     request: pending.request,
+                    ui_retries: pending.ui_retries,
                     expires_at: Instant::now() + self.config.prompt_timeout,
                     ui_token: ui.token,
                 });
@@ -647,7 +694,6 @@ mod tests {
 
     fn test_config() -> ApprovalConfig {
         ApprovalConfig {
-            ui_label: "User::Pkg::org.tvauth.ui".into(),
             ui_app_id: "org.tvauth.ui".into(),
             app_launcher: PathBuf::from("/nonexistent/tv-auth-launcher"),
             prompt_timeout: Duration::from_secs(5),
@@ -674,6 +720,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (
             ApprovalRequest {
+                ticket: 0,
                 request_id: "request-1".into(),
                 label: label.into(),
                 command: "id".into(),
@@ -809,18 +856,96 @@ mod tests {
         );
     }
 
+    fn no_relaunch_config() -> ApprovalConfig {
+        let mut config = test_config();
+        // Keep the (missing) launcher from failing the queue while a test
+        // swaps UI connections.
+        config.launch_cooldown = Duration::from_secs(60);
+        config
+    }
+
     #[test]
-    fn ui_disconnect_denies() {
-        let fixture = fixture(test_config());
-        let _ui = attach_ui(&fixture.manager, 1);
+    fn ui_disconnect_requeues_prompt_for_next_ui() {
+        let fixture = fixture(no_relaunch_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
         let (ask, reply) = request("User::Pkg::org.example.app");
         fixture.manager.handle().request(ask).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let _ = read_json(&mut ui);
         fixture.manager.handle().detach_ui(1).unwrap();
+
+        let mut ui = attach_ui(&fixture.manager, 2);
+        let prompt = read_json(&mut ui);
+        assert_eq!(prompt["type"], "ui.prompt");
+        fixture
+            .manager
+            .handle()
+            .decide(
+                2,
+                "decision-1".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Once,
+            )
+            .unwrap();
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(2)),
+            Ok(ApprovalResult::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn ui_disconnect_denies_after_retry_limit() {
+        let fixture = fixture(no_relaunch_config());
+        let (ask, reply) = request("User::Pkg::org.example.app");
+        let mut ui = attach_ui(&fixture.manager, 1);
+        fixture.manager.handle().request(ask).unwrap();
+        for token in 1..=u64::from(MAX_PROMPT_UI_RETRIES) + 1 {
+            if token > 1 {
+                ui = attach_ui(&fixture.manager, token);
+            }
+            let _ = read_json(&mut ui);
+            assert!(reply.try_recv().is_err());
+            fixture.manager.handle().detach_ui(token).unwrap();
+        }
         assert_eq!(
             reply.recv_timeout(Duration::from_secs(2)),
             Ok(ApprovalResult::Denied("ui_unavailable", "ui_disconnected"))
         );
+    }
+
+    #[test]
+    fn cancel_drops_active_and_queued_requests() {
+        let fixture = fixture(no_relaunch_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let handle = fixture.manager.handle();
+        let (first, _first_reply) = request("User::Pkg::org.example.one");
+        let first_ticket = handle.request(first).unwrap();
+        let prompt = read_json(&mut ui);
+        let (second, _second_reply) = request("User::Pkg::org.example.two");
+        let second_ticket = handle.request(second).unwrap();
+
+        handle.cancel(first_ticket).unwrap();
+        // The queued request is promoted once the active one is cancelled.
+        let next = read_json(&mut ui);
+        assert_eq!(next["label"], "User::Pkg::org.example.two");
+
+        // The cancelled prompt can no longer be approved.
+        handle
+            .decide(
+                1,
+                "decision-1".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Once,
+            )
+            .unwrap();
+        assert_eq!(read_json(&mut ui)["error"], "stale_prompt");
+
+        handle.cancel(second_ticket).unwrap();
+        let (third, _third_reply) = request("User::Pkg::org.example.two");
+        handle.request(third).unwrap();
+        // Label is free again, so the new request is prompted, not rejected.
+        assert_eq!(read_json(&mut ui)["label"], "User::Pkg::org.example.two");
     }
 
     #[test]

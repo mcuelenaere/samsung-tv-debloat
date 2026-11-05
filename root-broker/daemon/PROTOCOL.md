@@ -11,7 +11,9 @@ Limits:
 - maximum command timeout: 120,000 ms;
 - default prompt timeout: 60,000 ms;
 - default UI launch/connect timeout: 10,000 ms;
-- maximum concurrent clients: 16 by default;
+- maximum concurrent clients: 16 by default, plus a separate allowance of 2 for the approval UI;
+- a complete request line must arrive within the idle timeout (30 s apps, 600 s UI) of the daemon starting to wait for it;
+- at most 1024 distinct request IDs per connection;
 - default approval queue: 8 pending requests (including the active one).
 
 Unknown JSON fields, versions, and methods are rejected. A request `id` is
@@ -92,14 +94,19 @@ approval flow. M2 errors include:
 |---|---|
 | `user_denied` | the user chose Deny |
 | `prompt_timeout` | no decision arrived before the prompt timeout |
-| `ui_disconnected` | the UI connection dropped while the prompt was pending |
+| `ui_disconnected` | the UI connection dropped while the prompt was pending and the retry limit (2 re-shows) was exhausted |
 | `ui_unavailable` | no UI connected and launch attempts were exhausted |
 | `ui_launch_failed` | the fixed launcher could not be started |
 | `prompt_queue_full` | the global approval queue is full |
 | `request_already_pending` | this package already has a queued or active request |
 | `grant_persist_failed` | Always allow could not be saved; the command did not run |
 | `ui_role` | the approval UI attempted to send `exec` |
+| `too_many_requests` | the connection exceeded its request limit; the daemon closes it |
 | `approval_wait_timeout` | the daemon-side wait for the approval manager expired |
+
+If the app closes (or half-closes) its socket while waiting for approval, the
+daemon cancels the pending prompt and never executes the command; a late UI
+decision for it gets `stale_prompt`.
 
 Execution uses `/usr/bin/setsid /bin/sh -c <command>` with a cleared environment
 except `PATH`, `HOME=/root`, and `LANG=C`. On timeout the process group receives

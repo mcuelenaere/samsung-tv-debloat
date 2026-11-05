@@ -84,16 +84,6 @@ impl Request {
             Self::GrantsRevoke(request) => &request.id,
         }
     }
-
-    pub fn method(&self) -> &'static str {
-        match self {
-            Self::Exec(_) => "exec",
-            Self::UiHello(_) => "ui.hello",
-            Self::UiDecision(_) => "ui.decision",
-            Self::GrantsList(_) => "grants.list",
-            Self::GrantsRevoke(_) => "grants.revoke",
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,15 +140,6 @@ pub fn is_valid_request_id(id: &str) -> bool {
 }
 
 pub fn validate_exec(request: &ExecRequest) -> Result<u64, &'static str> {
-    if request.version != PROTOCOL_VERSION {
-        return Err("unsupported_version");
-    }
-    if request.method != "exec" {
-        return Err("unsupported_method");
-    }
-    if !is_valid_request_id(&request.id) {
-        return Err("invalid_request_id");
-    }
     if request.command.is_empty() {
         return Err("empty_command");
     }
@@ -170,15 +151,6 @@ pub fn validate_exec(request: &ExecRequest) -> Result<u64, &'static str> {
 }
 
 pub fn validate_decision(request: &UiDecisionRequest) -> Result<(), &'static str> {
-    if request.version != PROTOCOL_VERSION {
-        return Err("unsupported_version");
-    }
-    if request.method != "ui.decision" {
-        return Err("unsupported_method");
-    }
-    if !is_valid_request_id(&request.id) {
-        return Err("invalid_request_id");
-    }
     if !is_valid_request_id(&request.prompt_id) || !is_valid_request_id(&request.nonce) {
         return Err("invalid_prompt_token");
     }
@@ -186,15 +158,6 @@ pub fn validate_decision(request: &UiDecisionRequest) -> Result<(), &'static str
 }
 
 pub fn validate_revoke(request: &GrantsRevokeRequest) -> Result<(), &'static str> {
-    if request.version != PROTOCOL_VERSION {
-        return Err("unsupported_version");
-    }
-    if request.method != "grants.revoke" {
-        return Err("unsupported_method");
-    }
-    if !is_valid_request_id(&request.id) {
-        return Err("invalid_request_id");
-    }
     if !is_valid_package_label(&request.label) {
         return Err("invalid_label");
     }
@@ -334,27 +297,48 @@ impl PromptMessage {
 
 /// Replace characters that could make the displayed command differ from the
 /// executed command. The command is never executed from this copy.
+/// Control chars (except \n, \t, and \r before \n), Unicode format (Cf)
+/// characters and line/paragraph separators become U+FFFD.
 pub fn display_safe(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character == '\n'
-                || character == '\r'
-                || character == '\t'
-                || (!character.is_control() && !is_bidi_control(character))
-            {
-                character
-            } else {
-                '\u{FFFD}'
-            }
-        })
-        .collect()
+    let mut chars = value.chars().peekable();
+    let mut out = String::with_capacity(value.len());
+    while let Some(character) = chars.next() {
+        let keep = match character {
+            '\n' | '\t' => true,
+            // A lone CR can overwrite the line in some renderers.
+            '\r' => chars.peek() == Some(&'\n'),
+            _ => !character.is_control() && !is_invisible_format(character),
+        };
+        out.push(if keep { character } else { '\u{FFFD}' });
+    }
+    out
 }
 
-fn is_bidi_control(character: char) -> bool {
+/// Unicode General_Category=Cf (no std API) plus U+2028/U+2029 separators.
+fn is_invisible_format(character: char) -> bool {
     matches!(
         character,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}' // incl. Zl/Zp and bidi embeddings
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }
 
@@ -458,21 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_version_and_method() {
+    fn rejects_bad_timeouts_and_commands() {
         let mut value = exec_request();
-        value.version = 2;
-        assert_eq!(validate_exec(&value), Err("unsupported_version"));
-        value.version = 1;
-        value.method = "shell".into();
-        assert_eq!(validate_exec(&value), Err("unsupported_method"));
-    }
-
-    #[test]
-    fn rejects_bad_ids_timeouts_and_commands() {
-        let mut value = exec_request();
-        value.id = "bad id".into();
-        assert_eq!(validate_exec(&value), Err("invalid_request_id"));
-        value.id = "ok".into();
         value.timeout_ms = Some(0);
         assert_eq!(validate_exec(&value), Err("invalid_timeout"));
         value.timeout_ms = Some(MAX_TIMEOUT_MS + 1);
@@ -607,5 +578,31 @@ mod tests {
         );
         assert_eq!(prompt.command, "one\u{FFFD}two\u{FFFD}three\nfour");
         assert!(!prompt.command_truncated);
+    }
+
+    #[test]
+    fn display_safe_replaces_invisible_characters() {
+        for bad in [
+            '\u{200B}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{E0041}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{00AD}',
+            '\u{202E}',
+        ] {
+            assert_eq!(display_safe(&format!("a{bad}b")), "a\u{FFFD}b", "{bad:?}");
+        }
+        assert_eq!(display_safe("a\rb"), "a\u{FFFD}b");
+        assert_eq!(display_safe("a\r\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn display_safe_keeps_ordinary_text() {
+        let text = "caf\u{e9} \u{65e5}\u{672c} \u{1F600}\tx\ny";
+        assert_eq!(display_safe(text), text);
     }
 }

@@ -82,45 +82,55 @@ fn run(args: Args) -> io::Result<()> {
         args.server.max_connections
     ))?;
 
-    let current = Arc::new(AtomicUsize::new(0));
+    // Apps and the approval UI have separate slots so apps cannot lock the UI out.
+    let current_apps = Arc::new(AtomicUsize::new(0));
+    let current_ui = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(stream) => stream,
             Err(error) => {
-                logger.log(&format!("accept_error={error}"))?;
+                let _ = logger.log(&format!("accept_error={error}"));
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };
 
-        if current.fetch_add(1, Ordering::AcqRel) >= args.server.max_connections {
-            current.fetch_sub(1, Ordering::AcqRel);
-            logger.log("connection_rejected=busy")?;
-            drop(stream);
+        // Peer identity is a cheap getsockopt, so read it before taking a slot.
+        let identity = match identity::from_fd(stream.as_raw_fd()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = logger.log(&format!("peer_identity_error={error}"));
+                continue;
+            }
+        };
+        if !identity::is_valid_package_label(&identity.label) {
+            let _ = logger.log(&format!(
+                "connection_rejected label={:?} uid={} pid={}",
+                identity.label, identity.uid, identity.pid
+            ));
+            continue;
+        }
+
+        let (counter, limit) = if args.server.is_ui(&identity) {
+            (&current_ui, args.server.max_ui_connections)
+        } else {
+            (&current_apps, args.server.max_connections)
+        };
+        if counter.fetch_add(1, Ordering::AcqRel) >= limit {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            let _ = logger.log(&format!(
+                "connection_rejected=busy label={}",
+                identity.label
+            ));
             continue;
         }
 
         let client_broker = Arc::clone(&broker);
         let client_logger = Arc::clone(&logger);
         let config = args.server.clone();
-        let active = ActiveConnection(Arc::clone(&current));
+        let active = ActiveConnection(Arc::clone(counter));
         thread::spawn(move || {
             let _active = active;
-            let identity = match identity::from_fd(stream.as_raw_fd()) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    let _ = client_logger.log(&format!("peer_identity_error={error}"));
-                    return;
-                }
-            };
-            if !identity::is_valid_package_label(&identity.label) {
-                let _ = client_logger.log(&format!(
-                    "connection_rejected label={:?} uid={} pid={}",
-                    identity.label, identity.uid, identity.pid
-                ));
-                return;
-            }
-
             if let Err(error) =
                 tv_authd::handle_connection(stream, identity, client_broker, &config)
             {
@@ -278,7 +288,6 @@ fn parse_args() -> Result<Option<Args>, String> {
 
     let ui_app_id = ui_app_id.unwrap_or_else(|| ui_package.clone());
     let approval = ApprovalConfig {
-        ui_label: format!("User::Pkg::{ui_package}"),
         ui_app_id: ui_app_id.clone(),
         app_launcher,
         prompt_timeout: Duration::from_millis(prompt_timeout_ms),
@@ -289,8 +298,9 @@ fn parse_args() -> Result<Option<Args>, String> {
     };
     let server = ServerConfig {
         max_connections,
+        max_ui_connections: 2,
         max_requests_per_connection: 1024,
-        ui_label: approval.ui_label.clone(),
+        ui_label: format!("User::Pkg::{ui_package}"),
         ui_uid,
         approval_wait_timeout: approval.approval_wait_timeout(),
     };
