@@ -2,7 +2,7 @@
 
 *Target: `root@192.0.2.10` · Tizen 6.5.0 · build `T-PTMDEUC-REL-202602250226`
 (QE55S95BATXXH / S95B, PontusM) · investigated 2026-11-04 (read-only); UEP gate
-re-derived and tested 2026-11-05.*
+re-derived and tested, path scope confirmed 2026-11-05.*
 
 This note documents **UEP** ("Unsigned Execution Prevention" / Samsung *kUEP*) as
 it is actually deployed on this TV: the kernel module, the userspace verification
@@ -36,6 +36,11 @@ The gate is therefore **volatile by design** (a reboot restores it), and the onl
 root toolkit works around this by flipping the same gate word in RAM through a
 kernel-memory primitive. On **this** exact build that word was re-derived from
 the live kernel and flipped successfully (see §8).
+
+Enforcement is also **path-scoped**: the kernel only verifies files whose
+`d_path()` falls under `/opt`, `/tmp`, `/var`, or `/home`. A bind mount that
+exposes such a file under a path outside that list (e.g. `/run/...`) skips the
+UEP check entirely — confirmed on-device on 2026-11-05 (§8).
 
 ---
 
@@ -100,6 +105,11 @@ The naming that appears on the box:
   `0x208c26c4`,** and the transition is a compare-before-write (verify
   surrounding state, write, verify read-back). This was confirmed on this exact
   build; see §8.
+- Enforcement is **path-scoped**, not inode-scoped. The verifier builds the
+  file's absolute path with `d_path()` (`0xc01ac8f4`) and compares it against
+  `/opt:/tmp:/var:/home` (`0xc09f46b0`). Paths outside that list take the
+  "UEP disabled" branch without a signature check; a bind mount therefore
+  changes whether a file is checked. See §8.
 
 Because the state lives only in RAM, any disable is **lost on reboot**, which is
 why every project in this space pairs "root" with "re-acquire after boot".
@@ -282,6 +292,57 @@ checks in `bash`/`node` are a separate path (§6). Other builds still need the
 same per-image check: **UEP disable is per-firmware RE**, not a portable
 primitive.
 
+### Path-scoped enforcement and the bind-mount bypass (2026-11-05)
+
+The gate is not a property of the inode or superblock; it is a check on the
+**absolute path**. The verifier builds that path with `d_path()`:
+
+- `SfdConstructAbsoluteFileNameByFile` (`0xc027e620`) →
+  `SfdConstructAbsoluteFileNameByPath` (`0xc027e560`) → `d_path()`
+  (`0xc01ac8f4`).
+- `SfdCheckFileIsInRWUsingPath` (`0xc027e66c`) compares the result against the
+  prefix table at `0xc09f46b0`, whose four entries are `/opt`, `/tmp`, `/var`,
+  and `/home` (`0xc0782d24`…`0xc0782d33`).
+- A path outside that list produces the "UEP disabled" result (2) and no
+  signature verification.
+
+Because `d_path()` is mount-aware, a **bind mount** changes the path the kernel
+sees. A bind mount is not a symlink: `d_path()` resolves symlinks back to
+`/opt/...`, but a bind mount has its own `vfsmount` and mount point.
+
+Confirmed on the TV with the gate at `1` (UEP enabled):
+
+```console
+# unsigned static ARMv7 binary; real path under /opt
+mount --bind /opt/uep-alias /run/uep-mnt
+/run/uep-mnt/hello          # runs: exit 0, no UEP rejection
+/opt/uep-control/hello      # rejected: exit 126, "Operation not permitted"
+```
+
+`dmesg` recorded only the control failure:
+
+```text
+[Verification fail] file /opt/uep-control/hello is not signed. Sign it.(fsname:vdfs, mnt_flags:1020)
+```
+
+The bind mount showed as `/dev/mmcblk0p21 on /run/uep-mnt type vdfs (rw,...)`.
+The alias executed successfully while the identical binary at its real `/opt`
+path was rejected. Cleanup removes the mount and temporary copies; the bind
+mount is volatile and disappears on unmount or reboot.
+
+Caveats:
+
+- The alias must be visible in the **exec'ing process's mount namespace**.
+  The root shell is in the init namespace (`mnt:[4026531840]`), so a bind mount
+  there is visible to it; a zone/container with its own namespace would not see
+  it.
+- The executable's SMACK label still has to permit execution (the copies under
+  `/opt` were labeled `System::Privileged`; `/run` is `System::Run`).
+- This bypasses the **path scope**, not the key or the gate; UEP remains enabled
+  for files actually under the four prefixes.
+- The bind mount is a runtime VFS object. It does not modify the rootfs or its
+  VDFS signatures; `umount` or reboot restores the original view.
+
 ---
 
 ## 9. Observability & a note on limits
@@ -295,6 +356,9 @@ dmesg | grep SfdUep                 # [SfdUepCheckFileType] ...
 ls -l /run/security-manager.socket /run/securezone_ready
 cat /proc/self/zone                 # "50 0"  (level 50, type 0)
 ```
+
+A bind mount outside the four checked prefixes (e.g. `/run/...`) changes the
+check result without touching the gate or the key table; see §8.
 
 What it **cannot** see without a kernel-memory primitive:
 
@@ -310,10 +374,12 @@ physical-memory primitive: via the toolkit's `qn90b uep status`, or directly as
 
 ## 10. Evidence & method
 
-All facts above were gathered **read-only** over SSH (and by extracting
+The 2026-11-04 investigation was **read-only** over SSH (and by extracting
 `/usr/lib/libkUEPUser.so` and `/opt/etc/parseinfo.sh` for offline `strings`/`nm`
-analysis). No files were changed on the TV; the only on-device state change was
-the volatile UEP gate write on 2026-11-05 (§8). Key sources:
+analysis). The 2026-11-05 follow-up wrote the volatile gate once, read the key
+table only, and ran the bind-mount test: temporary copies under `/opt`, a bind
+mount under `/run`, execution, then unmount and removal of the copies; the gate
+was left at its pre-test value. Key sources:
 
 - On-TV: `/sys/module/uep/version`, `/proc/cmdline`, `/proc/version`, `/proc/devices`,
   `/proc/misc`, `/proc/self/zone`, `dmesg`, `ls -l /run`, `/etc/prd_info.ini`,
@@ -329,6 +395,9 @@ the volatile UEP gate write on 2026-11-05 (§8). Key sources:
   `docs/research-notes/EXPLOIT_CHAIN.md` §"UEP bypass",
   `docs/research-notes/QN90B_REPRODUCTION.md` §"UEP",
   `src/samsung_tv_root/{qn90b,compatibility}.py`.
+- Kernel disassembly: `SfdConstructAbsoluteFileNameByFile` (`0xc027e620`),
+  `d_path` (`0xc01ac8f4`), prefix matcher (`0xc027e3cc`), prefix table
+  (`0xc09f46b0`), and the on-device bind-mount test (§8).
 - Local repo: [`docs/samsung-qn90b-architecture.md`](samsung-qn90b-architecture.md) §3,
   [`dropbear/README.md`](../dropbear/README.md), [`re/qn90b-core-daemons`](../re/qn90b-core-daemons/README.md).
 
@@ -342,8 +411,11 @@ the volatile UEP gate write on 2026-11-05 (§8). Key sources:
 > `libkUEPUser.so` (`BSContext::verifyFileWihtoutKey`) that only verifies scripts on a
 > **writable mount**, armed by the platform token `micom` in `/proc/modules`.
 
-1. Exact semantic of the kernel gate's "file type" (`#RPA`) and which paths/labels
-   are exempt from the exec check.
+1. ~~Exact semantic of the kernel gate's "file type" (`#RPA`) and which
+   paths/labels are exempt from the exec check.~~ **Partially resolved
+   2026-11-05:** the kernel checks `d_path()` against `/opt:/tmp:/var:/home`;
+   paths outside the list are exempt, and a bind mount under `/run` bypasses the
+   check (§8). The `#RPA` file-type details remain open.
 2. Whether the two embedded RSA keys map 1:1 to (a) firmware/update files and
    (b) scripts, or split differently.
 3. The precise `_UepSigMeta` blob layout (header/type byte + signature) for the
