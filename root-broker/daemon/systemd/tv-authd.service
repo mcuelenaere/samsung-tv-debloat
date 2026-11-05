@@ -1,0 +1,17 @@
+# Install this unit source at /opt/tv-units/tv-authd.service.
+# The AT-HUB boot hook copies it into /run/systemd/system and starts it.
+[Unit]
+Description=tv-authd privilege broker
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c "mkdir -p /run/tv-auth && cp -f /opt/tv-auth/tv-authd /run/tv-auth/tv-authd.new && chmod 0755 /run/tv-auth/tv-authd.new && mv -f /run/tv-auth/tv-authd.new /run/tv-auth/tv-authd"
+ExecStart=/run/tv-auth/tv-authd --socket /run/tv-auth/broker.sock --grants /opt/tv-auth/grants.json --log /run/tv-auth/tv-authd.log --socket-gid 100
+Restart=always
+RestartSec=1
+
+[Install]
+# The systemd unit path is read-only; this section is documentation only.
+WantedBy=multi-user.target

@@ -1,74 +1,44 @@
 #!/usr/bin/gawk -f
 # ─────────────────────────────────────────────────────────────────────────────
-# Drop-in replacement for /opt/etc/parseinfo.sh  (run by AT-HUB.service)
+# Root boot hook for /opt/etc/parseinfo.sh (run by AT-HUB.service)
 #
 #   AT-HUB.service:
 #     ExecStart=/opt/etc/parseinfo.sh &      # no User=  -> root
 #     WantedBy=starter.target                # runs every boot
 #
-# ⚠  Keep the stock backup (`/opt/etc/parseinfo.sh.orig`) so the change stays
-#    reversible. Install/rollback and validation: see ./README.md.
-#
 # WHAT IT DOES
 #   1. Reproduces the stock behaviour exactly (writes __<BUILD>__<MODEL> to
 #      /proc/target_version) so nothing downstream notices the swap.
-#   2. Injects ./dropbear.service into the runtime systemd unit path
-#      (/run/systemd/system) and starts it. systemd resolves the *new* unit on
-#      demand over D-Bus (`StartUnit`/`LoadUnit`), so NO full `daemon-reload` is
-#      needed. systemd (PID 1) then owns dropbear: spawning, respawn
-#      (Restart=always), its own cgroup, and logging. The hook can just exit.
+#   2. Copies every *.service file from the root-only /opt/tv-units directory
+#      into the runtime systemd unit path (/run/systemd/system) and starts each
+#      one independently. systemd resolves newly written units on demand over
+#      D-Bus (StartUnit/LoadUnit), so NO full daemon-reload is needed.
 #
 # WHY GAWK (not bash, not a binary)
 #   * systemd execs this file directly; the kernel #! handler runs the
 #     interpreter named on line 1.
-#   * A `#!/bin/bash` script on writable /opt is UEP-checked by *bash's* userspace
+#   * A #!/bin/bash script on writable /opt is UEP-checked by *bash's* userspace
 #     uep_verify() -> "[uep][bash] the file is NOT signed!!" + exit.
 #     /usr/bin/gawk has no such check (it does not link libkUEPUser.so).
 #   * A native ELF here would be an unsigned binary on VDFS (writable /opt) and
-#     would face the *kernel* UEP gate. Avoid.
-#   See  ../re/at-hub-persistence-analysis.md  and  ../docs/samsung-tv-secure-boot.md.
+#     would face the kernel UEP gate. Avoid.
 #
-# WHY THIS UNIT/SYSTEMD APPROACH IS FEASIBLE (validated on-device 2026-11-04)
-#   * The TV already creates transient units at runtime (Samsung's
-#     tv-restart-sdbd.*), and the systemd D-Bus policy lets uid 0 do anything
-#     (no polkit). A live test wrote a unit to /run/systemd/system, started it,
-#     logged in on an alternate port as uid 0, and confirmed systemd respawned
-#     it after kill. A second test confirmed that `LoadUnit`/`StartUnit` load a
-#     freshly-written unit WITHOUT a full `daemon-reload`. See ./README.md.
-#
-# NOTE the payload is still an unsigned ELF, so the unit's ExecStart execs it
-# from /run (tmpfs) — the placement UEP permits; /opt (VDFS) exec returns EPERM.
+# /opt/tv-units MUST be root-owned, mode 0700, and not app-writable. It is a
+# privileged extension point: a unit placed there runs as root at boot.
 # ─────────────────────────────────────────────────────────────────────────────
 
 BEGIN {
-    # Log to tmpfs, not /opt: writing here costs zero flash (MMC) writes, and
-    # /run survives the whole boot — so you can still read this after the TV has
-    # booted (it is wiped only at the NEXT reboot).
-    #
-    # NB: stdout/stderr are NOT usable here. This TV ships
-    #   DefaultStandardOutput=null / DefaultStandardError=null
-    # in /etc/systemd/system.conf, and systemd-journald is inactive, so systemd
-    # discards both streams — `systemctl status AT-HUB.service` would show
-    # nothing. A tmpfs file is the only cheap inspectable sink available.
     LOG = "/run/at-hub-boot.log"
-    ts  = strftime("%Y-%m-%dT%H:%M:%S%z")
+    UNIT_DIR = "/opt/tv-units"
+    ts = strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    # gawk's system() runs "/bin/sh -c <string>" — an inline command string, NOT a
-    # script FILE, so bash's RW-script UEP check never fires for our own logic.
-    system("echo '" ts " parseinfo(gawk): BEGIN' >> " LOG)
+    system("mkdir -p /run/systemd/system")
 
     # ── (1) PRESERVE THE STOCK BEHAVIOUR EXACTLY ─────────────────────────────
-    # Original script body:
-    #   Repoinfo=$(grep "Build=" /etc/prd_info.ini | cut -d "=" -f2 | cut -d";" -f1)
-    #   REPO=${Repoinfo%*;}
-    #   Modelinfo=$(grep "Model=" /etc/prd_info.ini | cut -d "=" -f2 | cut -d";" -f1)
-    #   MODEL=${Modelinfo%*;}
-    #   echo "__${REPO}__${MODEL}" > /proc/target_version
-    # Replicate it byte-for-byte so nothing downstream notices the swap.
     repo = ""; model = ""
     while ((getline line < "/etc/prd_info.ini") > 0) {
         if (line ~ /^Build=/) {
-            sub(/^Build=/, "", line); sub(/;.*/, "", line); repo  = line
+            sub(/^Build=/, "", line); sub(/;.*/, "", line); repo = line
         } else if (line ~ /^Model=/) {
             sub(/^Model=/, "", line); sub(/;.*/, "", line); model = line
         }
@@ -77,34 +47,26 @@ BEGIN {
 
     printf "__%s__%s\n", repo, model > "/proc/target_version"
     close("/proc/target_version")
-    system("echo '" ts " parseinfo(gawk): target_version=__" repo "__" model "' >> " LOG)
+    system("echo '" ts " parseinfo: target_version=__" repo "__" model "' >> " LOG)
 
-    # ── (2) INJECT THE DROPBEAR UNIT AND LET SYSTEMD OWN IT ──────────────────
-    # The unit (./dropbear.service -> /opt/systemd/dropbear.service) has an
-    # ExecStartPre that stages the unsigned binary onto /run and generates the
-    # host key; ExecStart runs it from /run on port 22.
-    system("mkdir -p /run/systemd/system")
+    # ── (2) STAGE AND START ALL ROOT-OWNED EXTRA UNITS ───────────────────────
+    cmd = "rc=0; " \
+          "for unit in " UNIT_DIR "/*.service; do " \
+          "  [ -f \"$unit\" ] || continue; " \
+          "  name=${unit##*/}; " \
+          "  case \"$name\" in *.service) ;; *) echo '" ts " invalid unit name: $name' >> " LOG "; rc=1; continue ;; esac; " \
+          "  if ! cp -f \"$unit\" \"/run/systemd/system/$name\"; then " \
+          "    echo '" ts " stage failed: $name' >> " LOG "; rc=1; continue; " \
+          "  fi; " \
+          "  if ! /usr/bin/systemctl start \"$name\"; then " \
+          "    /usr/bin/systemctl daemon-reload; " \
+          "    if ! /usr/bin/systemctl start \"$name\"; then " \
+          "      echo '" ts " start failed: $name' >> " LOG "; rc=1; " \
+          "    fi; " \
+          "  fi; " \
+          "done; " \
+          "exit $rc"
 
-    rc = system("/bin/cp -f /opt/systemd/dropbear.service /run/systemd/system/dropbear.service")
-    system("echo '" ts " parseinfo(gawk): stage unit rc=" rc "' >> " LOG)
-
-    # Load + start just this unit over D-Bus. For a *newly written* unit file
-    # systemd resolves it on demand (equivalent to Manager.LoadUnit), so the
-    # heavy `daemon-reload` is not required; that is only needed to re-read units
-    # which are already loaded. Verified on-device (systemd 244):
-    #   busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
-    #     org.freedesktop.systemd1.Manager LoadUnit s dropbear.service   -> ok
-    #   systemctl restart <brand-new unit>                               -> rc=0
-    rc = system("/usr/bin/systemctl restart dropbear.service")
-    if (rc != 0) {
-        # Fallback for any systemd build that does not resolve it on demand.
-        system("echo '" ts " parseinfo(gawk): on-demand load failed (rc=" rc "); daemon-reload fallback' >> " LOG)
-        system("/usr/bin/systemctl daemon-reload")
-        rc = system("/usr/bin/systemctl restart dropbear.service")
-    }
-    system("echo '" ts " parseinfo(gawk): start dropbear rc=" rc "' >> " LOG)
-
-    # ── (3) DONE ─────────────────────────────────────────────────────────────
-    # No keep-alive: dropbear now lives in its own unit/cgroup owned by PID 1, so
-    # it is unaffected by AT-HUB exiting. (Stock AT-HUB also exits after a few s.)
+    rc = system(cmd)
+    system("echo '" ts " parseinfo: start units rc=" rc "' >> " LOG)
 }

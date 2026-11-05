@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: proposal, 2026-11-04. No implementation yet. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes and M1 headless broker complete and cold-boot validated. Next milestone: M2 approval UI. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -308,29 +308,44 @@ D-Bus versus raw sockets is independent of the authorization model: either trans
 
 ## 9. Boot and storage integration
 
-Reuse the existing AT-HUB boot hook to install and start a transient `tv-authd.service` from `/run/systemd/system`. Systemd owns restart and cgroup lifetime; AT-HUB must not host the long-running daemon.
+The AT-HUB boot hook dynamically discovers every root-owned
+`/opt/tv-units/*.service`, copies it into `/run/systemd/system`, and starts each
+unit independently. Systemd owns restart and cgroup lifetime; AT-HUB does not
+host the long-running daemon.
 
-Proposed paths:
+Validated layout:
 
 ```text
+/opt/tv-units/
+    tv-authd.service         root-only unit source
+    dropbear.service         root-only unit source
+
 /opt/tv-auth/
     tv-authd                 persistent ARMv7 binary
-    tv-authd.service         persistent unit source
     grants.json              persistent allow grants
+
+/opt/tv-sshd/
+    bin/dropbear             root-only Dropbear source
+    authorized_keys
+    dropbear_ed25519_host_key
 
 /run/tv-auth/
     tv-authd                 executable staged on tmpfs
     broker.sock
-    pending/                 if runtime files are needed
+    tv-authd.log
 ```
 
-`/opt/tv-auth` must be root-owned, mode `0700`, with a suitable non-app-writable SMACK label and safe parent ancestry. Use symlink-safe file handling and atomic grant-file replacement. Corrupt or unreadable grants fail closed. Runtime logs stay bounded in `/run`; avoid routine flash writes and do not log command output by default.
+`/opt/tv-units`, `/opt/tv-auth`, and `/opt/tv-sshd/bin` are root-owned mode
+`0700`, labeled `System::Shared`. Use symlink-safe file handling and atomic
+grant-file replacement. Corrupt or unreadable grants fail closed. Runtime logs
+stay bounded in `/run`; do not log command output by default.
 
-### Existing persistence inputs need hardening
+### Persistence inputs were hardened
 
-The live TV currently has `/opt/systemd` labeled `User` and mode `0777`, and the Dropbear source under the app-writable `User::App::Shared` staging area. Those inputs are copied into a root execution path.
-
-Before presenting `tv-authd` as a security feature, place its unit, binary, and grants in the root-only layout above. Harden Dropbear's boot inputs as well; otherwise an unprivileged app can bypass the broker by altering a future root boot payload.
+The previous app-writable `/opt/systemd` directory and the app-shared Dropbear
+staging binary were retired. `/opt/systemd` was removed; Dropbear now executes a
+root-only source at `/opt/tv-sshd/bin/dropbear`. This was validated across a cold
+boot. The stock behavior and old unit/hook were backed up before deployment.
 
 ## 10. Implementation and binary-size guidance
 
@@ -438,13 +453,16 @@ Avoid having multiple agents edit the protocol definition or the same persistenc
 
 The native-UI failure is why the design now uses managed .NET for the approval UI. Root daemon execution from `/run` remains native Rust.
 
-### M1 — Headless broker
+### M1 — Headless broker (complete)
 
-- Start through the transient systemd unit.
-- Pre-seed one test app's allow grant manually.
-- Execute a harmless command and return bounded output.
-- Reject an unknown test app.
-- Restart client processes without restarting the broker.
+- Rust core implemented under `root-broker/daemon/` with NDJSON protocol, strict package-label identity, exact-label grants, bounded execution, and ARMv7 build.
+- Deployed as `/opt/tv-auth/tv-authd`, unit source `/opt/tv-units/tv-authd.service`, runtime socket `/run/tv-auth/broker.sock`.
+- Dynamic boot hook stages and starts every `/opt/tv-units/*.service` independently.
+- A granted managed .NET package executed a root command and received a valid response; an ungranted package was denied.
+- `systemctl restart tv-authd.service` recovered the socket and accepted the next request.
+- Test packages, grants, and temporary files were removed after validation.
+- Cold boot passed: new boot ID, AT-HUB `start units rc=0`, Dropbear and `tv-authd` automatically active from `/opt/tv-units`, broker socket recreated, and empty grants loaded.
+- The root-only Dropbear source path was validated on the cold boot.
 
 ### M2 — Approval and persistent grants
 
