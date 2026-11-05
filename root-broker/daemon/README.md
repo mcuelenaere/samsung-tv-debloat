@@ -59,8 +59,11 @@ docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
 ./build-armv7.sh
 ```
 
-This produces a static stripped ARMv7 musl binary in `out/tv-authd` and checks
-its `--help` output under ARM emulation. The validated M2 build is 546,388 bytes,
+This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
+from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
+checks its `--help` output under ARM emulation. A full build takes about 11 s
+(the previous fully emulated build took about 100 s). With `rustix` and
+`lexopt` the binary is 558,812 bytes. The validated M2 build is 546,388 bytes,
 SHA-256 `d93890d3f4104fee7fc537e927010dc05b8c06777944a671c2262a558c4a5ae1`
 (M1 was 461,940 bytes).
 

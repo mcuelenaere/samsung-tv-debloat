@@ -30,7 +30,7 @@ pub struct GrantStore {
 impl GrantStore {
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let euid = unsafe { libc::geteuid() };
+        let euid = rustix::process::geteuid().as_raw();
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

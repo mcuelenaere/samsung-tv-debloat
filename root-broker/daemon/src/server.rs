@@ -8,9 +8,10 @@ use crate::protocol::{
     validate_revoke, write_response, ExecRequest, GrantView, ParseError, Request, Response,
     MAX_REQUEST_BYTES,
 };
+use rustix::io::Errno;
+use rustix::net::RecvFlags;
 use std::collections::HashSet;
 use std::io::{self, BufReader, Read};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -99,27 +100,12 @@ impl Read for DeadlineReader {
 
 /// True if the peer has closed its end (non-consuming check).
 fn peer_closed(writer: &Arc<Mutex<UnixStream>>) -> bool {
-    let fd = writer
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_raw_fd();
-    let mut byte = 0_u8;
-    // SAFETY: `fd` is a live socket owned by `writer`; `byte` is a valid 1-byte buffer.
-    let n = unsafe {
-        libc::recv(
-            fd,
-            (&mut byte as *mut u8).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    match n {
-        0 => true,
-        n if n > 0 => false,
-        _ => !matches!(
-            io::Error::last_os_error().kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ),
+    let stream = writer.lock().unwrap_or_else(|error| error.into_inner());
+    let mut byte = [0_u8; 1];
+    match rustix::net::recv(&*stream, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT) {
+        Ok((0, _)) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(error, Errno::AGAIN | Errno::INTR),
     }
 }
 

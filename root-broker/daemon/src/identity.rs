@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::AsFd;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -28,33 +28,17 @@ pub fn is_valid_package_label(label: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub fn from_fd(fd: RawFd) -> io::Result<PeerIdentity> {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut lengths = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut lengths,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if lengths as usize != std::mem::size_of::<libc::ucred>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short SO_PEERCRED result",
-        ));
-    }
+pub fn from_fd(socket: impl AsFd) -> io::Result<PeerIdentity> {
+    use std::os::fd::AsRawFd;
 
+    let credentials = rustix::net::sockopt::socket_peercred(&socket)?;
+
+    // SO_PEERSEC (the SMACK label) has no rustix wrapper.
     let mut buffer = [0_u8; 4096];
     let mut length = buffer.len() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
-            fd,
+            socket.as_fd().as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PEERSEC,
             buffer.as_mut_ptr().cast(),
@@ -84,15 +68,15 @@ pub fn from_fd(fd: RawFd) -> io::Result<PeerIdentity> {
     }
 
     Ok(PeerIdentity {
-        pid: credentials.pid,
-        uid: credentials.uid,
-        gid: credentials.gid,
+        pid: credentials.pid.as_raw_nonzero().get(),
+        uid: credentials.uid.as_raw(),
+        gid: credentials.gid.as_raw(),
         label: label.to_owned(),
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn from_fd(_fd: RawFd) -> io::Result<PeerIdentity> {
+pub fn from_fd(_socket: impl AsFd) -> io::Result<PeerIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "peer security labels require Linux",

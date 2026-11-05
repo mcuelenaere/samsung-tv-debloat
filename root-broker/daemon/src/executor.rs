@@ -1,6 +1,10 @@
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+use rustix::io::Errno;
+use rustix::process::{kill_process_group, Pid, Signal};
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -47,8 +51,8 @@ pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
         .stderr
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "missing stderr"))?;
-    let stdout_fd = stdout.as_raw_fd();
-    let stderr_fd = stderr.as_raw_fd();
+    let stdout_fd = stdout.as_fd();
+    let stderr_fd = stderr.as_fd();
     set_nonblocking(stdout_fd)?;
     set_nonblocking(stderr_fd)?;
 
@@ -72,7 +76,7 @@ pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
 
         if !timed_out && status.is_none() && Instant::now() >= deadline {
             timed_out = true;
-            kill_process_group(&child);
+            kill_group(&child);
             let kill_deadline = Instant::now() + Duration::from_secs(2);
             while status.is_none() && Instant::now() < kill_deadline {
                 status = child.try_wait()?;
@@ -96,35 +100,42 @@ pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
 
         let poll_timeout = if status.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            remaining.as_millis().clamp(1, 50) as i32
+            remaining.as_millis().clamp(1, 50) as i64
         } else {
             10
         };
-        let mut fds = [
-            pollfd(stdout_fd, stdout_closed),
-            pollfd(stderr_fd, stderr_closed),
-        ];
-        let result =
-            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: poll_timeout * 1_000_000,
+        };
+        // Only poll pipes that are still open: an EOF'd pipe reports POLLHUP
+        // forever and would turn this into a busy loop.
+        let mut fds = Vec::with_capacity(2);
+        if !stdout_closed {
+            fds.push(PollFd::new(&stdout_fd, PollFlags::IN));
         }
-        if result > 0 {
-            if !stdout_closed && fds[0].revents != 0 {
-                drain_fd(stdout_fd, &mut output, &mut truncated, &mut stdout_closed)?;
-            }
-            if !stderr_closed && fds[1].revents != 0 {
-                drain_fd(
-                    stderr_fd,
-                    &mut error_output,
-                    &mut truncated,
-                    &mut stderr_closed,
-                )?;
-            }
+        if !stderr_closed {
+            fds.push(PollFd::new(&stderr_fd, PollFlags::IN));
+        }
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let mut ready = fds.iter().map(|fd| !fd.revents().is_empty());
+        let stdout_ready = !stdout_closed && ready.next().unwrap_or(false);
+        let stderr_ready = !stderr_closed && ready.next().unwrap_or(false);
+        drop(fds);
+        if stdout_ready {
+            drain_fd(stdout_fd, &mut output, &mut truncated, &mut stdout_closed);
+        }
+        if stderr_ready {
+            drain_fd(
+                stderr_fd,
+                &mut error_output,
+                &mut truncated,
+                &mut stderr_closed,
+            );
         }
     }
 
@@ -152,59 +163,37 @@ pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
     })
 }
 
-fn pollfd(fd: RawFd, closed: bool) -> libc::pollfd {
-    libc::pollfd {
-        fd: if closed { -1 } else { fd },
-        events: if closed { 0 } else { libc::POLLIN },
-        revents: 0,
-    }
-}
-
-fn drain_fd(
-    fd: RawFd,
-    output: &mut Vec<u8>,
-    truncated: &mut bool,
-    closed: &mut bool,
-) -> io::Result<()> {
+fn drain_fd(fd: BorrowedFd<'_>, output: &mut Vec<u8>, truncated: &mut bool, closed: &mut bool) {
     let mut buffer = [0_u8; 8192];
     // Bound one drain pass so a continuously writing process cannot starve
     // timeout and child-status checks in the caller.
     for _ in 0..64 {
-        let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if count > 0 {
-            let count = count as usize;
-            let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
-            let keep = remaining.min(count);
-            output.extend_from_slice(&buffer[..keep]);
-            if keep < count {
-                *truncated = true;
+        match rustix::io::read(fd, &mut buffer) {
+            Ok(0) => {
+                *closed = true;
+                return;
             }
-        } else if count == 0 {
-            *closed = true;
-            return Ok(());
-        } else {
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EAGAIN) => return Ok(()),
-                Some(libc::EINTR) => continue,
-                _ => {
-                    *closed = true;
-                    return Ok(());
+            Ok(count) => {
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+                let keep = remaining.min(count);
+                output.extend_from_slice(&buffer[..keep]);
+                if keep < count {
+                    *truncated = true;
                 }
+            }
+            Err(Errno::AGAIN) => return,
+            Err(Errno::INTR) => continue,
+            Err(_) => {
+                *closed = true;
+                return;
             }
         }
     }
-    Ok(())
 }
 
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let flags = fcntl_getfl(fd)?;
+    fcntl_setfl(fd, flags | OFlags::NONBLOCK)?;
     Ok(())
 }
 
@@ -234,7 +223,7 @@ impl Drop for ChildGuard {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
-        kill_process_group(&child);
+        kill_group(&child);
         let _ = child.kill();
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
@@ -249,10 +238,10 @@ impl Drop for ChildGuard {
     }
 }
 
-fn kill_process_group(child: &Child) {
-    let process_group = child.id() as libc::pid_t;
-    unsafe {
-        libc::kill(-process_group, libc::SIGKILL);
+/// SIGKILL the child's process group (it is the session leader via setsid).
+fn kill_group(child: &Child) {
+    if let Some(pid) = Pid::from_raw(child.id() as i32) {
+        let _ = kill_process_group(pid, Signal::KILL);
     }
 }
 

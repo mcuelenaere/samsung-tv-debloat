@@ -1,8 +1,5 @@
-use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -96,7 +93,7 @@ fn run(args: Args) -> io::Result<()> {
         };
 
         // Peer identity is a cheap getsockopt, so read it before taking a slot.
-        let identity = match identity::from_fd(stream.as_raw_fd()) {
+        let identity = match identity::from_fd(&stream) {
             Ok(identity) => identity,
             Err(error) => {
                 let _ = logger.log(&format!("peer_identity_error={error}"));
@@ -143,7 +140,23 @@ fn run(args: Args) -> io::Result<()> {
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut args = std::env::args().skip(1);
+    use lexopt::prelude::*;
+
+    fn path(parser: &mut lexopt::Parser) -> Result<PathBuf, String> {
+        parser
+            .value()
+            .map(PathBuf::from)
+            .map_err(|error| error.to_string())
+    }
+    fn value<T: std::str::FromStr>(parser: &mut lexopt::Parser, name: &str) -> Result<T, String> {
+        let raw = parser.value().map_err(|error| error.to_string())?;
+        let text = raw
+            .into_string()
+            .map_err(|_| format!("--{name} must be valid UTF-8"))?;
+        text.parse()
+            .map_err(|_| format!("--{name}: invalid value {text:?}"))
+    }
+
     let mut socket = PathBuf::from("/run/tv-auth/broker.sock");
     let mut grants = PathBuf::from("/opt/tv-auth/grants.json");
     let mut log = PathBuf::from("/run/tv-auth/tv-authd.log");
@@ -159,86 +172,32 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut max_launch_attempts = 3_usize;
     let mut max_connections = 16_usize;
 
-    while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--socket" => {
-                socket = PathBuf::from(args.next().ok_or("--socket requires a path")?);
+    let mut parser = lexopt::Parser::from_env();
+    while let Some(argument) = parser.next().map_err(|error| error.to_string())? {
+        match argument {
+            Long("socket") => socket = path(&mut parser)?,
+            Long("grants") => grants = path(&mut parser)?,
+            Long("log") => log = path(&mut parser)?,
+            Long("socket-gid") => socket_gid = value(&mut parser, "socket-gid")?,
+            Long("max-connections") => max_connections = value(&mut parser, "max-connections")?,
+            Long("ui-package") => ui_package = value(&mut parser, "ui-package")?,
+            Long("ui-uid") => ui_uid = value(&mut parser, "ui-uid")?,
+            Long("ui-app-id") => ui_app_id = Some(value(&mut parser, "ui-app-id")?),
+            Long("app-launcher") => app_launcher = path(&mut parser)?,
+            Long("prompt-timeout-ms") => {
+                prompt_timeout_ms = value(&mut parser, "prompt-timeout-ms")?
             }
-            "--grants" => {
-                grants = PathBuf::from(args.next().ok_or("--grants requires a path")?);
+            Long("ui-launch-timeout-ms") => {
+                ui_launch_timeout_ms = value(&mut parser, "ui-launch-timeout-ms")?
             }
-            "--log" => {
-                log = PathBuf::from(args.next().ok_or("--log requires a path")?);
+            Long("launch-cooldown-ms") => {
+                launch_cooldown_ms = value(&mut parser, "launch-cooldown-ms")?
             }
-            "--socket-gid" => {
-                socket_gid = args
-                    .next()
-                    .ok_or("--socket-gid requires a numeric gid")?
-                    .parse()
-                    .map_err(|_| "--socket-gid must be numeric")?;
+            Long("prompt-queue-max") => prompt_queue_max = value(&mut parser, "prompt-queue-max")?,
+            Long("max-launch-attempts") => {
+                max_launch_attempts = value(&mut parser, "max-launch-attempts")?
             }
-            "--max-connections" => {
-                max_connections = args
-                    .next()
-                    .ok_or("--max-connections requires a number")?
-                    .parse()
-                    .map_err(|_| "--max-connections must be numeric")?;
-                if max_connections == 0 {
-                    return Err("--max-connections must be greater than zero".into());
-                }
-            }
-            "--ui-package" => {
-                ui_package = args.next().ok_or("--ui-package requires a package id")?;
-            }
-            "--ui-uid" => {
-                ui_uid = args
-                    .next()
-                    .ok_or("--ui-uid requires a numeric uid")?
-                    .parse()
-                    .map_err(|_| "--ui-uid must be numeric")?;
-            }
-            "--ui-app-id" => {
-                ui_app_id = Some(args.next().ok_or("--ui-app-id requires an app id")?);
-            }
-            "--app-launcher" => {
-                app_launcher = PathBuf::from(args.next().ok_or("--app-launcher requires a path")?);
-            }
-            "--prompt-timeout-ms" => {
-                prompt_timeout_ms = args
-                    .next()
-                    .ok_or("--prompt-timeout-ms requires a number")?
-                    .parse()
-                    .map_err(|_| "--prompt-timeout-ms must be numeric")?;
-            }
-            "--ui-launch-timeout-ms" => {
-                ui_launch_timeout_ms = args
-                    .next()
-                    .ok_or("--ui-launch-timeout-ms requires a number")?
-                    .parse()
-                    .map_err(|_| "--ui-launch-timeout-ms must be numeric")?;
-            }
-            "--launch-cooldown-ms" => {
-                launch_cooldown_ms = args
-                    .next()
-                    .ok_or("--launch-cooldown-ms requires a number")?
-                    .parse()
-                    .map_err(|_| "--launch-cooldown-ms must be numeric")?;
-            }
-            "--prompt-queue-max" => {
-                prompt_queue_max = args
-                    .next()
-                    .ok_or("--prompt-queue-max requires a number")?
-                    .parse()
-                    .map_err(|_| "--prompt-queue-max must be numeric")?;
-            }
-            "--max-launch-attempts" => {
-                max_launch_attempts = args
-                    .next()
-                    .ok_or("--max-launch-attempts requires a number")?
-                    .parse()
-                    .map_err(|_| "--max-launch-attempts must be numeric")?;
-            }
-            "--help" | "-h" => {
+            Long("help") | Short('h') => {
                 println!(
                     "tv-authd {}\n\
                      \n\
@@ -262,20 +221,24 @@ fn parse_args() -> Result<Option<Args>, String> {
                 );
                 return Ok(None);
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => return Err(other.unexpected().to_string()),
         }
     }
 
     if !identity::is_valid_package_id(&ui_package) {
         return Err("--ui-package must be a valid package id".into());
     }
-    if prompt_timeout_ms == 0
+    if max_connections == 0
+        || prompt_timeout_ms == 0
         || ui_launch_timeout_ms == 0
         || launch_cooldown_ms == 0
         || prompt_queue_max == 0
         || max_launch_attempts == 0
     {
-        return Err("timeouts, queue size, and launch attempts must be greater than zero".into());
+        return Err(
+            "connections, timeouts, queue size, and launch attempts must be greater than zero"
+                .into(),
+        );
     }
     if prompt_timeout_ms > 600_000
         || ui_launch_timeout_ms > 120_000
@@ -336,12 +299,5 @@ fn remove_stale_socket(socket: &Path) -> io::Result<()> {
 }
 
 fn chown_root_group(path: &Path, gid: u32) -> io::Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let result = unsafe { libc::chown(path.as_ptr(), 0, gid) };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    std::os::unix::fs::chown(path, Some(0), Some(gid))
 }
