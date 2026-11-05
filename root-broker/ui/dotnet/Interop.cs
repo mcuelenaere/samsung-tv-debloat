@@ -82,7 +82,16 @@ namespace TvAuthUi
         public static extern void ecore_wl2_window_type_set(IntPtr window, int type);
 
         [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr elm_bg_add(IntPtr parent);
+        public static extern void elm_win_alpha_set(IntPtr obj, byte alpha);
+
+        [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void elm_win_screen_size_get(IntPtr obj, out int x, out int y, out int w, out int h);
+
+        [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr elm_table_add(IntPtr parent);
+
+        [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void elm_table_pack(IntPtr obj, IntPtr child, int col, int row, int colspan, int rowspan);
 
         [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr elm_box_add(IntPtr parent);
@@ -119,6 +128,18 @@ namespace TvAuthUi
 
         [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern void evas_object_size_hint_min_set(IntPtr obj, int width, int height);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void evas_object_size_hint_padding_set(IntPtr obj, int left, int right, int top, int bottom);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr evas_object_evas_get(IntPtr obj);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr evas_object_rectangle_add(IntPtr evas);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void evas_object_color_set(IntPtr obj, int r, int g, int b, int a);
 
         [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern void evas_object_resize(IntPtr obj, int width, int height);

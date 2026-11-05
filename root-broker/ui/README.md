@@ -24,14 +24,16 @@ Samsung's signed apphost, so UEP stays enforced. Native calls are confined to
 When an app without a persistent grant connects, the daemon launches
 `app_launcher -s org.tvauth.ui` and sends a `ui.prompt` frame. The UI:
 
-- raises a notification-type EFL window (notification level TOP, then HIGH,
-  MEDIUM, DEFAULT);
+- raises a full-screen notification-type EFL window (notification level TOP,
+  then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card, so
+  the home screen no longer shows through the prompt;
 - displays the exact package ID and SMACK label from the daemon, plus the
   daemon-generated **FULL ROOT ACCESS** warning;
 - displays a sanitized display copy of the command (control and bidirectional
   formatting characters are replaced; long commands are truncated and marked);
 - offers **Deny**, **Allow once**, and **Always allow**, focusing **Deny** by
   default;
+- shows a live "Denied automatically in N s" countdown for the daemon timeout;
 - sends `ui.decision` with the prompt ID and nonce;
 - exits shortly after the daemon acknowledges the decision.
 
@@ -92,9 +94,9 @@ out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
 Observed local artifacts:
 
 ```text
-Managed assembly: 34,816 bytes
-Unsigned TPK:     16,535 bytes
-Signed TPK:       24,073 bytes
+Managed assembly: 37,376 bytes
+Unsigned TPK:     17,995 bytes
+Signed TPK:       25,545 bytes
 ```
 
 ## Signing and installation
@@ -139,6 +141,13 @@ Completed on 2026-11-05 with `org.tvauth.ui` installed and the M2 daemon running
    so automated tests must wait for the grants response before injecting keys.
 
 Pause/resume and repeat-key hardening remain M4 items.
+
+The card layout was re-verified on the TV on 2026-11-05 using
+`enlightenment_info -dump_screen`. The window reported 1920x1080; the scrim
+dimmed the home screen to about 12% brightness; the prompt rendered with a live
+countdown and timed out to `denied`/`prompt_timeout`; and `input_keyevent
+XF86Back` closed the manager. No monospace font is installed, so the command
+falls back to the proportional UI font.
 
 ## Known limitations
 

@@ -30,7 +30,19 @@ namespace TvAuthUi
         private static readonly Interop.EvasSmartCb RefreshDelegate = OnRefreshClicked;
         private static readonly Interop.EcoreTimerCb TimerDelegate = OnTimer;
 
+        // Palette (RGB). Rectangles are opaque except the scrim.
+        private const int ColorCard = 0x1c1f26;
+        private const int ColorInset = 0x0e1014;
+        private const int ColorRow = 0x272b34;
+        private const int ColorDanger = 0xe5484d;
+        private const int ColorAccent = 0x3e7bfa;
+        private const int CardWidth = 1200;
+        private const int CardPadding = 56;
+
         private static IntPtr window;
+        private static IntPtr accentBar;
+        private static IntPtr countdownLabel;
+        private static int lastCountdown = -1;
         private static IntPtr headerLabel;
         private static IntPtr statusLabel;
         private static IntPtr contentBox;
@@ -103,31 +115,45 @@ namespace TvAuthUi
             if (!backGrabbed)
                 Log("XF86Back keygrab failed");
 
-            var background = Interop.elm_bg_add(window);
-            if (background == IntPtr.Zero)
+            // Full-screen dimmed scrim with a solid, centered card. The old
+            // elm_bg is transparent in the TV theme, so the home screen showed
+            // straight through the prompt. If the compositor ignores alpha the
+            // scrim simply renders opaque black, which is also fine.
+            Interop.elm_win_alpha_set(window, 1);
+            var scrim = CreateRect(window, 0x000000, 225);
+            Interop.evas_object_size_hint_weight_set(scrim, 1.0, 1.0);
+            Interop.elm_win_resize_object_add(window, scrim);
+
+            var layout = Interop.elm_table_add(window);
+            if (layout == IntPtr.Zero)
                 return false;
-            Interop.evas_object_size_hint_weight_set(background, 1.0, 1.0);
-            Interop.elm_win_resize_object_add(window, background);
-            Interop.evas_object_show(background);
+            Interop.evas_object_size_hint_weight_set(layout, 1.0, 1.0);
+            Interop.evas_object_size_hint_align_set(layout, -1.0, -1.0);
+            Interop.elm_win_resize_object_add(window, layout);
+            Interop.evas_object_show(layout);
 
-            var rootBox = Interop.elm_box_add(window);
-            if (rootBox == IntPtr.Zero)
-                return false;
-            Interop.evas_object_size_hint_weight_set(rootBox, 1.0, 1.0);
-            Interop.evas_object_size_hint_align_set(rootBox, -1.0, -1.0);
-            Interop.elm_box_padding_set(rootBox, 28, 20);
-            Interop.elm_win_resize_object_add(window, rootBox);
-            Interop.evas_object_show(rootBox);
+            var card = Panel(layout, ColorCard, CardPadding, CardPadding, out var cardBox);
+            Interop.evas_object_size_hint_weight_set(card, 1.0, 1.0);
+            Interop.evas_object_size_hint_align_set(card, 0.5, 0.5);
+            Interop.elm_table_pack(layout, card, 0, 0, 1, 1);
+            Interop.elm_box_padding_set(cardBox, 0, 18);
 
-            headerLabel = CreateLabel(rootBox, "<font_size=42><b>Root access manager</b></font_size>");
-            headerLabel = AddToBox(rootBox, headerLabel);
-            statusLabel = CreateLabel(rootBox, "<font_size=22>Connecting to tv-authd...</font_size>");
-            statusLabel = AddToBox(rootBox, statusLabel);
+            accentBar = CreateRect(card, ColorAccent, 255);
+            Interop.evas_object_size_hint_min_set(accentBar, CardWidth, 8);
+            Interop.evas_object_size_hint_weight_set(accentBar, 1.0, 1.0);
+            Interop.evas_object_size_hint_align_set(accentBar, -1.0, 0.0);
+            Interop.elm_table_pack(card, accentBar, 0, 0, 1, 1);
 
-            contentBox = Interop.elm_box_add(rootBox);
+            headerLabel = AddToBox(cardBox, CreateLabel(cardBox, ""));
+            statusLabel = AddToBox(cardBox, CreateLabel(cardBox, ""));
+            SetHeader("TV-AUTHD", "Root access manager", ColorAccent);
+            SetStatus("Connecting to tv-authd...");
+
+            contentBox = Interop.elm_box_add(cardBox);
             Interop.evas_object_size_hint_weight_set(contentBox, 1.0, 1.0);
             Interop.evas_object_size_hint_align_set(contentBox, -1.0, -1.0);
-            Interop.elm_box_pack_end(rootBox, contentBox);
+            Interop.elm_box_padding_set(contentBox, 0, 24);
+            Interop.elm_box_pack_end(cardBox, contentBox);
             Interop.evas_object_show(contentBox);
 
             RenderManager();
@@ -143,7 +169,14 @@ namespace TvAuthUi
             broker.StatusMessage += OnStatusMessage;
             broker.Start();
 
-            Interop.evas_object_resize(window, 1200, 700);
+            Interop.elm_win_screen_size_get(window, out _, out _, out var screenW, out var screenH);
+            if (screenW <= 0 || screenH <= 0)
+            {
+                screenW = 1920;
+                screenH = 1080;
+            }
+            Log("screen " + screenW + "x" + screenH);
+            Interop.evas_object_resize(window, screenW, screenH);
             Interop.elm_win_center(window, 1, 1);
             Interop.evas_object_show(window);
             Interop.elm_win_raise(window);
@@ -187,6 +220,16 @@ namespace TvAuthUi
                 catch (Exception error)
                 {
                     Log("dispatch: " + error);
+                }
+            }
+
+            if (currentPrompt != null && promptExpiresAt.HasValue && countdownLabel != IntPtr.Zero)
+            {
+                var remaining = (int)Math.Ceiling((promptExpiresAt.Value - DateTime.UtcNow).TotalSeconds);
+                if (remaining != lastCountdown && remaining >= 0)
+                {
+                    lastCountdown = remaining;
+                    SetText(countdownLabel, Small("Denied automatically in " + remaining + " s", "#8a8f99"));
                 }
             }
 
@@ -296,12 +339,14 @@ namespace TvAuthUi
                 return;
             if (ok)
             {
-                SetStatus("Decision sent. Closing...");
+                SetStatus("Closing...");
                 exitAt = DateTime.UtcNow.AddSeconds(1.2);
             }
             else
             {
-                SetStatus("Decision failed: " + (string.IsNullOrEmpty(error) ? "unknown" : error));
+                SetHeader("ERROR", "Decision failed", ColorDanger);
+                SetStatus("tv-authd reported: " + (string.IsNullOrEmpty(error) ? "unknown" : error)
+                    + ". The request was not approved.");
                 exitAt = DateTime.UtcNow.AddSeconds(2.5);
             }
         }
@@ -367,7 +412,18 @@ namespace TvAuthUi
             promptExpiresAt = null;
             exitAt = DateTime.UtcNow.AddSeconds(5);
             ClearContent();
-            SetHeader("Root access requested");
+            switch (decision)
+            {
+                case "once":
+                    SetHeader("ROOT ACCESS", "Allowed once", ColorAccent);
+                    break;
+                case "always":
+                    SetHeader("ROOT ACCESS", "Always allowed", ColorAccent);
+                    break;
+                default:
+                    SetHeader("ROOT ACCESS", "Denied", ColorDanger);
+                    break;
+            }
             SetStatus("Sending decision...");
             broker.Decide(prompt, decision);
             Log("decision sent package=" + prompt.Package + " decision=" + decision);
@@ -379,34 +435,37 @@ namespace TvAuthUi
                 return;
             var prompt = currentPrompt;
             ClearContent();
-            SetHeader("Root access requested");
-            SetStatus("An application is requesting full root access.");
+            SetHeader("ROOT ACCESS REQUEST", "An app wants full root access", ColorDanger);
+            SetStatus("Root can read, change or erase anything on this TV, including other apps' data "
+                + "and system files. Only allow apps you trust.");
 
-            AddContent(CreateLabel(contentBox,
-                "<font_size=26><b>Package:</b> " + Escape(prompt.Package) + "</font_size>" +
-                "<br/><font_size=18>" + Escape(prompt.Label) + "</font_size>"));
+            var app = Panel(contentBox, ColorRow, 32, 24, out var appBox);
+            AddContent(app);
+            AddToBox(appBox, CreateLabel(appBox, Small("APPLICATION", "#8a8f99")));
+            AddToBox(appBox, CreateLabel(appBox,
+                "<font_size=34><b>" + Escape(prompt.Package) + "</b></font_size>"));
+            AddToBox(appBox, CreateLabel(appBox, Small(prompt.Label, "#8a8f99")));
 
-            AddContent(CreateLabel(contentBox,
-                "<font_size=24><b>This grants FULL ROOT ACCESS.</b></font_size>" +
-                "<br/><font_size=20>Commands will run as root. Only allow packages you trust." +
-                "<br/>This decision applies to the command shown below.</font_size>"));
+            AddContent(CreateLabel(contentBox, Small("COMMAND", "#8a8f99")));
+            var command = Panel(contentBox, ColorInset, 28, 20, out var commandBox);
+            AddContent(command);
+            AddToBox(commandBox, CreateLabel(commandBox,
+                "<font=Monospace><font_size=22><color=#e8e8e8>"
+                + CommandMarkup(prompt.Command, prompt.CommandTruncated)
+                + "</color></font_size></font>"));
 
-            AddContent(CreateLabel(contentBox,
-                "<font_size=20>" + CommandMarkup(prompt.Command, prompt.CommandTruncated) +
-                "</font_size>"));
+            AddContent(CreateLabel(contentBox, Small(
+                "<b>Allow once</b> runs only this command. <b>Always allow</b> lets this app run any "
+                + "command as root without asking again; revoke it later in Root access manager.",
+                "#b4b9c2", escape: false)));
 
-            var buttons = Interop.elm_box_add(contentBox);
-            Interop.elm_box_horizontal_set(buttons, 1);
-            Interop.elm_box_padding_set(buttons, 12, 8);
-            Interop.evas_object_size_hint_weight_set(buttons, 1.0, 0.0);
-            Interop.evas_object_size_hint_align_set(buttons, -1.0, 1.0);
-            Interop.elm_box_pack_end(contentBox, buttons);
-            Interop.evas_object_show(buttons);
-            contentObjects.Add(buttons);
-
-            var deny = CreateButton(buttons, "Deny", DecisionDelegate, (IntPtr)1);
-            CreateButton(buttons, "Allow once", DecisionDelegate, (IntPtr)2);
-            CreateButton(buttons, "Always allow", DecisionDelegate, (IntPtr)3);
+            var footer = CreateRow(contentBox);
+            AddContent(footer);
+            lastCountdown = -1;
+            countdownLabel = AddToBox(footer, CreateLabel(footer, ""));
+            var deny = CreateButton(footer, "Deny", DecisionDelegate, (IntPtr)1);
+            CreateButton(footer, "Allow once", DecisionDelegate, (IntPtr)2);
+            CreateButton(footer, "Always allow", DecisionDelegate, (IntPtr)3);
             Interop.elm_object_focus_set(deny, 1);
         }
 
@@ -415,46 +474,42 @@ namespace TvAuthUi
             if (contentBox == IntPtr.Zero)
                 return;
             ClearContent();
-            SetHeader("Root access manager");
-            SetStatus(managerMessage ?? "Applications with persistent root access are listed below.");
+            SetHeader("TV-AUTHD", "Root access manager", ColorAccent);
+            SetStatus(managerMessage ?? "Apps listed here can run commands as root without asking.");
 
             if (!connected)
             {
                 AddContent(CreateLabel(contentBox,
-                    "<font_size=22><color=#ffcc66>Not connected to tv-authd. Retrying automatically.</color></font_size>"));
+                    Small("Not connected to tv-authd. Retrying automatically.", "#ffb74d")));
             }
 
+            var firstButton = IntPtr.Zero;
             if (grants.Count == 0)
             {
-                AddContent(CreateLabel(contentBox,
-                    "<font_size=24>No application currently has persistent root access.</font_size>"));
+                var empty = Panel(contentBox, ColorRow, 32, 28, out var emptyBox);
+                AddContent(empty);
+                AddToBox(emptyBox, CreateLabel(emptyBox,
+                    "<font_size=28><b>No apps have permanent root access</b></font_size>"));
+                AddToBox(emptyBox, CreateLabel(emptyBox, Small(
+                    "When an app asks for root and you choose Always allow, it will appear here.",
+                    "#8a8f99")));
             }
             else
             {
-                var firstButton = IntPtr.Zero;
                 foreach (var grant in grants.Take(5))
                 {
-                    var row = Interop.elm_box_add(contentBox);
-                    Interop.elm_box_horizontal_set(row, 1);
-                    Interop.elm_box_padding_set(row, 12, 8);
-                    Interop.evas_object_size_hint_weight_set(row, 1.0, 0.0);
-                    Interop.evas_object_size_hint_align_set(row, -1.0, 0.5);
-                    Interop.elm_box_pack_end(contentBox, row);
-                    Interop.evas_object_show(row);
-                    contentObjects.Add(row);
+                    var row = Panel(contentBox, ColorRow, 32, 20, out var rowBox);
+                    AddContent(row);
+                    Interop.elm_box_horizontal_set(rowBox, 1);
+                    Interop.elm_box_padding_set(rowBox, 24, 0);
 
-                    AddToBox(row, CreateLabel(row,
-                        "<font_size=24><b>" + Escape(grant.Package) + "</b></font_size>" +
-                        "<br/><font_size=17><color=#b0b0b0>" + Escape(grant.Label) +
-                        "</color></font_size>"));
+                    AddToBox(rowBox, CreateLabel(rowBox,
+                        "<font_size=28><b>" + Escape(grant.Package) + "</b></font_size><br/>"
+                        + Small(grant.Label, "#8a8f99")));
 
                     var handle = GCHandle.Alloc(grant.Label);
                     revokeHandles.Add(GCHandle.ToIntPtr(handle));
-                    var button = CreateButton(
-                        row,
-                        "Revoke",
-                        RevokeDelegate,
-                        GCHandle.ToIntPtr(handle));
+                    var button = CreateButton(rowBox, "Revoke", RevokeDelegate, GCHandle.ToIntPtr(handle));
                     if (firstButton == IntPtr.Zero)
                         firstButton = button;
                 }
@@ -462,23 +517,71 @@ namespace TvAuthUi
                 if (grants.Count > 5)
                 {
                     AddContent(CreateLabel(contentBox,
-                        "<font_size=18>Only the first 5 grants are shown.</font_size>"));
+                        Small("Only the first 5 of " + grants.Count + " apps are shown.", "#8a8f99")));
                 }
-                if (firstButton != IntPtr.Zero)
-                    Interop.elm_object_focus_set(firstButton, 1);
             }
 
-            var buttons = Interop.elm_box_add(contentBox);
-            Interop.elm_box_horizontal_set(buttons, 1);
-            Interop.elm_box_padding_set(buttons, 12, 8);
-            Interop.evas_object_size_hint_weight_set(buttons, 1.0, 0.0);
-            Interop.evas_object_size_hint_align_set(buttons, -1.0, 1.0);
-            Interop.elm_box_pack_end(contentBox, buttons);
-            Interop.evas_object_show(buttons);
-            contentObjects.Add(buttons);
-            var refresh = CreateButton(buttons, "Refresh", RefreshDelegate, IntPtr.Zero);
-            if (grants.Count == 0)
-                Interop.elm_object_focus_set(refresh, 1);
+            var footer = CreateRow(contentBox);
+            AddContent(footer);
+            AddToBox(footer, CreateLabel(footer, Small("Press BACK to close", "#8a8f99")));
+            var refresh = CreateButton(footer, "Refresh", RefreshDelegate, IntPtr.Zero);
+            Interop.elm_object_focus_set(firstButton != IntPtr.Zero ? firstButton : refresh, 1);
+        }
+
+        private static string Small(string text, string color, bool escape = true)
+        {
+            return "<font_size=20><color=" + color + ">" + (escape ? Escape(text) : text)
+                + "</color></font_size>";
+        }
+
+        private static IntPtr CreateRect(IntPtr parent, int rgb, int alpha)
+        {
+            var rect = Interop.evas_object_rectangle_add(Interop.evas_object_evas_get(parent));
+            // Evas colors are premultiplied.
+            Interop.evas_object_color_set(rect,
+                ((rgb >> 16) & 0xff) * alpha / 255,
+                ((rgb >> 8) & 0xff) * alpha / 255,
+                (rgb & 0xff) * alpha / 255,
+                alpha);
+            Interop.evas_object_show(rect);
+            return rect;
+        }
+
+        /// <summary>A solid rectangle with a padded vertical box stacked on top.</summary>
+        private static IntPtr Panel(IntPtr parent, int rgb, int padX, int padY, out IntPtr inner)
+        {
+            var table = Interop.elm_table_add(parent);
+            Interop.evas_object_size_hint_weight_set(table, 1.0, 0.0);
+            Interop.evas_object_size_hint_align_set(table, -1.0, 0.5);
+
+            var rect = CreateRect(table, rgb, 255);
+            Interop.evas_object_size_hint_weight_set(rect, 1.0, 1.0);
+            Interop.evas_object_size_hint_align_set(rect, -1.0, -1.0);
+            Interop.elm_table_pack(table, rect, 0, 0, 1, 1);
+
+            inner = Interop.elm_box_add(table);
+            Interop.evas_object_size_hint_weight_set(inner, 1.0, 1.0);
+            Interop.evas_object_size_hint_align_set(inner, -1.0, -1.0);
+            Interop.evas_object_size_hint_padding_set(inner, padX, padX, padY, padY);
+            Interop.elm_box_padding_set(inner, 0, 6);
+            Interop.elm_table_pack(table, inner, 0, 0, 1, 1);
+            Interop.evas_object_show(inner);
+
+            Interop.evas_object_show(table);
+            return table;
+        }
+
+        /// <summary>Horizontal row: first label stretches, buttons hug the right edge.</summary>
+        private static IntPtr CreateRow(IntPtr parent)
+        {
+            var row = Interop.elm_box_add(parent);
+            Interop.elm_box_horizontal_set(row, 1);
+            Interop.elm_box_padding_set(row, 16, 0);
+            Interop.evas_object_size_hint_weight_set(row, 1.0, 0.0);
+            Interop.evas_object_size_hint_align_set(row, -1.0, 0.5);
+            Interop.evas_object_size_hint_padding_set(row, 0, 0, 12, 0);
+            Interop.evas_object_show(row);
+            return row;
         }
 
         private static IntPtr CreateLabel(IntPtr parent, string markup)
@@ -520,7 +623,9 @@ namespace TvAuthUi
             if (button == IntPtr.Zero)
                 return IntPtr.Zero;
             SetText(button, text);
-            Interop.evas_object_size_hint_min_set(button, 240, 84);
+            Interop.evas_object_size_hint_min_set(button, 260, 84);
+            Interop.evas_object_size_hint_weight_set(button, 0.0, 0.0);
+            Interop.evas_object_size_hint_align_set(button, 0.5, 0.5);
             Interop.evas_object_smart_callback_add(button, Clicked, callback, data);
             Interop.elm_box_pack_end(parent, button);
             Interop.evas_object_show(button);
@@ -529,6 +634,7 @@ namespace TvAuthUi
 
         private static void ClearContent()
         {
+            countdownLabel = IntPtr.Zero;
             foreach (var obj in contentObjects)
             {
                 if (obj != IntPtr.Zero)
@@ -542,14 +648,22 @@ namespace TvAuthUi
             revokeHandles.Clear();
         }
 
-        private static void SetHeader(string text)
+        private static void SetHeader(string eyebrow, string title, int accent)
         {
-            SetText(headerLabel, "<font_size=42><b>" + Escape(text) + "</b></font_size>");
+            var hex = "#" + accent.ToString("x6");
+            SetText(headerLabel,
+                "<font_size=20><b><color=" + hex + ">" + Escape(eyebrow) + "</color></b></font_size><br/>"
+                + "<font_size=46><b>" + Escape(title) + "</b></font_size>");
+            if (accentBar != IntPtr.Zero)
+            {
+                Interop.evas_object_color_set(accentBar,
+                    (accent >> 16) & 0xff, (accent >> 8) & 0xff, accent & 0xff, 255);
+            }
         }
 
         private static void SetStatus(string text)
         {
-            SetText(statusLabel, "<font_size=22>" + Escape(text) + "</font_size>");
+            SetText(statusLabel, "<font_size=24><color=#c9ccd3>" + Escape(text) + "</color></font_size>");
         }
 
         private static void SetWindowTitle(string text)
@@ -575,10 +689,10 @@ namespace TvAuthUi
             foreach (var rawLine in command.Replace("\r\n", "\n").Split('\n'))
             {
                 var line = rawLine;
-                while (line.Length > 76)
+                while (line.Length > 72)
                 {
-                    lines.Add(line.Substring(0, 76));
-                    line = line.Substring(76);
+                    lines.Add(line.Substring(0, 72));
+                    line = line.Substring(72);
                 }
                 lines.Add(line);
                 if (lines.Count > 12)
@@ -597,7 +711,7 @@ namespace TvAuthUi
                 builder.Append(Escape(lines[i]));
             }
             if (truncated)
-                builder.Append("<br/><i>Command truncated for display.</i>");
+                builder.Append("<br/><color=#8a8f99><i>Command truncated for display.</i></color>");
             return builder.ToString();
         }
 
