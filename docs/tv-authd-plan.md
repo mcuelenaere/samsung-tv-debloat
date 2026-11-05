@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: M0 platform spikes and M1 headless broker complete and cold-boot validated. Next milestone: M2 approval UI. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes, M1 headless broker, and M2 approval UI are complete; M1 and M2 are cold-boot validated on the target. Next milestone: M3 Vetro cutover. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -165,11 +165,37 @@ Command output is base64 so arbitrary bytes do not get corrupted by JSON UTF-8 c
 UI-only messages:
 
 - `ui.hello` — registers the approval UI connection;
-- `ui.prompt` — daemon to UI: request ID, resolved application name, and command;
-- `ui.decision` — `deny`, `once`, or `always`, with the request ID and an unguessable prompt nonce;
+- `ui.prompt` — daemon to UI: prompt ID, nonce, request ID, exact package ID and SMACK label, and command;
+- `ui.decision` — `deny`, `once`, or `always`, with the prompt ID and unguessable prompt nonce;
 - `grants.list` / `grants.revoke` — manager functionality.
 
-The daemon generates prompt wording. The requester cannot supply a trusted-looking app name or approval description. Long commands may be shown in a scrollable details view or clearly marked as truncated; the prompt must always say that the application is requesting **full root access**.
+The implemented v1 shapes are:
+
+```json
+{"version":1,"id":"hello-1","method":"ui.hello"}
+{"version":1,"id":"decision-1","method":"ui.decision",
+ "prompt_id":"32-hex","nonce":"32-hex","decision":"once"}
+{"version":1,"id":"list-1","method":"grants.list"}
+{"version":1,"id":"revoke-1","method":"grants.revoke",
+ "label":"User::Pkg::org.example.app"}
+```
+
+The daemon sends prompts only to the authenticated UI connection:
+
+```json
+{"version":1,"type":"ui.prompt","prompt_id":"32-hex","nonce":"32-hex",
+ "request_id":"app-request-1","label":"User::Pkg::org.example.app",
+ "package":"org.example.app","command":"id","command_bytes":2,
+ "command_truncated":false,"timeout_ms":60000}
+```
+
+The daemon generates prompt wording and derives the package identity from the
+kernel-provided SMACK label. The requester cannot supply a trusted-looking app
+name or approval description. The command is a sanitized display copy: control
+and bidirectional formatting characters are replaced and long commands are
+clearly marked as truncated. The prompt always says that the application is
+requesting **full root access**. M2 shows the exact package ID and SMACK label
+rather than a friendly package name; friendly names are not a trust input.
 
 ### UI IPC security
 
@@ -265,18 +291,28 @@ A managed .NET assembly has no custom native ELF. Tizen's signed `dotnet-launche
 
 The C# layer uses direct P/Invoke for the Tizen app lifecycle, Elm/Evas widgets, `efl_util_set_notification_window_level`, and Eext key grabbing. This is a small platform binding, not a dependency on a large UI framework.
 
-The UI should:
+The implemented M2 UI lives in `root-broker/ui/` and:
 
-1. be launched by the daemon through a fixed AUL/`app_launcher` command;
-2. create a notification-type EFL/Wayland window at the highest usable notification level;
-3. set the underlying surface type to notification before showing it;
-4. grab only the remote keys needed for navigation and confirmation;
-5. connect to `broker.sock` and register with `ui.hello`;
-6. display the daemon-resolved app name and full-root warning;
-7. return a decision with the pending request ID and prompt nonce;
-8. exit when idle, or remain open when the user is managing grants.
+1. is launched by the daemon through a fixed AUL/`app_launcher -s org.tvauth.ui` command;
+2. creates a notification-type EFL/Wayland window at the highest usable notification level;
+3. sets the underlying surface type to notification before showing it;
+4. grabs only the TV Back key (`XF86Back`) and relies on normal Elementary focus for the buttons;
+5. connects directly to `broker.sock` and registers with `ui.hello`;
+6. displays the daemon-supplied exact package ID, SMACK label, full-root warning, and a sanitized command copy;
+7. returns `deny`, `once`, or `always` with the pending prompt ID and nonce;
+8. exits shortly after a decision, or remains open in the grant-manager view when opened manually.
 
-Initially, call the EFL notification mechanisms directly. Do not modify `/opt/dbspace/.syspopup.db` or depend on Samsung's alert-syspopup package.
+The window is a best-effort consent surface; the daemon treats every timeout,
+disconnect, launcher failure, stale nonce, or malformed decision as a denial. Do
+not modify `/opt/dbspace/.syspopup.db` or depend on Samsung's alert-syspopup
+package.
+
+M2 UI status: implemented, signed, installed, and TV-validated. The final
+managed DLL is 34,816 bytes; the unsigned TPK is 16,535 bytes and the signed TPK
+is 24,073 bytes. Notification level TOP was accepted. `input_keyevent` was used
+to verify RETURN activation, Right/Left focus movement, and BACK handling without
+a physical remote. The manager view renders grants after roughly two seconds, so
+test scripts must wait for the grants response before sending keys.
 
 Fallback if notification priority/key-grab fails for a developer-signed app:
 
@@ -464,14 +500,47 @@ The native-UI failure is why the design now uses managed .NET for the approval U
 - Cold boot passed: new boot ID, AT-HUB `start units rc=0`, Dropbear and `tv-authd` automatically active from `/opt/tv-units`, broker socket recreated, and empty grants loaded.
 - The root-only Dropbear source path was validated on the cold boot.
 
-### M2 — Approval and persistent grants
+### M2 — Approval and persistent grants (complete)
 
-- Unknown app prompts.
-- Deny does not execute.
-- Allow once executes once and prompts for the next command.
-- Always executes subsequent commands and survives reboot.
-- Revoke restores prompting.
-- UI timeout/crash/compositor failure does not execute.
+- Daemon protocol extended with `ui.hello`, `ui.prompt`, `ui.decision`,
+  `grants.list`, and `grants.revoke`; exact UI label + UID role separation.
+- Approval manager implements one global prompt, one pending request per package,
+  a bounded queue, 128-bit prompt IDs/nonces, prompt timeout/default-deny,
+  fixed `app_launcher` execution, and bounded relaunch attempts.
+- Deny does not execute; Allow once executes exactly the pending request; Always
+  persists the exact label before execution; revoke restores prompting.
+- UI timeout, disconnect, launcher failure, and stale/expired decisions fail
+  closed.
+- Managed .NET approval/grant-manager UI implemented under `root-broker/ui/`.
+- 35 Linux tests pass, including queueing, nonce rejection, timeout, disconnect,
+  persistence, revoke, rollback on failed grant writes, and role separation.
+  ARMv7 broker build: 546,388 bytes, SHA-256
+  `d93890d3f4104fee7fc537e927010dc05b8c06777944a671c2262a558c4a5ae1`.
+- TV acceptance on 2026-11-05:
+  - signed `org.tvauth.ui` installed; process label verified as
+    `User::Pkg::org.tvauth.ui`; notification level TOP accepted;
+  - Deny returned `denied`/`user_denied` and did not execute;
+  - Allow once returned a root `id` result, did not persist a grant, and the next
+    request prompted again;
+  - Always allow persisted the exact label and executed; later requests ran with
+    no prompt, including after a daemon restart and a cold boot;
+  - manager revocation returned `revoked=true`, emptied the grant file, and the
+    next request prompted again;
+  - prompt timeout returned `denied`/`prompt_timeout` and did not execute; the UI
+    logged `prompt expired` and exited;
+  - killing the UI during a pending prompt returned
+    `ui_unavailable`/`ui_disconnected` and did not execute;
+  - RETURN, Right/Left focus movement, and BACK were exercised with
+    `/usr/bin/input_keyevent`; the manager takes about two seconds to render the
+    grant list after launch.
+- Cold boot on 2026-11-05: new boot ID
+  `7687b045-4e4b-4a7e-9416-68ecc3fc6efc`, AT-HUB logged `start units rc=0`,
+  Dropbear and `tv-authd` were active, the unit reported
+  `Environment=XDG_RUNTIME_DIR=/run HOME=/root`, the grant survived, and the
+  requester executed without launching the UI.
+- The M0 spike already validated the same notification-window mechanism above a
+  foreground YouTube session; M2 revalidated TOP acceptance and the consent
+  flow itself.
 
 ### M3 — Vetro cutover
 
@@ -512,11 +581,20 @@ Treat the spike results and integration measurements as inputs to this document,
 - reconcile the wire protocol, workstream ownership, and acceptance tests with what was actually built;
 - link the relevant validation logs/source instead of claiming unverified behavior.
 
-M0 was completed on 2026-11-04/05. The plan now reflects the observed soft-float EFL ABI, successful `SO_PEERSEC` package labels, native-ELF UEP rejection, and the validated managed .NET notification popup. Raw evidence and build commands live in:
+M0 was completed on 2026-11-04/05, M1 was deployed and cold-boot validated on
+2026-11-05, and M2 was implemented, deployed, and cold-boot validated on
+2026-11-05. The plan now reflects the observed soft-float EFL ABI, successful
+`SO_PEERSEC` package labels, native-ELF UEP rejection, the validated managed .NET
+notification popup, the live broker layout, the M2 approval protocol, and the
+interactive denial/once/always/revoke/timeout/crash/reboot results. Raw evidence
+and build commands live in:
 
 - `root-broker/spikes/armv7-hello/`
 - `root-broker/spikes/peer-identity/`
 - `root-broker/spikes/efl-popup/`
 - `root-broker/sysroot/`
+- `root-broker/daemon/`
+- `root-broker/ui/`
 
-Future milestones should continue updating this document rather than preserving superseded assumptions.
+Future milestones should continue updating this document rather than preserving
+superseded assumptions.

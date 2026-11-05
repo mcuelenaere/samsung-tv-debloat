@@ -7,6 +7,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# app_launcher/AUL use the runtime directory; keep this explicit even though
+# systemd currently supplies it on this firmware.
+Environment=XDG_RUNTIME_DIR=/run
+Environment=HOME=/root
 ExecStartPre=/bin/sh -c "mkdir -p /run/tv-auth && cp -f /opt/tv-auth/tv-authd /run/tv-auth/tv-authd.new && chmod 0755 /run/tv-auth/tv-authd.new && mv -f /run/tv-auth/tv-authd.new /run/tv-auth/tv-authd"
 ExecStart=/run/tv-auth/tv-authd --socket /run/tv-auth/broker.sock --grants /opt/tv-auth/grants.json --log /run/tv-auth/tv-authd.log --socket-gid 100
 Restart=always

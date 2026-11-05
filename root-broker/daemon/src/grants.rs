@@ -81,6 +81,12 @@ impl GrantStore {
         self.grants.contains_key(label)
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.grants
+            .iter()
+            .map(|(label, entry)| (label.as_str(), entry.granted_at))
+    }
+
     pub fn grant(&mut self, label: &str) -> io::Result<bool> {
         if !is_valid_package_label(label) {
             return Err(io::Error::new(
@@ -97,16 +103,22 @@ impl GrantStore {
             .as_secs();
         self.grants
             .insert(label.to_owned(), GrantEntry { granted_at });
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.grants.remove(label);
+            return Err(error);
+        }
         Ok(true)
     }
 
     pub fn revoke(&mut self, label: &str) -> io::Result<bool> {
-        let removed = self.grants.remove(label).is_some();
-        if removed {
-            self.save()?;
+        let Some(removed) = self.grants.remove(label) else {
+            return Ok(false);
+        };
+        if let Err(error) = self.save() {
+            self.grants.insert(label.to_owned(), removed);
+            return Err(error);
         }
-        Ok(removed)
+        Ok(true)
     }
 
     fn save(&self) -> io::Result<()> {
@@ -173,6 +185,34 @@ mod tests {
         fs::write(&path, r#"{"version":1,"grants":{}}"#).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(GrantStore::load(path).is_err());
+    }
+
+    #[test]
+    fn failed_save_rolls_back_grant_and_revoke() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("grants");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("grants.json");
+        let mut store = GrantStore::load(&path).unwrap();
+        fs::remove_dir(&parent).unwrap();
+        fs::write(&parent, b"blocker").unwrap();
+
+        assert!(store.grant("User::Pkg::org.example.app").is_err());
+        assert!(!store.is_allowed("User::Pkg::org.example.app"));
+
+        fs::remove_file(&parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(
+            &path,
+            r#"{"version":1,"grants":{"User::Pkg::org.example.keep":{"granted_at":1}}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut store = GrantStore::load(&path).unwrap();
+        fs::remove_dir_all(&parent).unwrap();
+        fs::write(&parent, b"blocker").unwrap();
+        assert!(store.revoke("User::Pkg::org.example.keep").is_err());
+        assert!(store.is_allowed("User::Pkg::org.example.keep"));
     }
 
     #[test]

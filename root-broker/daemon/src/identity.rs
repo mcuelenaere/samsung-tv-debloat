@@ -9,16 +9,22 @@ pub struct PeerIdentity {
     pub label: String,
 }
 
-pub fn is_valid_package_label(label: &str) -> bool {
-    const PREFIX: &str = "User::Pkg::";
-    let Some(package) = label.strip_prefix(PREFIX) else {
-        return false;
-    };
+pub fn package_from_label(label: &str) -> Option<&str> {
+    label
+        .strip_prefix("User::Pkg::")
+        .filter(|package| !package.is_empty())
+}
+
+pub fn is_valid_package_id(package: &str) -> bool {
     !package.is_empty()
         && package.len() <= 127
         && package
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub fn is_valid_package_label(label: &str) -> bool {
+    package_from_label(label).is_some_and(is_valid_package_id)
 }
 
 #[cfg(target_os = "linux")]
@@ -95,12 +101,18 @@ pub fn from_fd(_fd: RawFd) -> io::Result<PeerIdentity> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_package_label;
+    use super::{is_valid_package_id, is_valid_package_label, package_from_label};
 
     #[test]
     fn accepts_package_labels() {
         assert!(is_valid_package_label("User::Pkg::org.example.app"));
         assert!(is_valid_package_label("User::Pkg::abc_123"));
+        assert!(is_valid_package_id("org.example.app"));
+        assert_eq!(
+            package_from_label("User::Pkg::org.example.app"),
+            Some("org.example.app")
+        );
+        assert_eq!(package_from_label("System::Privileged"), None);
     }
 
     #[test]

@@ -43,6 +43,12 @@ Dropbear copy replaces `/home/owner/share/tmp/sdk_tools/dropbear` as the boot
 payload source, so an unprivileged app can no longer replace a binary that root
 executes at boot.
 
+M2 also installs the managed `org.tvauth.ui` package. It connects directly to the
+broker as `User::Pkg::org.tvauth.ui`, is the only package allowed to use the UI
+methods, and updates `/opt/tv-auth/grants.json` live for Always allow and revoke.
+The unit source explicitly sets `XDG_RUNTIME_DIR=/run` and `HOME=/root` so the
+broker's fixed `app_launcher` call works from systemd.
+
 `/run/tv-auth/` is recreated each boot. It contains the staged executable,
 `broker.sock` (`0660 root:users`) and the bounded daemon log.
 
@@ -121,7 +127,8 @@ existing alternate recovery channels available until the cold boot is verified.
   ownership or mode.
 - `systemd-journald` is inactive; unit stdout/stderr are discarded. Use
   `/run/tv-auth/tv-authd.log` and `/run/at-hub-boot.log`.
-- `/opt/tv-auth/grants.json` is loaded at daemon startup. Grant changes require
-  a daemon restart until the approval UI owns live grant updates.
+- M2's approval UI updates `/opt/tv-auth/grants.json` live through the daemon
+  and does not require a restart. Manually edited grants are still only read at
+  daemon startup, so restart `tv-authd.service` after external edits.
 - OTA updates may replace or remove `AT-HUB.service`, `/opt/etc/parseinfo.sh`, or
   paths under `/opt`; verify after every firmware update.
