@@ -120,7 +120,7 @@ namespace TvAuthUi
             // straight through the prompt. If the compositor ignores alpha the
             // scrim simply renders opaque black, which is also fine.
             Interop.elm_win_alpha_set(window, 1);
-            var scrim = CreateRect(window, 0x000000, 225);
+            var scrim = CreateRect(window, 0x000000, 140);
             Interop.evas_object_size_hint_weight_set(scrim, 1.0, 1.0);
             Interop.elm_win_resize_object_add(window, scrim);
 

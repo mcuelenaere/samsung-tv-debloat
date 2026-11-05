@@ -144,7 +144,7 @@ Pause/resume and repeat-key hardening remain M4 items.
 
 The card layout was re-verified on the TV on 2026-11-05 using
 `enlightenment_info -dump_screen`. The window reported 1920x1080; the scrim
-dimmed the home screen to about 12% brightness; the prompt rendered with a live
+dims the home screen to about 45% brightness; the prompt rendered with a live
 countdown and timed out to `denied`/`prompt_timeout`; and `input_keyevent
 XF86Back` closed the manager. No monospace font is installed, so the command
 falls back to the proportional UI font.
