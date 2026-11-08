@@ -251,4 +251,8 @@ it on 2026-11-08 with a short restart:
 - The manager-refresh UI was installed in place on 2026-11-08 using the
   Apps2Samsung **Partner** certificate (the installed UI's author certificate
   matches exactly). Use the Partner profile for future UI updates.
-- Optional remaining check: a cold boot with the M4 binary and v2 grant.
+- Cold boot passed on 2026-11-08 (boot ID `c0b55e8d-22a6-4fb6-8c70-a755bbfcab86`):
+  AT-HUB `start units rc=0`, both services active with 0 restarts, the M4 binary
+  and Partner-signed UI survived, the v2 Vetro grant loaded with `notify: first`
+  and no migration/stale events, Vetro commands resumed `exit_code=0`, and the
+  post-boot UI showed the manager with **Toast: first use**.

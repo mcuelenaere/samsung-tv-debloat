@@ -177,6 +177,11 @@ succeeded without uninstalling; `manager grants refresh` and two
 `ui_grants_list` requests were observed, and the manager showed Vetro with
 `Toast: first use`.
 
+After the 2026-11-08 cold boot (boot ID
+`c0b55e8d-22a6-4fb6-8c70-a755bbfcab86`), the UI launched again, reattached as
+`User::Pkg::org.tvauth.ui`, refreshed the manager grants, and showed Vetro with
+`Toast: first use`.
+
 Pause/resume and repeat-key hardening remain hardening items.
 
 The execution toast was validated on the TV on 2026-11-08 with Vetro holding an

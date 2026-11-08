@@ -201,4 +201,13 @@ number includes the .NET runtime while it lingers for Vetro toasts.
 
 ### Pending
 
-- optional cold-boot re-check of the M4 daemon and grant.
+### Cold boot: pass
+
+Rebooted to boot ID `c0b55e8d-22a6-4fb6-8c70-a755bbfcab86` on 2026-11-08
+19:50:32. AT-HUB logged `start units rc=0`; Dropbear and `tv-authd` started
+automatically with 0 restarts; the M4 binary `7903c0ba…` and Partner-signed UI
+DLL `53f446fb…` were intact. The v2 Vetro grant was loaded directly with
+`notify: first` and fingerprint `ed44a7da…` (no stale/migration events), and
+Vetro commands resumed with `exit_code=0`. `/run/tv-auth` was `0711`, the socket
+`0660 root:users`, and the log `0600`. Launching the UI after boot showed
+**vetrotvapp / Toast: first use** and performed the manager grants refresh.

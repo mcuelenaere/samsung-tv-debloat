@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. Remaining: optional cold boot. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. All M4 acceptance checks, including cold boot, are complete. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -556,7 +556,7 @@ The native-UI failure is why the design now uses managed .NET for the approval U
 - Vetro service restart does not reacquire root or kill the broker.
 - A cold boot with no PC connected works once Vetro has its persistent grant.
 
-### M4 — Hardening and multi-app tests (deployed and validated; optional cold boot + UI refresh install pending)
+### M4 — Hardening and multi-app tests (complete)
 
 - Two same-UID apps cannot impersonate each other or the UI: exact-label role
   separation is enforced and unit-tested; TV `uiprobe` confirmed every UI method
@@ -591,7 +591,13 @@ The native-UI failure is why the design now uses managed .NET for the approval U
 - The manager-refresh UI was installed in place on 2026-11-08 using the
   Apps2Samsung **Partner** certificate; the installed package's author
   certificate matches, and the TV is running the new UI (DLL `53f446fb…`).
-- Optional remaining check: cold boot with the M4 binary and v2 grant.
+- Cold boot passed on 2026-11-08 with boot ID
+  `c0b55e8d-22a6-4fb6-8c70-a755bbfcab86`: AT-HUB logged `start units rc=0`,
+  Dropbear and `tv-authd` were active with 0 restarts, the M4 binary and
+  Partner-signed UI survived, the v2 Vetro grant loaded directly with
+  `notify: first` and no migration/stale events, Vetro commands resumed
+  `exit_code=0`, `/run/tv-auth` was `0711` with a `0660 root:users` socket and
+  `0600` log, and the post-boot manager showed **vetrotvapp / Toast: first use**.
 
 ## 14. Explicit simplifications relative to the earlier proposal
 
