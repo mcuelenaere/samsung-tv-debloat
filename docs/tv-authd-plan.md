@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. Remaining: optional cold boot and installing the manager-refresh UI fix with the installed signing profile. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. Remaining: optional cold boot. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -588,10 +588,9 @@ The native-UI failure is why the design now uses managed .NET for the approval U
   retained it, and the test package/grant were removed. Post-M4 `fsprobe` found
   the log `0600`/app-read denied and `/run/tv-auth` `0711`. Normal broker RSS was
   328 kB / 356 kB HWM, 3 threads, ~0.4% CPU under Vetro polling.
-- The manager-refresh fix (refresh grants whenever the manager opens) is in the
-  worktree but not installed: the live UI is signed with a different author
-  certificate, so `pkgcmd -i` rejects it (`Author certificate not match`). It
-  needs the installed signing profile or an uninstall/reinstall.
+- The manager-refresh UI was installed in place on 2026-11-08 using the
+  Apps2Samsung **Partner** certificate; the installed package's author
+  certificate matches, and the TV is running the new UI (DLL `53f446fb…`).
 - Optional remaining check: cold boot with the M4 binary and v2 grant.
 
 ## 14. Explicit simplifications relative to the earlier proposal

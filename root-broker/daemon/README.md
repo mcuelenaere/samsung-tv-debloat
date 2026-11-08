@@ -248,8 +248,7 @@ it on 2026-11-08 with a short restart:
 - Normal operation: `tv-authd` 328 kB RSS / 356 kB HWM, 3 threads, ~0.4% CPU
   during Vetro polling. Under 64 MiB tmpfs pressure it stayed at 304 kB RSS /
   384 kB HWM; the UI stayed at 50,288 kB RSS / 53,036 kB HWM; no restart/OOM.
-- The UI manager-refresh fix is in this worktree but not installed: the live
-  `org.tvauth.ui` is signed with a different author certificate and `pkgcmd -i`
-  rejects the update (`Author certificate not match`). Re-sign with the installed
-  profile or uninstall/reinstall.
+- The manager-refresh UI was installed in place on 2026-11-08 using the
+  Apps2Samsung **Partner** certificate (the installed UI's author certificate
+  matches exactly). Use the Partner profile for future UI updates.
 - Optional remaining check: a cold boot with the M4 binary and v2 grant.

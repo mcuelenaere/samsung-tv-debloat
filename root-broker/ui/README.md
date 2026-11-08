@@ -122,7 +122,7 @@ Observed local artifacts:
 ```text
 Managed assembly: 46,592 bytes
 Unsigned TPK:     21,536 bytes
-Signed TPK:       29,094 bytes
+Signed TPK:       29,135 bytes (Partner key)
 ```
 
 ## Signing and installation
@@ -135,10 +135,10 @@ tizen package -t tpk -s <profile> -- org.tvauth.ui-0.1.0.tpk
 ```
 
 No certificate material or passwords belong in this repository. The installed
-`org.tvauth.ui` on the current TV was signed with a different author certificate;
-`pkgcmd -i` rejects an update signed by another author with
-`Author certificate not match`. Sign with the same profile as the installed UI,
-or uninstall/reinstall (which changes the package signer).
+`org.tvauth.ui` on the current TV is signed with the Apps2Samsung **Partner**
+certificate. Sign with that author/distributor profile for an in-place update;
+the Public profile is rejected with `Author certificate not match`. If a
+mismatch occurs, uninstall/reinstall (which changes the package signer).
 
 The signed TPK must be installed through `pkgcmd` on the TV:
 
@@ -171,7 +171,13 @@ Completed on 2026-11-05 with `org.tvauth.ui` installed and the M2 daemon running
    movement, and BACK. The manager list renders about two seconds after launch,
    so automated tests must wait for the grants response before injecting keys.
 
-Pause/resume and repeat-key hardening remain M4 items.
+On 2026-11-08 the M4 manager-refresh UI was installed in place with the
+Apps2Samsung **Partner** certificate (DLL SHA-256 `53f446fb…`). The update
+succeeded without uninstalling; `manager grants refresh` and two
+`ui_grants_list` requests were observed, and the manager showed Vetro with
+`Toast: first use`.
+
+Pause/resume and repeat-key hardening remain hardening items.
 
 The execution toast was validated on the TV on 2026-11-08 with Vetro holding an
 Always-allow grant: Vetro bursts of ~20 execs/s were coalesced into single

@@ -194,12 +194,11 @@ number includes the .NET runtime while it lingers for Vetro toasts.
   only Vetro; the first row was Vetro, so the wrong grant was revoked. Vetro was
   immediately restored from the pre-M4 backup and re-migrated with
   `notify: first`; commands resumed. The worktree UI now refreshes grants when
-  the manager opens, but the installed UI is signed with a different author
-  certificate, so that fix was not installed (`Author certificate not match`).
+  the manager opens. That fix was installed in place on 2026-11-08 with the
+  Apps2Samsung Partner certificate (the installed UI's author certificate
+  matches).
 - The M4 daemon is deployed and Vetro is running with the v2 fingerprint grant.
 
 ### Pending
 
-- install the manager-refresh UI fix with the installed UI's signing profile
-  (or uninstall/reinstall to change the signer);
 - optional cold-boot re-check of the M4 daemon and grant.
