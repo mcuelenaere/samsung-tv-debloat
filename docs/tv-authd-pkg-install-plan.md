@@ -4,13 +4,13 @@ Status: proposal, self-contained milestone numbering (M1–M3 below). Builds on
 the completed tv-authd broker and the signature-validation analysis of
 T-PTMDEUC (Tizen 6.5, armv7).
 
-M1 and M2 are implemented and TV-validated for the TPK path: M1 covers
-protocol v2, staging, manifest inspection, PID-1 trust enrollment,
-`pkg.install`, the package prompt, deny/timeout/policy paths, and cold-boot
-persistence; M2 adds `pkg.uninstall`, `pkg.list`, and the prompt-free uid-0
-root role with package toasts. WGT installs and Samsung Home registration
-remain M4 (§6.1/§13), and M3 on-device signing is not started. The work is
-rebased onto `main` (M4 + `review-fixes`).
+M1–M3 are implemented and TV-validated for the TPK path: M1 covers protocol
+v2, staging, manifest inspection, PID-1 trust enrollment, `pkg.install`, the
+package prompt, deny/timeout/policy paths, and cold-boot persistence; M2 adds
+`pkg.uninstall`, `pkg.list`, and the prompt-free uid-0 root role with package
+toasts; M3 adds on-device re-signing of unsigned and foreign-signed packages
+with two enrolled CAs. WGT installs and Samsung Home registration remain M4
+(§6.1/§13). The work is rebased onto `main` (M4 + `review-fixes`).
 
 ## 1. Goal
 
@@ -74,11 +74,12 @@ tv-authd (root)
 New daemon module `trust.rs`:
 
 - Material under `/opt/tv-auth/trust/` (root 0700):
-  - `user-root-ca.pem`, `user-author.p12`-equivalents (see §7),
-    `fingerprint_list.xml` (copy of stock + user CA SHA-1 added to
-    `tizen-developer`, `tizen-public`, and partner distributor domains so
-    user-approved homebrew apps can use both public and partner privileges),
-    `tizen-ca/` (copy of `/usr/share/ca-certificates/tizen` + user CA).
+  - `user-root-ca.pem` (distributor root) and `author-root-ca.pem` (author
+    root), the author/distributor EE keys and certificates (§7),
+    `fingerprint_list.xml` (copy of stock with the author root SHA-1 in
+    `tizen-developer` and the distributor root SHA-1 in `tizen-public` and
+    `tizen-partner` — *not* in `tizen-developer`, see §7.3), and `tizen-ca/`
+    (copy of `/usr/share/ca-certificates/tizen` plus both user roots).
 - **Root mount-namespace requirement (`PID 1`):**
   - `tv-authd.service` uses `BindReadOnlyPaths=/opt/tv-auth:/run/opt/tv-auth`,
     which places `tv-authd` in a private slave mount namespace. Any `mount(2)`
@@ -356,11 +357,30 @@ or denied requests, while verifying the staged file's SHA-256 before signing):
   by a different author certificate than `tv-user-author`, reject early with
   `author_mismatch_requires_reinstall` (Tizen rejects cross-author upgrades with
   `-12`).
-- Keys stay in `/opt/tv-auth/trust/` (`0600 root`); the enrolled CA is
-  the one being trusted, so post-sign install passes.
+- Keys stay in `/opt/tv-auth/trust/` (`0600 root`); the enrolled CAs are
+  the ones being trusted, so post-sign install passes.
 - The prompt clearly states "unsigned — will be signed with your on-device
   CA" or "third-party signature — will be re-signed with your on-device CA"
   (`re_signed: true` in the response).
+
+**Two CAs, not one (verified on the TV).** Tizen's validator
+(`libcert-svc-vcore.so`) enforces certificate *domains* from
+`fingerprint_list.xml`: `author-signature.xml`'s root must be listed in
+`tizen-developer`, while the distributor signature's root must be listed in
+`tizen-public`/`tizen-partner` and must **not** be in `tizen-developer`. A
+single CA in all three domains fails every re-signed package with
+`-12 Invalid certificate chain`. M3 therefore enrolls:
+
+- `author-root-ca.pem` in `tizen-developer`, signing `user-author.pem`;
+- `user-root-ca.pem` in `tizen-public` + `tizen-partner`, signing
+  `user-distributor.pem`.
+
+`xmlsec1 sign --id-attr Id --privkey-pem key,cert,ca template.xml` fills the
+per-file digests (SHA-512 of the raw bytes), the `#prop` c14n-1.1 digest, and
+the RSA-SHA512 `SignatureValue`. The templates reference every payload file
+(URI-encoded, `/` → `%2F`), exclude old signature files, and carry the
+`role-author`/`role-distributor` signature properties. The signed archive is
+written back over the staged file.
 
 ## 8. Policy and safety limits
 
@@ -436,7 +456,7 @@ with explicit authorization, on the user's TV.
 |---|---|---|---|
 | M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | **done (host):** 120 Linux tests, clippy/fmt clean, ARMv7 cross-build; uninstall/list protocol round-trips, root-role gating, notice kinds | **validated 2026-11-08:** app-role uninstall prompt, Deny and Remove, protected/unknown refusals, `pkg.list` from app and root roles, prompt-free root install/uninstall with `PACKAGE CHANGE` toasts |
-| M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned / foreign-signed wgt → user approves → broker re-signs → installs → launches; signature survives reboot |
+| M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | **done (host):** template/reference/signature-file unit tests, archive rewrite, author-mismatch refusal, 127 Linux tests, ARMv7 build | **validated 2026-11-08 (tpk):** foreign-signed tpk → approve → `re_signed: true` → installs; stripped Partner-signed upgrade → `author_mismatch_requires_reinstall`; two-CA domain rule verified. WGT install still blocked by `pkgcmd` (M4) |
 | M4 | WAS install/registration helper so WGT works and installs appear in Samsung Home | helper API/ABI check, DB row comparison with an SDB install | WGT installs and appears in "My apps"; TPK installed via broker appears in "My apps"; launch from Home |
 
 Out of scope (documented to avoid creep): delta updates, mount-installed
@@ -708,3 +728,58 @@ Notes:
   manually after validation.
 - The fingerprint list still has the user CA in `tizen-developer`,
   `tizen-public`, and `tizen-partner`; no trust changes were needed for M2.
+
+## 16. M3 implementation notes and TV validation (2026-11-08)
+
+Code:
+
+- `daemon/src/pkgsign.rs` (new) — unpack the staged archive (safe names, caps),
+  drop old `author-signature.xml`/`signatureN.xml`, build the two templates,
+  run `xmlsec1 sign --id-attr Id --privkey-pem <key>,<cert>,<ca>` with the work
+  directory as cwd, strip the XML declaration, rewrite the archive in place;
+  `installed_author_fingerprint` reads the installed author leaf certificate for
+  the upgrade check.
+- `daemon/src/trust.rs` — two CAs (`user-root-ca.pem` distributor,
+  `author-root-ca.pem` author) with content verification of both in the target
+  `tizen-ca` and both fingerprints in the target list; key paths exposed for
+  signing.
+- `daemon/src/pkgmeta.rs` — `SignatureContext` carries both roots; a chain
+  containing either is `user_ca`.
+- `daemon/src/server.rs` — re-sign decisions, `sign_failed`, early
+  `author_mismatch_requires_reinstall`, `re_signed` in the response.
+- `daemon/src/executor.rs` — `execute_argv_in` for `xmlsec1` (relative file
+  references resolve against the work directory).
+- `daemon/src/main.rs` — `--xmlsec1` (default `/usr/bin/xmlsec1`).
+- `ui/dotnet/Program.cs` — unsigned/foreign badges now promise re-signing.
+
+Deployed: daemon 855,716 bytes, SHA-256
+`ab637c0287f439221a4b545e5a63a1440acaaf45f007ae95176e9f946d0bdcec`; UI signed
+with the Partner profile (36,637 bytes, SHA-256
+`20358bf4f31587d9da14ee7c808f5faa38677af92ce3596459ecb27f3cd9dd22`).
+
+Validated on the target:
+
+- trust material: `author-root-ca.pem` (`F5:8C:18:D6…`) in `tizen-developer`,
+  `user-root-ca.pem` (`8C:28:28:A4…`) in `tizen-public`/`tizen-partner`;
+  `--enroll-trust` reports `already enrolled` and the target `tizen-ca` holds
+  both roots;
+- a foreign-signed TPK installed through the probe prompt returned
+  `status: ok`, `re_signed: true`, and the log shows `result=signed files=7`;
+  `pkgcmd -l` lists it and the installed `author-signature.xml` has two
+  certificates with `role-author`;
+- an unsigned (signatures stripped) copy of the Partner-signed UI package was
+  refused with `denied/author_mismatch_requires_reinstall` before any prompt,
+  because the installed UI has a different author.
+
+Bugs found and fixed during this validation:
+
+1. A single CA cannot sign both chains: the distributor root may not be in
+   `tizen-developer`. Added a separate author root CA.
+2. `xmlsec1` resolves relative Reference URIs against the working directory,
+   not the template's directory; signing now runs with `cwd` set to the work
+   directory.
+3. `xmlsec1` does not support `--output` for `sign` on this build and requires
+   `--id-attr Id` with the value as a separate argument; stdout is used.
+
+Still pending: WGT installs (blocked by `pkgcmd`'s `-4 Load archive info fail`;
+M4) — the signer itself is format-agnostic and signs WGTs the same way.

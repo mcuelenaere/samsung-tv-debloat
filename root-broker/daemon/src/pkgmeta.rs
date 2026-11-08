@@ -73,7 +73,11 @@ impl std::fmt::Display for MetaError {
 /// prompt; the stock installer performs the real chain validation.
 #[derive(Debug, Clone, Default)]
 pub struct SignatureContext {
+    /// Distributor root CA (public/partner domains).
     pub user_ca_sha1: Option<[u8; 20]>,
+    /// Author root CA (`tizen-developer` domain). A package signed on-device
+    /// carries both chains, so either root identifies it as ours.
+    pub author_ca_sha1: Option<[u8; 20]>,
     pub known_fingerprints: Vec<[u8; 20]>,
 }
 
@@ -194,7 +198,7 @@ pub fn is_reserved_pkgid(pkgid: &str) -> bool {
         .any(|prefix| pkgid.starts_with(prefix))
 }
 
-fn is_safe_entry_name(name: &str) -> bool {
+pub(crate) fn is_safe_entry_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('/') || name.starts_with('\\') {
         return false;
     }
@@ -420,7 +424,10 @@ pub fn classify_signature(
     if !has_author && !has_distributor {
         return SignatureStatus::UnsignedWillResign;
     }
-    if let Some(ours) = context.user_ca_sha1 {
+    for ours in [context.user_ca_sha1, context.author_ca_sha1]
+        .into_iter()
+        .flatten()
+    {
         if chain.contains(&ours) {
             return SignatureStatus::UserCa;
         }
@@ -620,9 +627,11 @@ mod tests {
     fn classifies_signature_roots() {
         let ours = [1_u8; 20];
         let samsung = [2_u8; 20];
+        let author = [3_u8; 20];
         let context = SignatureContext {
             user_ca_sha1: Some(ours),
-            known_fingerprints: vec![ours, samsung],
+            author_ca_sha1: Some(author),
+            known_fingerprints: vec![ours, author, samsung],
         };
         assert_eq!(
             classify_signature(false, false, &[], &context),
@@ -633,11 +642,15 @@ mod tests {
             SignatureStatus::UserCa
         );
         assert_eq!(
+            classify_signature(true, true, &[[9_u8; 20], author], &context),
+            SignatureStatus::UserCa
+        );
+        assert_eq!(
             classify_signature(true, true, &[[9_u8; 20], samsung], &context),
             SignatureStatus::Samsung
         );
         assert_eq!(
-            classify_signature(true, true, &[[3_u8; 20]], &context),
+            classify_signature(true, true, &[[4_u8; 20]], &context),
             SignatureStatus::ForeignWillResign
         );
         assert_eq!(

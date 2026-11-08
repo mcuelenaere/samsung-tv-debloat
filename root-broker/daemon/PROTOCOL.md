@@ -162,8 +162,10 @@ Success:
 ```
 
 `log_tail_b64` is the last 8 KiB of `pkgcmd` output (standard output followed by
-standard error), base64-encoded. `re_signed` is reserved for M3 on-device
-re-signing and is currently always `false`.
+standard error), base64-encoded. `re_signed` is `true` when the daemon replaced
+the package's signatures with the on-device author/distributor CAs before
+installing (unsigned or foreign-signed input). `pkgcmd` validates the result
+like any other package.
 
 The request lifecycle:
 
@@ -174,8 +176,11 @@ The request lifecycle:
    `tizen-manifest.xml` for tpk);
 4. `ui.prompt` with the package metadata;
 5. trust enrollment (`enroll_failed` if it cannot be repaired);
-6. `pkgcmd -i -t <type> -p <staged>` with the request timeout;
-7. response, then the staged copy is deleted on every path.
+6. for `signature` in `unsigned_will_resign`/`foreign_will_resign`: re-sign with
+   `xmlsec1` and the on-device keys (`sign_failed` on error); a `user_ca` or
+   `samsung` package is installed as-is;
+7. `pkgcmd -i -t <type> -p <staged>` with the request timeout;
+8. response, then the staged copy is deleted on every path.
 
 Policy refusals use `status: denied`; failures after the user approved use
 `status: error`. Every refusal and attempt carries a `detail` string where one
@@ -188,6 +193,8 @@ is useful.
 | `too_large` | `denied` | source or staged copy exceeds the size cap |
 | `bad_package` | `error` | not a zip, unsafe entry names, bad or missing manifest |
 | `manifest_forbidden` | `denied` | reserved package-id prefix or platform-only privileges; `detail` lists them |
+| `author_mismatch_requires_reinstall` | `denied` | an upgrade of a package signed by a different author (Tizen refuses cross-author upgrades); uninstall first |
+| `sign_failed` | `error` | on-device re-signing failed or signing keys are unavailable; nothing was installed |
 | `user_denied` | `denied` | the user chose Deny |
 | `prompt_timeout` | `denied` | no decision before the prompt timeout |
 | `enroll_failed` | `error` | trust enrollment could not be established; nothing was installed |
@@ -548,11 +555,23 @@ Response:
   refused, as are platform-only privileges (the installer's
   own privilege check remains authoritative).
 - Trust material lives in `/opt/tv-auth/trust/` (`user-root-ca.pem`,
-  `fingerprint_list.xml`, `tizen-ca/`). Enrollment bind-mounts the fingerprint
-  list and CA overlay over the stock paths in **PID 1's mount namespace** (`nsenter
-  -t 1 -m`), because `pkgcmd` only talks to `pkgmgr-server`
-  (`package-manager.service`, `PrivateMounts=no`), which validates signatures
-  there. Enrollment is re-verified before every approved install.
+  `author-root-ca.pem`, `fingerprint_list.xml`, `tizen-ca/`, and the M3 signing
+  keys). Enrollment bind-mounts the fingerprint list and CA overlay over the
+  stock paths in **PID 1's mount namespace** (`nsenter -t 1 -m`), because
+  `pkgcmd` only talks to `pkgmgr-server` (`package-manager.service`,
+  `PrivateMounts=no`), which validates signatures there. Enrollment is
+  re-verified before every approved install.
+- Tizen enforces certificate *domains*: the author chain's root must be listed
+  in `tizen-developer`, while the distributor chain's root must be listed in
+  `tizen-public`/`tizen-partner` and must **not** be in `tizen-developer`. Two
+  CAs are therefore enrolled: `author-root-ca.pem` (developer) and
+  `user-root-ca.pem` (public/partner).
+- Unsigned and foreign-signed packages are re-signed on-device after approval:
+  `author-signature.xml` (all files, `role-author`, RSA-SHA512) with the author
+  key, then `signature1.xml` (the author signature plus all files,
+  `role-distributor`) with the distributor key. Templates are built by the
+  daemon; `xmlsec1` computes digests, the C14N form, and the signature value.
+  Keys are `0600 root` under `0700` `/opt/tv-auth/trust`.
 - Uninstall/list read the same package manager database (`package_info` in
   `/opt/dbspace/.pkgmgr_parser.db`, opened read-only through `sqlite3`). Only
   non-system, non-preload, removable `wgt`/`tpk` packages can be removed;

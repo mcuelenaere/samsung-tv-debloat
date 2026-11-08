@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, pkglist, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker, GrantStore,
-    Logger, PackageConfig, ServerConfig,
+    identity, pkglist, pkgsign, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker,
+    GrantStore, Logger, PackageConfig, ServerConfig,
 };
 
 struct Args {
@@ -226,6 +226,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut max_package_bytes = pkgstage::DEFAULT_MAX_PACKAGE_BYTES;
     let mut pkgcmd = PathBuf::from("/usr/bin/pkgcmd");
     let mut sqlite3 = PathBuf::from("/usr/bin/sqlite3");
+    let mut xmlsec1 = PathBuf::from("/usr/bin/xmlsec1");
     let mut pkgdb = PathBuf::from("/opt/dbspace/.pkgmgr_parser.db");
     let mut trust_root = Some(PathBuf::from(trust::DEFAULT_TRUST_ROOT));
     let mut package_support = true;
@@ -262,6 +263,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             Long("pkgcmd") => pkgcmd = path(&mut parser)?,
             Long("sqlite3") => sqlite3 = path(&mut parser)?,
+            Long("xmlsec1") => xmlsec1 = path(&mut parser)?,
             Long("pkgdb") => pkgdb = path(&mut parser)?,
             Long("trust-root") => trust_root = Some(path(&mut parser)?),
             Long("no-trust") => trust_root = None,
@@ -291,6 +293,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --max-package-bytes BYTES    staged package cap (default 134217728)\n\
                      --pkgcmd PATH                stock installer (default /usr/bin/pkgcmd)\n\
                      --sqlite3 PATH               sqlite3 CLI (default /usr/bin/sqlite3)\n\
+                     --xmlsec1 PATH               XML-DSig signer (default /usr/bin/xmlsec1)\n\
                      --pkgdb PATH                 pkgmgr database (default /opt/dbspace/.pkgmgr_parser.db)\n\
                      --trust-root PATH            trust material (default /opt/tv-auth/trust)\n\
                      --no-trust                   skip trust enrollment (development only)\n\
@@ -343,6 +346,10 @@ fn parse_args() -> Result<Option<Args>, String> {
         return Err("--max-package-bytes must be between 1 MiB and 256 MiB".into());
     }
 
+    let trust_paths = trust_root.map(trust::TrustPaths::new);
+    let signing = trust_paths
+        .as_ref()
+        .map(|paths| pkgsign::SigningKeys::from_trust(paths, xmlsec1.clone()));
     let packages = package_support.then(|| PackageConfig {
         staging: pkgstage::StageConfig {
             root: staging_dir,
@@ -354,7 +361,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             sqlite3,
             database: pkgdb,
         },
-        trust: trust_root.map(trust::TrustPaths::new),
+        xmlsec1,
+        trust: trust_paths,
+        signing,
         installed_roots: tv_authd::DEFAULT_INSTALLED_ROOTS
             .iter()
             .map(PathBuf::from)

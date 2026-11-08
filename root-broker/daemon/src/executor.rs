@@ -41,6 +41,20 @@ pub fn execute_argv(
     run(child, timeout_ms)
 }
 
+/// Like [`execute_argv`], but runs the program in `current_dir`. `xmlsec1`
+/// resolves relative file references against the working directory.
+pub fn execute_argv_in(
+    program: &Path,
+    args: &[&OsStr],
+    current_dir: &Path,
+    timeout_ms: u64,
+) -> io::Result<ExecutionOutcome> {
+    let mut child = isolated_command();
+    child.current_dir(current_dir);
+    child.arg(program).args(args);
+    run(child, timeout_ms)
+}
+
 fn isolated_command() -> Command {
     let setsid = if Path::new("/usr/bin/setsid").exists() {
         "/usr/bin/setsid"

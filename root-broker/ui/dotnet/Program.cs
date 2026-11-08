@@ -993,9 +993,10 @@ namespace TvAuthUi
             switch (signature)
             {
                 case "unsigned_will_resign":
-                    return Small("Unsigned package \u2014 no trusted signature.", "#ffb74d");
+                    return Small("Unsigned \u2014 it will be signed with this TV's CA.", "#ffb74d");
                 case "foreign_will_resign":
-                    return Small("Third-party signature \u2014 not trusted by this TV.", "#ffb74d");
+                    return Small("Third-party signature \u2014 it will be re-signed with this TV's CA.",
+                        "#ffb74d");
                 case "user_ca":
                     return Small("Signed by your own CA.", "#66bb6a");
                 case "samsung":

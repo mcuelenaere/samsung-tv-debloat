@@ -7,6 +7,7 @@ pub mod package_identity;
 pub mod pkginstall;
 pub mod pkglist;
 pub mod pkgmeta;
+pub mod pkgsign;
 pub mod pkgstage;
 pub mod protocol;
 pub mod server;

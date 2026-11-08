@@ -9,9 +9,10 @@ execution toasts; M4 binds grants to the installed package signature and adds
 failure-path/probe coverage. Protocol v2 adds package management (see
 `../../docs/tv-authd-pkg-install-plan.md`): `pkg.install` with staging, manifest
 inspection, trust enrollment, and a package-aware prompt (M1), plus
-`pkg.uninstall`, `pkg.list`, and the prompt-free uid-0 root role (M2). Both are
+`pkg.uninstall`, `pkg.list`, and the prompt-free uid-0 root role (M2), plus
+on-device re-signing of unsigned/foreign-signed packages (M3). All three are
 TV-validated for the `pkgcmd` TPK path; WGT installs and Samsung Home
-registration remain M4, and on-device re-signing remains M3.
+registration remain M4.
 
 The wire contract is in [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -59,11 +60,13 @@ rejection, timeouts, UI disconnect, requester hangup, grant
 persistence/revocation, execution, process-group timeouts, output truncation in
 both streams, EINTR handling, package staging (allowlist, symlinks, size caps,
 cleanup), zip hygiene and manifest parsing, identity/privilege policy,
-signature labelling, trust material and mount parsing, `pkgcmd` output
-handling, the full install prompt/approve/deny/failure flows, uninstall
+signature labelling, trust material and mount parsing (two CAs), `pkgcmd`
+output handling, the full install prompt/approve/deny/failure flows, uninstall
 prompting and policy (`protected_package`, `unknown_package`), `pkg.list`
-database parsing, and the root role (prompt-free install/removal with a notice,
-`exec` refused). The integrated suite is 120 Linux tests. Linux integration
+database parsing, the root role (prompt-free install/removal with a notice,
+`exec` refused), and re-signing (templates, reference encoding, signature-file
+recognition, author-mismatch refusal, archive rewrite). The integrated suite is
+127 Linux tests. Linux integration
 tests run in Docker:
 
 ```sh
@@ -81,10 +84,13 @@ This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 8 s
 (the previous fully emulated build took about 100 s). With package-install M1
-and M2 on top of M4 and the review-fixes hardening the binary is 787,372 bytes,
-SHA-256 `50e246fa4275dbd2bf6cedf05dc4b0a080a354d4bf9ef1d2f092ec8f0c37e915`
-(TV-validated for install, uninstall, list, and the root role; see the
-package-install plan). The validated M1 build was 762,228 bytes, SHA-256
+through M3 on top of M4 and the review-fixes hardening the binary is 855,716
+bytes, SHA-256
+`ab637c0287f439221a4b545e5a63a1440acaaf45f007ae95176e9f946d0bdcec`
+(TV-validated for install, uninstall, list, re-signing, and the root role; see
+the package-install plan). The validated M2 build was 787,372 bytes, SHA-256
+`50e246fa4275dbd2bf6cedf05dc4b0a080a354d4bf9ef1d2f092ec8f0c37e915`; the
+validated M1 build was 762,228 bytes, SHA-256
 `4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62`; the
 validated M4 build was 584,452 bytes, SHA-256
 `7903c0bac20e27ba3fb1de6b8def5424507e9d9f5c8ab77034c9f5cf5000f464`.
@@ -111,6 +117,7 @@ validated M4 build was 584,452 bytes, SHA-256
 | `--pkgcmd` | `/usr/bin/pkgcmd` | stock installer |
 | `--sqlite3` | `/usr/bin/sqlite3` | read-only package database access |
 | `--pkgdb` | `/opt/dbspace/.pkgmgr_parser.db` | pkgmgr package database |
+| `--xmlsec1` | `/usr/bin/xmlsec1` | on-device XML-DSig signer |
 | `--trust-root` | `/opt/tv-auth/trust` | CA material and fingerprint list |
 | `--no-trust` | off | skip trust enrollment (development only) |
 | `--no-package-support` | off | serve `exec` only |
@@ -126,6 +133,17 @@ The source allowlist is `/opt/usr/home/owner/**`, `/opt/media/**`, and `/tmp/**`
 packages are capped at 128 MiB by default (`--max-package-bytes`, up to
 256 MiB). Package operations never use the grant store and are always
 interactive for app clients; see `PROTOCOL.md`.
+
+Unsigned and foreign-signed packages are re-signed on-device after approval
+(M3). Tizen validates two chains with different domains: the author root must be
+in `tizen-developer`, and the distributor root in `tizen-public`/`tizen-partner`
+but *not* in `tizen-developer`. The daemon therefore enrolls two CAs and writes
+`author-signature.xml` (`role-author`, all files) and `signature1.xml`
+(`role-distributor`, the author signature plus all files) through `xmlsec1`.
+It rewrites the staged archive in place, sets `re_signed: true`, and lets
+`pkgcmd` validate the result. An upgrade is refused with
+`author_mismatch_requires_reinstall` when the installed package was signed by a
+different author, because Tizen rejects cross-author upgrades (`-12`).
 
 `pkg.uninstall` reads the installed package's metadata from
 `/opt/dbspace/.pkgmgr_parser.db` through `sqlite3 -readonly` (the
@@ -148,8 +166,10 @@ queue a `ui.notice` (`kind: "install"`/`"uninstall"`) so the user sees a toast;
 `exec` remains package-only. `test-clients/rootcli` is a static ARMv7 client for
 this role (run it from `/run`: the VDFS in `/opt` rejects unsigned ELFs).
 
-Trust enrollment needs `/opt/tv-auth/trust/` containing `user-root-ca.pem`,
-`fingerprint_list.xml`, and `tizen-ca/`. The daemon verifies the material and
+Trust enrollment and M3 signing need `/opt/tv-auth/trust/` containing
+`user-root-ca.pem` (distributor root), `author-root-ca.pem` (author root),
+`fingerprint_list.xml`, `tizen-ca/` (both roots), and the four signing files
+`user-author.key`/`.pem` and `user-distributor.key`/`.pem` (keys `0600`). The daemon verifies the material and
 bind-mounts it over the stock `/usr/share/ca-certificates/...` paths **in PID
 1's mount namespace** (`nsenter -t 1 -m`). This matters: `tv-authd.service`
 uses `BindReadOnlyPaths=`, so the daemon lives in a private mount namespace,
@@ -331,6 +351,21 @@ TV-validated on 2026-11-08:
   Deny returned `user_denied` with the package intact and Remove returned
   `status: ok`;
 - `pkgcmd -u -n <pkgid>` is the working uninstall form; `-p` is a package path.
+
+M3 (on-device re-signing) was deployed and TV-validated on 2026-11-08:
+
+- a foreign-signed TPK installed through the broker prompt returned
+  `status: ok` with `re_signed: true` and `result=signed files=7`; `pkgcmd`
+  accepted both new chains and the package installed;
+- the installed `author-signature.xml` carries two certificates and the
+  `role-author` property, and the UI badge read "Third-party signature — it
+  will be re-signed with this TV's CA";
+- stripping the signatures from the Partner-signed UI package and installing it
+  over the installed UI was refused with
+  `denied/author_mismatch_requires_reinstall` before any prompt;
+- the domain rule was found the hard way: a single CA in all three domains
+  makes every re-signed package fail with `-12 Invalid certificate chain`,
+  because the distributor root may not be in `tizen-developer`.
 
 Uninstalling a package that was installed through `sdb` leaves its Samsung Home
 `widgetinfo` row behind, because `pkgcmd` does not contact `webappservice`; M4

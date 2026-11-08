@@ -1,11 +1,22 @@
 //! One-time trust enrollment for the stock package installer.
 //!
 //! The firmware validates package signatures against files on the read-only
-//! rootfs. Enrolling a user-owned CA therefore means bind-mounting our CA set
+//! rootfs. Enrolling user-owned CAs therefore means bind-mounting our CA set
 //! and fingerprint list over the stock paths. `ensure_enrolled` is idempotent:
 //! it verifies the material, checks `/proc/self/mounts`, and repairs missing
 //! bind mounts. It is called at daemon start, before each approved install, and
 //! from `tv-authd --enroll-trust`.
+//!
+//! Tizen uses **two** independent signature chains and enforces the domain:
+//!
+//! - the author signature (`author-signature.xml`) must chain to a CA listed in
+//!   the `tizen-developer` domain;
+//! - the distributor signature (`signature1.xml`) must chain to a CA listed in
+//!   `tizen-public`/`tizen-partner`, and that root must *not* also be in
+//!   `tizen-developer` (the validator rejects such a chain).
+//!
+//! A single CA cannot be both, so M3 enrolls two: `author-root-ca.pem` and
+//! `user-root-ca.pem`.
 
 use crate::pkgmeta::{sha1_digest, SignatureContext};
 use base64::Engine as _;
@@ -21,7 +32,8 @@ pub const DEFAULT_TIZEN_CA_DIR: &str = "/usr/share/ca-certificates/tizen";
 
 #[derive(Debug, Clone)]
 pub struct TrustPaths {
-    /// Holds `user-root-ca.pem`, `fingerprint_list.xml`, and `tizen-ca/`.
+    /// Holds `user-root-ca.pem` (distributor), `author-root-ca.pem`,
+    /// `fingerprint_list.xml`, `tizen-ca/`, and the M3 signing keys.
     pub root: PathBuf,
     /// Stock fingerprint list to replace with our copy.
     pub fingerprint_file: PathBuf,
@@ -40,6 +52,26 @@ impl TrustPaths {
 
     pub fn ca_file(&self) -> PathBuf {
         self.root.join("user-root-ca.pem")
+    }
+
+    pub fn author_ca_file(&self) -> PathBuf {
+        self.root.join("author-root-ca.pem")
+    }
+
+    pub fn author_key_file(&self) -> PathBuf {
+        self.root.join("user-author.key")
+    }
+
+    pub fn author_cert_file(&self) -> PathBuf {
+        self.root.join("user-author.pem")
+    }
+
+    pub fn distributor_key_file(&self) -> PathBuf {
+        self.root.join("user-distributor.key")
+    }
+
+    pub fn distributor_cert_file(&self) -> PathBuf {
+        self.root.join("user-distributor.pem")
     }
 
     pub fn fingerprint_source(&self) -> PathBuf {
@@ -64,7 +96,7 @@ impl std::fmt::Display for TrustError {
         match self {
             Self::Missing(what) => write!(formatter, "missing trust material: {what}"),
             Self::FingerprintMissing => formatter
-                .write_str("fingerprint_list.xml does not contain the user CA SHA-1 fingerprint"),
+                .write_str("fingerprint_list.xml does not contain both user CA SHA-1 fingerprints"),
             Self::MountFailed(detail) => write!(formatter, "trust bind mount failed: {detail}"),
             Self::Io(error) => write!(formatter, "trust I/O error: {error}"),
         }
@@ -88,7 +120,10 @@ impl std::fmt::Display for Enrollment {
 
 #[derive(Debug, Clone)]
 pub struct TrustMaterial {
+    /// Distributor root CA (public/partner domains).
     pub user_ca_sha1: [u8; 20],
+    /// Author root CA (`tizen-developer` domain).
+    pub author_ca_sha1: [u8; 20],
     /// Every SHA-1 in the enrolled fingerprint list (stock roots + ours).
     pub known_fingerprints: Vec<[u8; 20]>,
 }
@@ -97,6 +132,7 @@ impl TrustMaterial {
     pub fn signature_context(&self) -> SignatureContext {
         SignatureContext {
             user_ca_sha1: Some(self.user_ca_sha1),
+            author_ca_sha1: Some(self.author_ca_sha1),
             known_fingerprints: self.known_fingerprints.clone(),
         }
     }
@@ -110,6 +146,11 @@ pub fn load_material(paths: &TrustPaths) -> Result<TrustMaterial, TrustError> {
     })?;
     let ca_der = certificate_der(&ca_pem)?;
     let user_ca_sha1 = sha1_digest(&ca_der);
+    let author_ca_pem = fs::read(paths.author_ca_file()).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => TrustError::Missing("author-root-ca.pem".into()),
+        _ => TrustError::Io(error),
+    })?;
+    let author_ca_sha1 = sha1_digest(&certificate_der(&author_ca_pem)?);
 
     let fingerprint_path = paths.fingerprint_source();
     let fingerprint_text =
@@ -118,7 +159,8 @@ pub fn load_material(paths: &TrustPaths) -> Result<TrustMaterial, TrustError> {
             _ => TrustError::Io(error),
         })?;
     let known_fingerprints = fingerprints_in(&fingerprint_text);
-    if !known_fingerprints.contains(&user_ca_sha1) {
+    if !known_fingerprints.contains(&user_ca_sha1) || !known_fingerprints.contains(&author_ca_sha1)
+    {
         return Err(TrustError::FingerprintMissing);
     }
 
@@ -129,6 +171,7 @@ pub fn load_material(paths: &TrustPaths) -> Result<TrustMaterial, TrustError> {
 
     Ok(TrustMaterial {
         user_ca_sha1,
+        author_ca_sha1,
         known_fingerprints,
     })
 }
@@ -143,7 +186,7 @@ pub fn load_material(paths: &TrustPaths) -> Result<TrustMaterial, TrustError> {
 /// bind mount (or an earlier repair) is active.
 pub fn ensure_enrolled(paths: &TrustPaths) -> Result<Enrollment, TrustError> {
     let material = load_material(paths)?;
-    if is_enrolled(paths, &material.user_ca_sha1) {
+    if is_enrolled(paths, &material) {
         return Ok(Enrollment::AlreadyEnrolled);
     }
 
@@ -164,35 +207,45 @@ pub fn ensure_enrolled(paths: &TrustPaths) -> Result<Enrollment, TrustError> {
         run_mount(&source, target)?;
     }
 
-    if !is_enrolled(paths, &material.user_ca_sha1) {
+    if !is_enrolled(paths, &material) {
         return Err(TrustError::MountFailed(
-            "the target files still do not contain the enrolled CA".into(),
+            "the target files still do not contain the enrolled CAs".into(),
         ));
     }
     Ok(Enrollment::Mounted)
 }
 
-fn is_enrolled(paths: &TrustPaths, user_ca_sha1: &[u8; 20]) -> bool {
-    is_enrolled_with(paths, user_ca_sha1, read_in_root_namespace)
+fn is_enrolled(paths: &TrustPaths, material: &TrustMaterial) -> bool {
+    is_enrolled_with(paths, material, read_in_root_namespace)
 }
 
 fn is_enrolled_with(
     paths: &TrustPaths,
-    user_ca_sha1: &[u8; 20],
+    material: &TrustMaterial,
     read: impl Fn(&Path) -> Result<Vec<u8>, TrustError>,
 ) -> bool {
-    let fingerprint_ok = read(&paths.fingerprint_file)
+    let fingerprints = read(&paths.fingerprint_file)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|text| fingerprints_in(&text).contains(user_ca_sha1))
-        .unwrap_or(false);
-    let ca_target = paths.tizen_ca_dir.join("user-root-ca.pem");
-    let ca_ok = read(&ca_target)
-        .ok()
-        .and_then(|pem| certificate_der(&pem).ok())
-        .map(|der| &sha1_digest(&der) == user_ca_sha1)
-        .unwrap_or(false);
-    fingerprint_ok && ca_ok
+        .map(|text| fingerprints_in(&text))
+        .unwrap_or_default();
+    if !fingerprints.contains(&material.user_ca_sha1)
+        || !fingerprints.contains(&material.author_ca_sha1)
+    {
+        return false;
+    }
+    [
+        ("user-root-ca.pem", material.user_ca_sha1),
+        ("author-root-ca.pem", material.author_ca_sha1),
+    ]
+    .iter()
+    .all(|(name, expected)| {
+        read(&paths.tizen_ca_dir.join(name))
+            .ok()
+            .and_then(|pem| certificate_der(&pem).ok())
+            .map(|der| &sha1_digest(&der) == expected)
+            .unwrap_or(false)
+    })
 }
 
 /// Command that runs in PID 1's mount namespace. `tv-authd.service` uses
@@ -381,19 +434,21 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn write_material(root: &Path, ca_der: &[u8], fingerprints: &str) {
-        fs::create_dir_all(root.join("tizen-ca")).unwrap();
-        let pem = format!(
+    fn pem(der: &[u8]) -> String {
+        format!(
             "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-            base64::engine::general_purpose::STANDARD.encode(ca_der)
-        );
-        fs::write(root.join("user-root-ca.pem"), pem).unwrap();
-        fs::write(root.join("fingerprint_list.xml"), fingerprints).unwrap();
-        fs::set_permissions(
-            root.join("user-root-ca.pem"),
-            fs::Permissions::from_mode(0o600),
+            base64::engine::general_purpose::STANDARD.encode(der)
         )
-        .unwrap();
+    }
+
+    fn write_material(root: &Path, ca_der: &[u8], author_der: &[u8], fingerprints: &str) {
+        fs::create_dir_all(root.join("tizen-ca")).unwrap();
+        fs::write(root.join("user-root-ca.pem"), pem(ca_der)).unwrap();
+        fs::write(root.join("author-root-ca.pem"), pem(author_der)).unwrap();
+        fs::write(root.join("fingerprint_list.xml"), fingerprints).unwrap();
+        for name in ["user-root-ca.pem", "author-root-ca.pem"] {
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     fn colon_hex(bytes: &[u8]) -> String {
@@ -427,21 +482,32 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let ca_der = b"not really a certificate, but stable bytes";
+        let author_der = b"a distinct author certificate";
         let fingerprint = colon_hex(&sha1_digest(ca_der));
+        let author_fingerprint = colon_hex(&sha1_digest(author_der));
         write_material(
             root,
             ca_der,
-            &format!("<fingerprint>{fingerprint}</fingerprint>"),
+            author_der,
+            &format!(
+                "<fingerprint>{fingerprint}</fingerprint>\
+                 <fingerprint>{author_fingerprint}</fingerprint>"
+            ),
         );
 
         let paths = TrustPaths::new(root);
         let material = load_material(&paths).unwrap();
         assert_eq!(material.user_ca_sha1, sha1_digest(ca_der));
+        assert_eq!(material.author_ca_sha1, sha1_digest(author_der));
         assert_eq!(
             material.signature_context().user_ca_sha1,
             Some(sha1_digest(ca_der))
         );
-        assert_eq!(material.known_fingerprints.len(), 1);
+        assert_eq!(
+            material.signature_context().author_ca_sha1,
+            Some(sha1_digest(author_der))
+        );
+        assert_eq!(material.known_fingerprints.len(), 2);
     }
 
     #[test]
@@ -449,28 +515,28 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("trust");
         let ca_der = b"target certificate bytes";
-        let sha1 = sha1_digest(ca_der);
-        write_material(
-            &root,
-            ca_der,
-            &format!("<FingerprintSHA1>{}</FingerprintSHA1>", colon_hex(&sha1)),
+        let author_der = b"target author certificate bytes";
+        let fingerprints = format!(
+            "<FingerprintSHA1>{}</FingerprintSHA1><FingerprintSHA1>{}</FingerprintSHA1>",
+            colon_hex(&sha1_digest(ca_der)),
+            colon_hex(&sha1_digest(author_der))
         );
+        write_material(&root, ca_der, author_der, &fingerprints);
 
         let mut paths = TrustPaths::new(&root);
         paths.fingerprint_file = directory.path().join("target-fingerprint.xml");
         paths.tizen_ca_dir = directory.path().join("target-tizen-ca");
         fs::create_dir_all(&paths.tizen_ca_dir).unwrap();
-        assert!(!is_enrolled_with(&paths, &sha1, |path| {
+        let material = load_material(&paths).unwrap();
+        assert!(!is_enrolled_with(&paths, &material, |path| {
             fs::read(path).map_err(TrustError::Io)
         }));
 
         fs::copy(root.join("fingerprint_list.xml"), &paths.fingerprint_file).unwrap();
-        fs::copy(
-            root.join("user-root-ca.pem"),
-            paths.tizen_ca_dir.join("user-root-ca.pem"),
-        )
-        .unwrap();
-        assert!(is_enrolled_with(&paths, &sha1, |path| {
+        for name in ["user-root-ca.pem", "author-root-ca.pem"] {
+            fs::copy(root.join(name), paths.tizen_ca_dir.join(name)).unwrap();
+        }
+        assert!(is_enrolled_with(&paths, &material, |path| {
             fs::read(path).map_err(TrustError::Io)
         }));
     }
@@ -482,6 +548,7 @@ mod tests {
         write_material(
             root,
             b"certificate",
+            b"author certificate",
             &format!("<fingerprint>{}</fingerprint>", "00:".repeat(19) + "00"),
         );
         assert!(matches!(

@@ -6,13 +6,14 @@ use crate::logger::Logger;
 use crate::pkginstall::{self, InstallError};
 use crate::pkglist;
 use crate::pkgmeta::{self, MetaError, SignatureContext};
+use crate::pkgsign::{self, SigningKeys};
 use crate::pkgstage::{self, StageConfig, StageError};
 use crate::protocol::{
     is_valid_request_id, parse_request, prompt_text, read_message, validate_decision,
     validate_exec, validate_install, validate_label, validate_uninstall, write_response,
     ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind, PackageView,
-    ParseError, PromptKind, Request, Response, UninstallMeta, UninstallRequest, MAX_PKGID_BYTES,
-    MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES, MAX_REQUEST_BYTES,
+    ParseError, PromptKind, Request, Response, SignatureStatus, UninstallMeta, UninstallRequest,
+    MAX_PKGID_BYTES, MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES, MAX_REQUEST_BYTES,
 };
 use crate::trust::{self, TrustPaths};
 use rustix::io::Errno;
@@ -38,8 +39,12 @@ pub struct PackageConfig {
     pub pkgcmd: PathBuf,
     /// Stock package database, read through `sqlite3 -readonly`.
     pub db: pkglist::PackageDb,
+    /// Stock XML-DSig signer, normally `/usr/bin/xmlsec1`.
+    pub xmlsec1: PathBuf,
     /// `None` disables trust enrollment (host tests and dry runs only).
     pub trust: Option<TrustPaths>,
+    /// On-device re-signing keys; `None` leaves unsigned packages uninstallable.
+    pub signing: Option<SigningKeys>,
     /// Directories that indicate an already installed package.
     pub installed_roots: Vec<PathBuf>,
 }
@@ -50,7 +55,9 @@ impl PackageConfig {
             staging: StageConfig::default(),
             pkgcmd: PathBuf::from("/usr/bin/pkgcmd"),
             db: pkglist::PackageDb::new(),
+            xmlsec1: PathBuf::from("/usr/bin/xmlsec1"),
             trust: Some(TrustPaths::new(trust::DEFAULT_TRUST_ROOT)),
+            signing: None,
             installed_roots: DEFAULT_INSTALLED_ROOTS.iter().map(PathBuf::from).collect(),
         }
     }
@@ -895,10 +902,98 @@ fn handle_install(
 
     let is_upgrade = pkginstall::is_installed(&meta.pkgid, &packages.installed_roots);
     let install_meta = meta.into_install_meta(staged.size_bytes(), is_upgrade);
+    // M3: unsigned and foreign-signed packages are re-signed on-device after
+    // approval. Tizen refuses cross-author upgrades (-12), so an upgrade of a
+    // package signed by someone else is rejected before the prompt.
+    let needs_signing = matches!(
+        install_meta.signature,
+        SignatureStatus::UnsignedWillResign | SignatureStatus::ForeignWillResign
+    );
+    let signing_keys = if needs_signing {
+        match packages.signing.clone() {
+            Some(keys) => Some(keys),
+            None => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} method=pkg.install pkgid={} error=sign_failed detail=signing_disabled",
+                        identity.label, request.id, install_meta.pkgid
+                    ),
+                );
+                send(
+                    writer,
+                    &Response::error_with_detail(
+                        &request.id,
+                        "error",
+                        "sign_failed",
+                        Some("on-device signing is disabled (no trust root)".into()),
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(keys) = &signing_keys {
+        let author = match keys.author_fingerprint() {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} error=sign_failed detail={error}",
+                        identity.label, request.id, install_meta.pkgid
+                    ),
+                );
+                send(
+                    writer,
+                    &Response::error_with_detail(
+                        &request.id,
+                        "error",
+                        "sign_failed",
+                        Some(error.to_string()),
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
+        if is_upgrade {
+            if let Some(installed) = pkgsign::installed_author_fingerprint(
+                &install_meta.pkgid,
+                &packages.installed_roots,
+            ) {
+                if installed != author {
+                    log(
+                        broker,
+                        &format!(
+                            "requester={} request={} pkgid={} denied=author_mismatch_requires_reinstall",
+                            identity.label, request.id, install_meta.pkgid
+                        ),
+                    );
+                    send(
+                        writer,
+                        &Response::error_with_detail(
+                            &request.id,
+                            "denied",
+                            "author_mismatch_requires_reinstall",
+                            Some(
+                                "the installed package was signed by a different author; \
+                                 uninstall it before installing this build"
+                                    .into(),
+                            ),
+                        ),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     log(
         broker,
         &format!(
-            "requester={} request={} method=pkg.install staged=true sha256={} pkgid={} version={} size={} signature={:?} upgrade={} {}",
+            "requester={} request={} method=pkg.install staged=true sha256={} pkgid={} version={} size={} signature={:?} upgrade={} re_sign={} {}",
             identity.label,
             request.id,
             staged.sha256(),
@@ -907,6 +1002,7 @@ fn handle_install(
             staged.size_bytes(),
             install_meta.signature,
             is_upgrade,
+            needs_signing,
             if prompt {
                 "approval_required"
             } else {
@@ -1006,6 +1102,41 @@ fn handle_install(
         }
     }
 
+    let mut re_signed = false;
+    if let Some(keys) = &signing_keys {
+        match pkgsign::resign(staged.path(), request.pkg_type, keys) {
+            Ok(outcome) => {
+                re_signed = true;
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} result=signed files={}",
+                        identity.label, request.id, install_meta.pkgid, outcome.files
+                    ),
+                );
+            }
+            Err(error) => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} error=sign_failed detail={error}",
+                        identity.label, request.id, install_meta.pkgid
+                    ),
+                );
+                send(
+                    writer,
+                    &Response::error_with_detail(
+                        &request.id,
+                        "error",
+                        "sign_failed",
+                        Some(error.to_string()),
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
     match pkginstall::install(
         &packages.pkgcmd,
         request.pkg_type,
@@ -1041,7 +1172,7 @@ fn handle_install(
                     &request.id,
                     &install_meta.pkgid,
                     &install_meta.pkg_version,
-                    false,
+                    re_signed,
                     &outcome.log_tail,
                 ),
             )?;
@@ -2005,6 +2136,30 @@ mod tests {
         std::fs::write(&pkgcmd, pkgcmd_body).unwrap();
         std::fs::set_permissions(&pkgcmd, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Fake signing material: the daemon only checks that the key paths
+        // exist and can read the author certificate. The fake xmlsec1 writes a
+        // placeholder signature document.
+        let trust = directory.join("trust");
+        std::fs::create_dir_all(trust.join("tizen-ca")).unwrap();
+        for name in [
+            "user-author.key",
+            "author-root-ca.pem",
+            "user-root-ca.pem",
+            "user-distributor.key",
+            "user-distributor.pem",
+            "user-distributor-ca.pem",
+        ] {
+            std::fs::write(trust.join(name), b"test key material").unwrap();
+        }
+        std::fs::write(trust.join("user-author.pem"), [0x30_u8, 1, 2, 3]).unwrap();
+        let xmlsec1 = directory.join("xmlsec1");
+        std::fs::write(
+            &xmlsec1,
+            "#!/bin/sh\nprintf '<?xml version=\"1.0\"?>\\n<Signature>fake</Signature>\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&xmlsec1, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         // Fake sqlite3: the daemon re-filters rows by package id, so a plain
         // dump of the fixture rows is enough for both list and get.
         let rows_path = directory.join("pkg-rows");
@@ -2028,10 +2183,37 @@ mod tests {
                 sqlite3,
                 database: directory.join("pkgmgr.db"),
             },
+            xmlsec1: xmlsec1.clone(),
             trust: None,
+            signing: Some(SigningKeys {
+                xmlsec1,
+                author_key: trust.join("user-author.key"),
+                author_cert: trust.join("user-author.pem"),
+                author_ca: trust.join("author-root-ca.pem"),
+                distributor_key: trust.join("user-distributor.key"),
+                distributor_cert: trust.join("user-distributor.pem"),
+                distributor_ca: trust.join("user-root-ca.pem"),
+            }),
             installed_roots: Vec::new(),
         });
         source
+    }
+
+    fn zip_entry(path: &std::path::Path, name: &str) -> Vec<u8> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut entry = archive.by_name(name).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn zip_has(path: &std::path::Path, name: &str) -> bool {
+        let file = std::fs::File::open(path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let found = archive.by_name(name).is_ok();
+        found
     }
 
     fn install_request(id: &str, path: &str) -> Value {
@@ -2089,7 +2271,7 @@ mod tests {
         assert_eq!(response["status"], "ok");
         assert_eq!(response["pkgid"], "org.example.app");
         assert_eq!(response["pkg_version"], "1.0.0");
-        assert_eq!(response["re_signed"], false);
+        assert_eq!(response["re_signed"], true);
         use base64::Engine as _;
         let log = base64::engine::general_purpose::STANDARD
             .decode(response["log_tail_b64"].as_str().unwrap())
@@ -2264,7 +2446,7 @@ mod tests {
                 capture.display()
             ),
         );
-        let original = std::fs::read(&source).unwrap();
+        let original_manifest = zip_entry(&source, "config.xml");
         let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
         ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
         assert_eq!(ui.read()["status"], "ok");
@@ -2288,12 +2470,78 @@ mod tests {
         }));
         assert_eq!(ui.read()["status"], "ok");
         assert_eq!(client.read()["status"], "ok");
-        assert_eq!(std::fs::read(&capture).unwrap(), original);
+        // Signing rewrites the archive, so compare the payload rather than the
+        // bytes: the tampered source must not have been used, and the archive
+        // handed to pkgcmd must carry fresh signatures.
+        assert_eq!(zip_entry(&capture, "config.xml"), original_manifest);
+        assert!(zip_has(&capture, "author-signature.xml"));
+        assert!(zip_has(&capture, "signature1.xml"));
 
         drop(client);
         handle.join().unwrap().unwrap();
         drop(ui);
         ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn upgrading_a_differently_signed_package_is_rejected_before_prompting() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let source = with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        // Pretend the package is installed with a different author certificate.
+        let apps = fixture._directory.path().join("installed");
+        let installed = apps.join("org.example.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        use base64::Engine as _;
+        let certificate = base64::engine::general_purpose::STANDARD.encode(b"another author");
+        std::fs::write(
+            installed.join("author-signature.xml"),
+            format!("<X509Data><X509Certificate>{certificate}</X509Certificate></X509Data>"),
+        )
+        .unwrap();
+        fixture.config.packages.as_mut().unwrap().installed_roots = vec![apps];
+        let marker = fixture._directory.path().join("pkgcmd-ran");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "author_mismatch_requires_reinstall");
+        assert!(!marker.exists());
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn unsigned_installs_fail_closed_without_signing_keys() {
+        let mut fixture = fixture();
+        fixture.config.packages = Some(PackageConfig {
+            staging: StageConfig {
+                root: fixture._directory.path().join("staging"),
+                allowed_roots: vec![fixture._directory.path().to_path_buf()],
+                max_bytes: 1024 * 1024,
+            },
+            pkgcmd: fixture._directory.path().join("pkgcmd"),
+            db: pkglist::PackageDb {
+                sqlite3: fixture._directory.path().join("sqlite3"),
+                database: fixture._directory.path().join("pkgmgr.db"),
+            },
+            xmlsec1: fixture._directory.path().join("xmlsec1"),
+            trust: None,
+            signing: None,
+            installed_roots: Vec::new(),
+        });
+        let source = fixture._directory.path().join("org.example.app-1.0.0.wgt");
+        write_wgt(&source, "org.example.app");
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+        let response = client.read();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "sign_failed");
+        drop(client);
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

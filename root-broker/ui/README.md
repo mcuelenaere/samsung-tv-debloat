@@ -60,10 +60,10 @@ The UI replaces the root-access warning with the package facts:
 - requester (package ID and SMACK label);
 - package name, package ID, version, type, and staged size;
 - an upgrade note when the daemon believes the package is already installed;
-- a signature badge: "Unsigned package — no trusted signature", "Third-party
-  signature — not trusted by this TV", "Signed by your own CA", or "Signed by
-  Samsung". Once M3 on-device signing lands, the unsigned/foreign labels will
-  say that the package will be re-signed before installation;
+- a signature badge: "Unsigned — it will be signed with this TV's CA",
+  "Third-party signature — it will be re-signed with this TV's CA", "Signed by
+  your own CA", or "Signed by Samsung". The unsigned/foreign labels are
+  accurate for M3: the daemon re-signs those packages after approval;
 - the requested privileges with friendly names for common Tizen privileges
   (up to 7 are listed; the rest are summarised);
 - **Deny** and **Install** buttons only. There is deliberately no **Always
@@ -162,11 +162,11 @@ Observed local artifacts (after rebasing package-prompt work onto M4):
 
 ```text
 Managed assembly: 57,856 bytes
-Unsigned TPK:     29,055 bytes
-Signed TPK:       36,640 bytes (Partner profile `tvauth-partner`, SHA-256
-                  `e6edecfc6f9507f83c1224488ac14adc09a8a7fc9f5c01134d3b0720c69c21e8`;
+Unsigned TPK:     29,051 bytes
+Signed TPK:       36,637 bytes (Partner profile `tvauth-partner`, SHA-256
+                  `20358bf4f31587d9da14ee7c808f5faa38677af92ce3596459ecb27f3cd9dd22`;
                   installed TvAuthUi.dll SHA-256
-                  `38c036d59a2c9e30808c035a804c9cc85af97af7370d4d862d4568124e5210de`)
+                  `f627f35c688afb2fc143422df0e90e3de3fc88658acdf5142ea3bf542c9bc910`)
 ```
 
 ## Signing and installation
@@ -248,6 +248,10 @@ daemon:
   `status: ok` and the package was gone;
 - root `pkg.install` and `pkg.uninstall` showed **PACKAGE CHANGE** toasts,
   "root installed a package" / "root removed a package", with the command line.
+
+The M3 badge text was verified on the TV on 2026-11-08 while installing a
+foreign-signed TPK: the package panel read "Third-party signature — it will be
+re-signed with this TV's CA", and approval installed the newly signed package.
 
 The execution toast was validated on the TV on 2026-11-08 with Vetro holding an
 Always-allow grant: Vetro bursts of ~20 execs/s were coalesced into single
