@@ -85,9 +85,9 @@ This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 8 s
 (the previous fully emulated build took about 100 s). With package-install M1
-through M4 on top of M4 and the review-fixes hardening the binary is 868,884
+through M4 on top of M4 and the review-fixes hardening the binary is 869,956
 bytes, SHA-256
-`f77fec8e99889bb91dfda27fdddcab8c4978e1b0ff40f33a89ea5b095183d56d`
+`97366e5c9c117f224e3647208ba25ece12ce52d8a9eee6ad9d6f0552880efc97`
 (TV-validated for install/uninstall/list/re-signing, the root role, and Samsung
 Home registration; see the package-install plan). The validated M3 build was
 855,716 bytes, SHA-256
@@ -159,6 +159,9 @@ binary exits immediately on retail firmware:
   Home ("My apps") reads, and removals delete them;
 - the staged package keeps its `0711`/`0644` layout because `webappservice`
   copies it as UID 5001;
+- the `/etc` copy is rebuilt before every operation and warmed in the
+  background at startup (`was_preparing` -> `was_ready`), so the socket starts
+  listening immediately even though the cold copy takes ~20 s;
 - `wascmd -u` refuses packages that were not installed through the SDK path
   (`is_sdk_app`); the daemon then falls back to `pkgcmd -u` plus an explicit
   Home cleanup (delete the `widgetinfo` row, remove the cached icon, set
@@ -401,6 +404,13 @@ M4 (the `webappservice` backend) was deployed and TV-validated on 2026-11-08:
   `is_display=1`, `install_state=3`) plus the cached icon;
 - a broker uninstall returned `backend=was` and removed the package, the Home
   row, and the icon;
+- a cold boot (2026-11-08 22:47) reproduced the whole flow: the AT-HUB hook
+  started the daemon (`start units rc=0`), `starting`/`staging_ready`/
+  `listening` happened in the same second with `was_preparing` in between,
+  `was_ready` followed, trust re-enrolled in PID 1 with both roots
+  (`author-root-ca.pem` + `user-root-ca.pem` in `tizen-ca`, fingerprints 1 + 2),
+  the `org.tvauth.ui` Home row survived, Vetro resumed executing, and broker
+  install/uninstall still produced and removed the Home row and icon;
 - a package installed with `pkgcmd` (the `is_sdk_app` case) uninstalled through
   the fallback (`backend=pkgcmd+home`), which deleted the manual Home row and
   icon;

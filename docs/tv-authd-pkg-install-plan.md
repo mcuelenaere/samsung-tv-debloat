@@ -864,12 +864,14 @@ Code:
   the cached icon, set `memory/was/app_change=1`) when `is_sdk_app` refuses.
   `is_upgrade` now comes from the pkgmgr database rather than a leftover app
   directory, which also keeps the M3 author check from reading stale files.
-- `daemon/src/main.rs` — `--no-was` (keep the `pkgcmd` backend); prepares the
-  `/etc` copy at startup and logs `was_ready`.
+- `daemon/src/main.rs` — `--no-was` (keep the `pkgcmd` backend); warms the
+  `/etc` copy in a background thread at startup (`was_preparing` ->
+  `was_ready`) so the socket starts listening immediately; package operations
+  serialize on a prepare lock and refresh the copy themselves.
 - `daemon/src/pkginstall.rs` — `pkgcmd` remains as the fallback backend.
 
-Deployed: daemon 868,884 bytes, SHA-256
-`f77fec8e99889bb91dfda27fdddcab8c4978e1b0ff40f33a89ea5b095183d56d`.
+Deployed: daemon 869,956 bytes, SHA-256
+`97366e5c9c117f224e3647208ba25ece12ce52d8a9eee6ad9d6f0552880efc97`.
 
 Validated on the target:
 
@@ -899,6 +901,16 @@ Bugs found and fixed:
    `is_upgrade` now comes from `package_info`.
 3. `xmlsec1`/`wascmd` must run with a working directory or explicit absolute
    paths; the namespace script uses absolute paths throughout.
+
+Cold boot (2026-11-08 22:47) validated the new pieces: the AT-HUB hook started
+the daemon, `starting`/`staging_ready`/`listening` happened in the same second
+(the `/etc` copy runs in the background), `was_ready` followed, trust
+re-enrolled in PID 1 with both roots (fingerprint list 1 author + 2
+distributor, both CA files in `tizen-ca`), the `org.tvauth.ui` Home row
+survived, and a broker TPK install/uninstall still used `backend=was` and
+created/removed the Home row and icon. The first version prepared `/etc`
+synchronously and delayed listening by ~20 s on a cold cache; that is fixed by
+the background warm-up.
 
 Known limitation: WGT packages are rejected by the firmware's package manager.
 The WAS backend is in place, so if a future firmware accepts WGT, the daemon

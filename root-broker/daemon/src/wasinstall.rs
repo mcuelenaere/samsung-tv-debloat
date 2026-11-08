@@ -28,6 +28,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub const DEFAULT_WASCMD: &str = "/usr/bin/wascmd";
 pub const DEFAULT_UNSHARE: &str = "/usr/bin/unshare";
@@ -35,6 +36,10 @@ pub const DEFAULT_MOUNT: &str = "/bin/mount";
 pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub const DEFAULT_ETC_SOURCE: &str = "/etc";
 pub const DEFAULT_ETC_COPY: &str = "/run/tv-auth/etc-norelease";
+
+/// Serializes `/etc` copy rebuilds between the startup warm-up thread and the
+/// package-operation threads.
+static PREPARE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct WasConfig {
@@ -180,6 +185,9 @@ fn run(
 /// keeps dynamic-linker/NSS files fresh. It lives on the `/run` tmpfs, next to
 /// the daemon log, and is removed when the daemon exits with the tmpfs.
 pub fn prepare_etc(config: &WasConfig) -> io::Result<()> {
+    let _guard = PREPARE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if config.etc_copy.exists() {
         fs::remove_dir_all(&config.etc_copy)?;
     }
