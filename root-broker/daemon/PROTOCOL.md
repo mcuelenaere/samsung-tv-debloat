@@ -181,7 +181,7 @@ The request lifecycle:
    `samsung` package is installed as-is;
 7. install through `wascmd` (`webappservice`), which also registers the app in
    Samsung Home and supports WGT; the stock `wascmd` runs inside a private
-   mount namespace with an `/etc` copy that has no `release` file. Without the
+   mount namespace with a symlink overlay of `/etc` that has no `release` file. Without the
    WAS backend (`--no-was`) the daemon falls back to
    `pkgcmd -i -t <type> -p <staged>` with no Home registration;
 8. response, then the staged copy is deleted on every path.
@@ -559,7 +559,7 @@ Response:
   refused, as are platform-only privileges (the installer's
   own privilege check remains authoritative).
 - Installs and removals go through `webappservice` by default: `wascmd -i`
-  (`-u` for removal) runs under `unshare -m` with a copy of `/etc` minus
+  (`-u` for removal) runs under `unshare -m` with a top-level symlink overlay of `/etc` minus
   `release`, because the stock binary refuses to run on retail firmware. This
   is what makes TPKs appear in Samsung Home and keeps their tiles clean on
   removal. `--no-was` selects the `pkgcmd` backend instead.

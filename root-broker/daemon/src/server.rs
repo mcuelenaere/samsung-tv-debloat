@@ -2734,6 +2734,7 @@ mod tests {
             shell: PathBuf::from("/bin/sh"),
             etc_source: etc,
             etc_copy: directory.join("etc-copy"),
+            etc_real: directory.join("etc-real"),
         });
         wascmd_args
     }

@@ -91,28 +91,20 @@ fn run(args: Args) -> io::Result<()> {
             packages.db.database.display()
         ))?;
         if let Some(was) = &packages.was {
-            // The cold copy takes ~20 s on this TV (1,200 files on VDFS), so
-            // never delay the socket: warm it in the background. A package
-            // operation that arrives first waits on the same lock and then
-            // refreshes the copy itself.
-            logger.log(&format!(
-                "was_preparing wascmd={} etc_copy={}",
-                was.wascmd.display(),
-                was.etc_copy.display()
-            ))?;
-            let preparation = was.clone();
-            let preparation_logger = Arc::clone(&logger);
-            thread::spawn(move || {
-                let message = match wasinstall::prepare_etc(&preparation) {
-                    Ok(()) => format!(
-                        "was_ready wascmd={} etc_copy={}",
-                        preparation.wascmd.display(),
-                        preparation.etc_copy.display()
-                    ),
-                    Err(error) => format!("was_etc_failed={error}"),
-                };
-                let _ = preparation_logger.log(&message);
-            });
+            // The overlay is a top-level symlink farm (one directory read),
+            // so this is effectively free even on a cold boot.
+            match wasinstall::prepare_etc(was) {
+                Ok(()) => logger.log(&format!(
+                    "was_ready wascmd={} etc_links={} etc_real={}",
+                    was.wascmd.display(),
+                    was.etc_copy.display(),
+                    was.etc_real.display()
+                ))?,
+                Err(error) => {
+                    // Installs will fail with a clear error; keep exec working.
+                    logger.log(&format!("was_etc_failed={error}"))?;
+                }
+            }
         }
         if let Some(paths) = &packages.trust {
             match trust::ensure_enrolled(paths) {

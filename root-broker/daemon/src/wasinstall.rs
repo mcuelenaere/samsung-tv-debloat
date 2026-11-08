@@ -7,13 +7,14 @@
 //! of it, but `/usr/bin/wascmd` exits immediately on retail firmware because
 //! `/etc/release` exists.
 //!
-//! This module runs the stock `wascmd` inside a private mount namespace where a
-//! copy of `/etc` **without** `release` is bound over `/etc`. Nothing in the
-//! host namespace changes, and the binary is the same Samsung-signed one
-//! `sdb install` drives in-process through `sdbd`.
+//! This module runs the stock `wascmd` inside a private mount namespace where
+//! `/etc` is replaced by a lightweight top-level symlink farm (`/run/tv-auth/etc-norelease`)
+//! pointing into a bind mount of the real `/etc` (`/run/tv-auth/etc-real`),
+//! with only `release` omitted. No files are copied and nothing in the host
+//! mount namespace changes.
 //!
 //! Install:
-//!   unshare -m -- /bin/sh -c 'mount --bind <etc-copy> /etc; exec wascmd -i <pkgid> -p <path>'
+//!   unshare -m -- /bin/sh -c 'mount --bind <etc-src> <etc-real> && mount --bind <etc-links> /etc && exec wascmd -i <pkgid> -p <path>'
 //! Uninstall:
 //!   ... wascmd -u <appid>
 //!
@@ -36,9 +37,9 @@ pub const DEFAULT_MOUNT: &str = "/bin/mount";
 pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub const DEFAULT_ETC_SOURCE: &str = "/etc";
 pub const DEFAULT_ETC_COPY: &str = "/run/tv-auth/etc-norelease";
+pub const DEFAULT_ETC_REAL: &str = "/run/tv-auth/etc-real";
 
-/// Serializes `/etc` copy rebuilds between the startup warm-up thread and the
-/// package-operation threads.
+/// Serializes symlink-farm rebuilds across package-operation threads.
 static PREPARE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
@@ -50,10 +51,12 @@ pub struct WasConfig {
     pub mount: PathBuf,
     /// Shell used for the bind-mount + exec one-liner.
     pub shell: PathBuf,
-    /// Real `/etc` to copy (tests use a fixture directory).
+    /// Real `/etc` to expose (tests use a fixture directory).
     pub etc_source: PathBuf,
-    /// Where the copy without `release` lives.
+    /// Directory of top-level symlinks without `release`, bound over `/etc`.
     pub etc_copy: PathBuf,
+    /// Mount point where the real `/etc` is bound inside the child namespace.
+    pub etc_real: PathBuf,
 }
 
 impl WasConfig {
@@ -65,6 +68,7 @@ impl WasConfig {
             shell: PathBuf::from(DEFAULT_SHELL),
             etc_source: PathBuf::from(DEFAULT_ETC_SOURCE),
             etc_copy: PathBuf::from(DEFAULT_ETC_COPY),
+            etc_real: PathBuf::from(DEFAULT_ETC_REAL),
         }
     }
 }
@@ -79,7 +83,7 @@ impl Default for WasConfig {
 pub enum WasError {
     /// Could not spawn `unshare`.
     Spawn(io::Error),
-    /// Could not build or copy the `/etc` overlay.
+    /// Could not build the `/etc` symlink farm.
     Etc(io::Error),
     /// `wascmd` ran but did not report success.
     Failed { detail: String, log_tail: Vec<u8> },
@@ -136,10 +140,16 @@ fn run(
     timeout_ms: u64,
 ) -> Result<WasOutcome, WasError> {
     prepare_etc(config).map_err(WasError::Etc)?;
-    // `$0` is "sh"; positional parameters start at $1. `$1` is the mount
-    // binary and `$2` the overlay, so the rest is the wascmd command line.
-    let script =
-        "cmd=\"$1\"; src=\"$2\"; shift 2; \"$cmd\" --bind \"$src\" /etc || exit 97; exec \"$@\"";
+    // `$0` is "sh"; positional parameters start at $1:
+    //   $1 = mount binary
+    //   $2 = real /etc source (normally /etc)
+    //   $3 = mount point for the real /etc (/run/tv-auth/etc-real)
+    //   $4 = symlink farm without `release` (/run/tv-auth/etc-norelease)
+    //   $5.. = wascmd command line
+    let script = "cmd=\"$1\"; src=\"$2\"; real=\"$3\"; links=\"$4\"; shift 4; \
+                  \"$cmd\" --bind \"$src\" \"$real\" || exit 97; \
+                  \"$cmd\" --bind \"$links\" /etc || exit 97; \
+                  exec \"$@\"";
     let mut argv: Vec<&OsStr> = vec![
         OsStr::new("-m"),
         OsStr::new("--"),
@@ -148,6 +158,8 @@ fn run(
         OsStr::new(script),
         OsStr::new("sh"),
         config.mount.as_os_str(),
+        config.etc_source.as_os_str(),
+        config.etc_real.as_os_str(),
         config.etc_copy.as_os_str(),
     ];
     argv.extend_from_slice(args);
@@ -168,7 +180,7 @@ fn run(
     if outcome.exit_code == 0 && text.contains(success_marker) {
         return Ok(WasOutcome { log_tail });
     }
-    let detail = if text.contains("mount") && outcome.exit_code == 97 {
+    let detail = if outcome.exit_code == 97 {
         "could not bind the /etc overlay".to_owned()
     } else {
         format!(
@@ -179,11 +191,16 @@ fn run(
     Err(WasError::Failed { detail, log_tail })
 }
 
-/// Build `<etc_copy>` as a copy of `<etc_source>` without `release`.
+/// Build `<etc_copy>` as a top-level symlink farm for `<etc_source>` without
+/// `release`, and create the empty `<etc_real>` mount point alongside it.
 ///
-/// The copy is rebuilt on every operation: `/etc` is only 12 MiB and this
-/// keeps dynamic-linker/NSS files fresh. It lives on the `/run` tmpfs, next to
-/// the daemon log, and is removed when the daemon exits with the tmpfs.
+/// Only top-level entries of `/etc` are inspected (no recursion and no file
+/// copies):
+/// - existing top-level symlinks (such as `/etc/mtab -> ../proc/mounts`) are
+///   recreated with their original target so relative `../` paths still resolve
+///   from `/etc`;
+/// - every other top-level file or directory is symlinked to
+///   `<etc_real>/<name>`, where the child mount namespace binds the real `/etc`.
 pub fn prepare_etc(config: &WasConfig) -> io::Result<()> {
     let _guard = PREPARE_LOCK
         .lock()
@@ -194,38 +211,30 @@ pub fn prepare_etc(config: &WasConfig) -> io::Result<()> {
     if let Some(parent) = config.etc_copy.parent() {
         fs::create_dir_all(parent)?;
     }
+    if let Some(parent) = config.etc_real.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir_all(&config.etc_real)?;
+    fs::set_permissions(&config.etc_real, fs::Permissions::from_mode(0o755))?;
     fs::create_dir(&config.etc_copy)?;
-    fs::set_permissions(&config.etc_copy, fs::Permissions::from_mode(0o700))?;
-    copy_tree(&config.etc_source, &config.etc_copy, true)
-}
+    fs::set_permissions(&config.etc_copy, fs::Permissions::from_mode(0o755))?;
 
-fn copy_tree(source: &Path, destination: &Path, root: bool) -> io::Result<()> {
-    for entry in fs::read_dir(source)? {
+    for entry in fs::read_dir(&config.etc_source)? {
         let entry = entry?;
         let name = entry.file_name();
-        if root && name == "release" {
+        if name == "release" {
             continue;
         }
-        let target = destination.join(&name);
+        let link_path = config.etc_copy.join(&name);
         let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(entry.path())?, target)?;
-        } else if file_type.is_dir() {
-            fs::create_dir(&target)?;
-            copy_permissions(&entry.path(), &target)?;
-            copy_tree(&entry.path(), &target, false)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &target)?;
-            copy_permissions(&entry.path(), &target)?;
-        }
-        // Sockets, FIFOs, and device nodes are not needed by wascmd.
+        let target = if file_type.is_symlink() {
+            fs::read_link(entry.path())?
+        } else {
+            config.etc_real.join(&name)
+        };
+        std::os::unix::fs::symlink(target, link_path)?;
     }
     Ok(())
-}
-
-fn copy_permissions(source: &Path, target: &Path) -> io::Result<()> {
-    let mode = fs::metadata(source)?.permissions().mode();
-    fs::set_permissions(target, fs::Permissions::from_mode(mode))
 }
 
 fn tail(log: &[u8], maximum: usize) -> Vec<u8> {
@@ -248,30 +257,41 @@ mod tests {
         fs::write(etc.join("release"), b"").unwrap();
         fs::create_dir(etc.join("ssl")).unwrap();
         fs::write(etc.join("ssl/cert.pem"), b"cert").unwrap();
-        symlink("/proc/mounts", etc.join("mtab")).unwrap();
+        symlink("../proc/mounts", etc.join("mtab")).unwrap();
         let config = WasConfig {
             etc_source: etc,
-            etc_copy: directory.path().join("copy"),
+            etc_copy: directory.path().join("links"),
+            etc_real: directory.path().join("real"),
             ..WasConfig::new()
         };
         (directory, config)
     }
 
     #[test]
-    fn copies_etc_without_release_and_keeps_symlinks() {
+    fn links_top_level_etc_entries_without_release_or_copying_files() {
         let (_directory, config) = fixture();
         prepare_etc(&config).unwrap();
-        let copy = &config.etc_copy;
-        assert!(copy.join("passwd").exists());
-        assert!(copy.join("ssl/cert.pem").exists());
-        assert!(copy.join("release").symlink_metadata().is_err());
+        let links = &config.etc_copy;
+        assert!(config.etc_real.is_dir());
+        assert!(links.join("release").symlink_metadata().is_err());
         assert_eq!(
-            fs::read_link(copy.join("mtab")).unwrap(),
-            Path::new("/proc/mounts")
+            fs::read_link(links.join("passwd")).unwrap(),
+            config.etc_real.join("passwd")
         );
-        // Rebuilding replaces the previous copy.
+        assert_eq!(
+            fs::read_link(links.join("ssl")).unwrap(),
+            config.etc_real.join("ssl")
+        );
+        assert_eq!(
+            fs::read_link(links.join("mtab")).unwrap(),
+            Path::new("../proc/mounts")
+        );
+        // Rebuilding replaces the previous symlink farm cleanly.
         prepare_etc(&config).unwrap();
-        assert!(copy.join("passwd").exists());
+        assert_eq!(
+            fs::read_link(links.join("passwd")).unwrap(),
+            config.etc_real.join("passwd")
+        );
     }
 
     #[test]

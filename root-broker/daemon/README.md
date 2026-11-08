@@ -66,7 +66,8 @@ prompting and policy (`protected_package`, `unknown_package`), `pkg.list`
 database parsing, the root role (prompt-free install/removal with a notice,
 `exec` refused), and re-signing (templates, reference encoding, signature-file
 recognition, author-mismatch refusal, archive rewrite), and the WAS backend
-(`/etc` copy without `release`, wascmd invocation, pkgcmd+Home fallback). The
+(`/etc` symlink overlay without `release`, wascmd invocation, pkgcmd+Home
+fallback). The
 integrated suite is 130 Linux tests. Linux integration
 tests run in Docker:
 
@@ -85,9 +86,9 @@ This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 8 s
 (the previous fully emulated build took about 100 s). With package-install M1
-through M4 on top of M4 and the review-fixes hardening the binary is 869,956
+through M4 on top of M4 and the review-fixes hardening the binary is 864,820
 bytes, SHA-256
-`97366e5c9c117f224e3647208ba25ece12ce52d8a9eee6ad9d6f0552880efc97`
+`36ed2cdc1e2e828255b936f0035a12c192309fdfa2e8a9c9a3f810acd74d38b7`
 (TV-validated for install/uninstall/list/re-signing, the root role, and Samsung
 Home registration; see the package-install plan). The validated M3 build was
 855,716 bytes, SHA-256
@@ -152,16 +153,18 @@ different author, because Tizen rejects cross-author upgrades (`-12`).
 
 Installs and removals go through **`webappservice`**, the same path `sdb
 install` uses. The daemon runs the stock `/usr/bin/wascmd` under
-`unshare -m` with a copy of `/etc` that has no `release` file, because that
-binary exits immediately on retail firmware:
+`unshare -m` with a top-level symlink overlay of `/etc` that has no `release`
+file, because that binary exits immediately on retail firmware. The overlay is
+a directory of symlinks (one per `/etc` entry, pointing into a bind mount of
+the real `/etc`) created in ~1 ms; no file data is copied:
 
 - TPK installs now create the `widgetinfo` row and cached icon that Samsung
   Home ("My apps") reads, and removals delete them;
 - the staged package keeps its `0711`/`0644` layout because `webappservice`
   copies it as UID 5001;
-- the `/etc` copy is rebuilt before every operation and warmed in the
-  background at startup (`was_preparing` -> `was_ready`), so the socket starts
-  listening immediately even though the cold copy takes ~20 s;
+- the overlay is reused; only the top-level symlink list is rebuilt before each
+  operation (one directory read), so startup and package operations are not
+  delayed by `/etc` contents;
 - `wascmd -u` refuses packages that were not installed through the SDK path
   (`is_sdk_app`); the daemon then falls back to `pkgcmd -u` plus an explicit
   Home cleanup (delete the `widgetinfo` row, remove the cached icon, set
@@ -406,8 +409,7 @@ M4 (the `webappservice` backend) was deployed and TV-validated on 2026-11-08:
   row, and the icon;
 - a cold boot (2026-11-08 22:47) reproduced the whole flow: the AT-HUB hook
   started the daemon (`start units rc=0`), `starting`/`staging_ready`/
-  `listening` happened in the same second with `was_preparing` in between,
-  `was_ready` followed, trust re-enrolled in PID 1 with both roots
+  `was_ready`/`listening` happened within one second (symlink overlay), trust re-enrolled in PID 1 with both roots
   (`author-root-ca.pem` + `user-root-ca.pem` in `tizen-ca`, fingerprints 1 + 2),
   the `org.tvauth.ui` Home row survived, Vetro resumed executing, and broker
   install/uninstall still produced and removed the Home row and icon;

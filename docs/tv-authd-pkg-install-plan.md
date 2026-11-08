@@ -240,7 +240,7 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>.<wgt\|tpk>` (ensure both `/opt/tv-auth` and `/opt/tv-auth/staging` have `0711` traversal perms, `0644` staged file, and preserved `.wgt`/`.tpk` extension so `webappservice` running as `owner` UID 5001 can copy it and infer package type without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
 | `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, main `appid` (`tizen_id`), version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
 | `pkgsign.rs` (new, M3) | in-daemon on-device re-signing after user approval (§7.3) |
-| `pkginstall.rs` (new) | M1: `pkgcmd -i`/`-u` invocation, timeout, `key[end]` parsing, tail log; retained as the fallback backend. M4 adds `wasinstall.rs` (stock `wascmd` under `unshare -m` with an `/etc` copy without `release`) for Home registration and WGT, with a `pkgcmd` + Home-cleanup fallback for `is_sdk_app` refusals (§18) |
+| `pkginstall.rs` (new) | M1: `pkgcmd -i`/`-u` invocation, timeout, `key[end]` parsing, tail log; retained as the fallback backend. M4 adds `wasinstall.rs` (stock `wascmd` under `unshare -m` with a symlink overlay of `/etc` without `release`) for Home registration and WGT, with a `pkgcmd` + Home-cleanup fallback for `is_sdk_app` refusals (§18) |
 | `pkglist.rs` (new, M2) | `pkg.list` / uninstall metadata from `/opt/dbspace/.pkgmgr_parser.db` via one `sqlite3 -readonly` query; row parsing, user-vs-system classification, `main_app_id` |
 | `grants.rs` | no change (exec-only by design, §5.4) |
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
@@ -459,7 +459,7 @@ with explicit authorization, on the user's TV.
 | M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | **done (host):** 120 Linux tests, clippy/fmt clean, ARMv7 cross-build; uninstall/list protocol round-trips, root-role gating, notice kinds | **validated 2026-11-08:** app-role uninstall prompt, Deny and Remove, protected/unknown refusals, `pkg.list` from app and root roles, prompt-free root install/uninstall with `PACKAGE CHANGE` toasts |
 | M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | **done (host):** template/reference/signature-file unit tests, archive rewrite, author-mismatch refusal, 127 Linux tests, ARMv7 build | **validated 2026-11-08 (tpk):** foreign-signed tpk → approve → `re_signed: true` → installs; stripped Partner-signed upgrade → `author_mismatch_requires_reinstall`; two-CA domain rule verified. WGT install still blocked by `pkgcmd` (M4) |
-| M4 | WAS backend (`wascmd` under a private mount namespace) so installs appear in Samsung Home | **done (host):** `/etc` copy without `release`, wascmd invocation, pkgcmd+Home fallback, 130 Linux tests | **validated 2026-11-08 (tpk):** broker install creates the Home row/icon; broker uninstall (WAS and pkgcmd fallback) removes them. WGT still fails with `-4 Load archive info fail` through `pkgcmd`, `sdb install`, and `wascmd` (firmware limitation) |
+| M4 | WAS backend (`wascmd` under a private mount namespace) so installs appear in Samsung Home | **done (host):** `/etc` symlink overlay without `release`, wascmd invocation, pkgcmd+Home fallback, 130 Linux tests | **validated 2026-11-08 (tpk):** broker install creates the Home row/icon; broker uninstall (WAS and pkgcmd fallback) removes them. WGT still fails with `-4 Load archive info fail` through `pkgcmd`, `sdb install`, and `wascmd` (firmware limitation) |
 
 Out of scope (documented to avoid creep): delta updates, mount-installed
 (readonly) packages, RPM/rpk installs, restoring stock trust (manual
@@ -852,11 +852,14 @@ and the D-Bus install method is asynchronous with a client-owned object.
 
 Code:
 
-- `daemon/src/wasinstall.rs` (new) — rebuilds `/run/tv-auth/etc-norelease`
-  (12 MiB copy, symlinks preserved, `release` omitted, mode 0700) before every
-  operation; runs `unshare -m -- sh -c 'mount --bind <copy> /etc; exec <wascmd>
-  …'` through `executor` with the request timeout; succeeds only on exit 0 plus
-  `install completed`/`uninstall completed` in the output.
+- `daemon/src/wasinstall.rs` (new) — builds `/run/tv-auth/etc-norelease`, a
+  directory of **top-level symlinks** for every `/etc` entry except `release`
+  (existing top-level symlinks such as `mtab -> ../proc/mounts` are preserved;
+  everything else points into `/run/tv-auth/etc-real`). No file data is copied:
+  the farm is one `read_dir` (~174 entries, ~1 ms). Per operation it runs
+  `unshare -m -- sh -c 'mount --bind /etc /run/tv-auth/etc-real; mount --bind
+  <farm> /etc; exec <wascmd> …'` through `executor` with the request timeout;
+  succeeds only on exit 0 plus `install completed`/`uninstall completed`.
 - `daemon/src/server.rs` — `install_package`/`uninstall_package` pick the WAS
   backend when configured, else `pkgcmd`. Uninstall tries `wascmd -u` first
   (which removes the Home tile) and falls back to `pkgcmd -u` plus
@@ -864,14 +867,13 @@ Code:
   the cached icon, set `memory/was/app_change=1`) when `is_sdk_app` refuses.
   `is_upgrade` now comes from the pkgmgr database rather than a leftover app
   directory, which also keeps the M3 author check from reading stale files.
-- `daemon/src/main.rs` — `--no-was` (keep the `pkgcmd` backend); warms the
-  `/etc` copy in a background thread at startup (`was_preparing` ->
-  `was_ready`) so the socket starts listening immediately; package operations
-  serialize on a prepare lock and refresh the copy themselves.
+- `daemon/src/main.rs` — `--no-was` (keep the `pkgcmd` backend); builds the
+  symlink overlay at startup (`was_ready`) and logs both paths. Because it is
+  one directory read, startup is not delayed.
 - `daemon/src/pkginstall.rs` — `pkgcmd` remains as the fallback backend.
 
-Deployed: daemon 869,956 bytes, SHA-256
-`97366e5c9c117f224e3647208ba25ece12ce52d8a9eee6ad9d6f0552880efc97`.
+Deployed: daemon 864,820 bytes, SHA-256
+`36ed2cdc1e2e828255b936f0035a12c192309fdfa2e8a9c9a3f810acd74d38b7`.
 
 Validated on the target:
 
@@ -903,14 +905,14 @@ Bugs found and fixed:
    paths; the namespace script uses absolute paths throughout.
 
 Cold boot (2026-11-08 22:47) validated the new pieces: the AT-HUB hook started
-the daemon, `starting`/`staging_ready`/`listening` happened in the same second
-(the `/etc` copy runs in the background), `was_ready` followed, trust
+the daemon, `starting`/`staging_ready`/`was_ready`/`listening` happened within
+one second, trust
 re-enrolled in PID 1 with both roots (fingerprint list 1 author + 2
 distributor, both CA files in `tizen-ca`), the `org.tvauth.ui` Home row
 survived, and a broker TPK install/uninstall still used `backend=was` and
-created/removed the Home row and icon. The first version prepared `/etc`
-synchronously and delayed listening by ~20 s on a cold cache; that is fixed by
-the background warm-up.
+created/removed the Home row and icon. Earlier versions copied `/etc` (12 MiB,
+1,240 files) and delayed listening by ~20 s on a cold cache; the symlink farm
+removed both the copy and the delay.
 
 Known limitation: WGT packages are rejected by the firmware's package manager.
 The WAS backend is in place, so if a future firmware accepts WGT, the daemon
