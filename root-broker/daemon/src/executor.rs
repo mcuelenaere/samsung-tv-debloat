@@ -274,4 +274,16 @@ mod tests {
         assert!(outcome.stdout.len() <= super::MAX_OUTPUT_BYTES);
         assert!(outcome.truncated);
     }
+
+    #[test]
+    fn stdout_and_stderr_are_independently_bounded() {
+        let outcome = execute(
+            "head -c 1100000 /dev/zero; head -c 1100000 /dev/zero >&2",
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(outcome.stdout.len(), super::MAX_OUTPUT_BYTES);
+        assert_eq!(outcome.stderr.len(), super::MAX_OUTPUT_BYTES);
+        assert!(outcome.truncated);
+    }
 }

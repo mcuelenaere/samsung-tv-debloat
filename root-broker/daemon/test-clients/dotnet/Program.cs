@@ -9,10 +9,12 @@ internal static class Program
     private const string SocketPath = "/run/tv-auth/broker.sock";
 #if PROBE_ONE
     private const string Probe = "broker-one";
+#elif PROBE_ONE_V2
+    private const string Probe = "broker-one-v2";
 #elif PROBE_TWO
     private const string Probe = "broker-two";
 #else
-#error Define PROBE_ONE or PROBE_TWO
+#error Define PROBE_ONE, PROBE_ONE_V2, or PROBE_TWO
 #endif
 
     private static int Main()

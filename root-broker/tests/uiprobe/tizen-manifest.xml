@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://tizen.org/ns/packages" package="org.tvauth.spike.uiprobe" version="0.1.0" api-version="6.5">
+  <profile name="tv"/>
+  <service-application appid="org.tvauth.spike.uiprobe" exec="UiProbe.dll" type="dotnet" multiple="false" taskmanage="false" nodisplay="true" auto-restart="false" on-boot="false">
+    <label>tv-auth UI impersonation probe</label>
+    <icon>org.tvauth.spike.uiprobe.png</icon>
+  </service-application>
+</manifest>

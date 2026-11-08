@@ -84,9 +84,10 @@ methods, and updates `/opt/tv-auth/grants.json` live for Always allow and revoke
 The unit source explicitly sets `XDG_RUNTIME_DIR=/run` and `HOME=/root` so the
 broker's fixed `app_launcher` call works from systemd.
 
-`/run/tv-auth/` is recreated each boot. It contains `broker.sock`
-(`0660 root:users`) and the bounded daemon log; the executable is bind-mounted at
-`/run/opt/tv-auth/tv-authd`, not copied here.
+`/run/tv-auth/` is recreated each boot and is mode `0711`, so apps can traverse
+to the known socket path but cannot list runtime entries. It contains
+`broker.sock` (`0660 root:users`) and the bounded daemon log (`0600`); the
+executable is bind-mounted at `/run/opt/tv-auth/tv-authd`, not copied here.
 
 ## Hook behavior
 

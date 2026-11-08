@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: M0 platform spikes, M1 headless broker, and M2 approval UI are complete; M1 and M2 are cold-boot validated on the target. Next milestone: M3 Vetro cutover. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is ported onto this main branch and also deployed on the live per-app toast branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed there. The main-branch port preserves the earlier toast code. Remaining: optional cold boot and installing the manager-refresh UI fix with the installed signing profile. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -556,13 +556,47 @@ The native-UI failure is why the design now uses managed .NET for the approval U
 - Vetro service restart does not reacquire root or kill the broker.
 - A cold boot with no PC connected works once Vetro has its persistent grant.
 
-### M4 — Hardening and multi-app tests
+### M4 — Hardening and multi-app tests (deployed and validated; optional cold boot + UI refresh install pending)
 
-- Two same-UID apps cannot impersonate each other or the UI.
-- Package upgrade/reinstall/signer-change behavior is documented and tested.
-- Oversized frames, output floods, prompt floods, timeouts, disconnects, and corrupt grant files fail safely.
-- Broker and UI memory use are measured under TV memory pressure.
-- Root-executed boot inputs are not writable by ordinary apps.
+- Two same-UID apps cannot impersonate each other or the UI: exact-label role
+  separation is enforced and unit-tested; TV `uiprobe` confirmed every UI method
+  returns `not_ui` from `User::Pkg::org.tvauth.spike.uiprobe`.
+- Package upgrade/reinstall/signer-change: persistent grants include a SHA-256 of
+  the installed `author-signature.xml` (TPK root or WGT `res/wgt`). An optional
+  `notify` value from the live per-app toast branch is preserved for
+  compatibility, but this main-branch port keeps the earlier toast code and does
+  not interpret it. Changed/missing/untrusted identity invalidates the grant;
+  version-1 label-only grants migrate on first use. Unit tests cover change,
+  missing, symlink, writable-file, migration, and notify-field preservation. The
+  0.1.1 upgrade client and the live-branch TV result are recorded below.
+- Failure paths: oversized frames, output floods in both streams, prompt-queue
+  exhaustion, prompt/UI timeouts, requester hangup, UI disconnect/retry, corrupt
+  grant files, and EINTR handling are covered by 64 Linux tests.
+- Memory: TV `measure-memory.sh 64` under 64 MiB tmpfs pressure left `tv-authd`
+  at 304 kB RSS / 384 kB HWM and the UI at 50,288 kB RSS / 53,036 kB HWM;
+  `MemAvailable` 437,588 → 374,316 → 438,120 kB; no restart or OOM.
+- Boot inputs: TV `fsprobe` found `/opt/etc/parseinfo.sh` and `resolv.conf`
+  non-writable, `/opt/etc` non-creatable, `/opt/tv-units`, `/opt/tv-auth`,
+  `/opt/tv-sshd/bin`, and the package cert DB non-writable, `/run/systemd/system`
+  and `/run/opt/tv-auth` not visible to the app, and the broker socket
+  connectable. The pre-M4 log was readable; the M4 logger makes it `0600`.
+- Runtime hardening: daemon log `0600`, `/run/tv-auth` `0711`, grant files reject
+  symlinks/untrusted ownership, and interrupted reads are retried.
+- M4 was deployed on the live toast branch on 2026-11-08 with a short restart.
+  Vetro's v1 grant migrated to `sha256:ed44a7da…` with `notify: first` preserved;
+  commands and toasts continued. `brokerone` 0.1.0→0.1.1 invalidated the grant
+  (`grant_stale reason=package_identity_changed`), an identical 0.1.1 reinstall
+  retained it, and the test package/grant were removed. Post-M4 `fsprobe` found
+  the log `0600`/app-read denied and `/run/tv-auth` `0711`. Normal broker RSS was
+  328 kB / 356 kB HWM, 3 threads, ~0.4% CPU under Vetro polling. This main-branch
+  port builds as 586,316 bytes (`a5e40940…`); the TV still runs the toast-branch
+  binary `7903c0ba…` (584,452 bytes). Do not deploy the main port over the live
+  toast UI without merging that branch.
+- The manager-refresh fix (refresh grants whenever the manager opens) is in the
+  worktree but not installed: the live UI is signed with a different author
+  certificate, so `pkgcmd -i` rejects it (`Author certificate not match`). It
+  needs the installed signing profile or an uninstall/reinstall.
+- Optional remaining check: cold boot with the M4 binary and v2 grant.
 
 ## 14. Explicit simplifications relative to the earlier proposal
 

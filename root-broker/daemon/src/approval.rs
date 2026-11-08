@@ -1,4 +1,4 @@
-use crate::grants::GrantStore;
+use crate::grants::{GrantError, GrantStore};
 use crate::logger::Logger;
 use crate::protocol::{
     write_json, write_response, Decision, NoticeEntry, NoticeMessage, PromptMessage, Response,
@@ -511,6 +511,7 @@ impl Manager {
             .active
             .take()
             .expect("validated active prompt must exist");
+        let mut ui_error = None;
         let result = match decision {
             Decision::Deny => ApprovalResult::Denied("denied", "user_denied"),
             Decision::Once => ApprovalResult::AllowOnce,
@@ -522,17 +523,33 @@ impl Manager {
                     .grant(&active.request.label);
                 match granted {
                     Ok(_) => ApprovalResult::AllowAlways,
+                    Err(GrantError::PackageIdentity(error)) => {
+                        self.log(&format!(
+                            "grant_identity_unavailable label={} error={error}",
+                            active.request.label
+                        ));
+                        ui_error = Some("package_identity_unavailable");
+                        ApprovalResult::Denied("denied", "package_identity_unavailable")
+                    }
                     Err(error) => {
                         self.log(&format!(
                             "grant_persist_failed label={} error={error}",
                             active.request.label
                         ));
+                        ui_error = Some("grant_persist_failed");
                         ApprovalResult::Denied("denied", "grant_persist_failed")
                     }
                 }
             }
         };
-        self.send_to_ui(token, &Response::ok(id));
+        match ui_error {
+            Some(error) => {
+                self.send_to_ui(token, &Response::error(id, "error", error));
+            }
+            None => {
+                self.send_to_ui(token, &Response::ok(id));
+            }
+        }
         self.log(&format!(
             "prompt_decision label={} request={} decision={:?}",
             active.request.label, active.request.request_id, decision
@@ -789,11 +806,21 @@ mod tests {
 
     fn fixture(config: ApprovalConfig) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("grants.json");
-        std::fs::write(&path, r#"{"version":1,"grants":{}}"#).unwrap();
         use std::os::unix::fs::PermissionsExt;
+        let apps = directory.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        let package = apps.join("org.example.app");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let signature = package.join("author-signature.xml");
+        std::fs::write(&signature, b"approval-test-signature").unwrap();
+        std::fs::set_permissions(&signature, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = directory.path().join("grants.json");
+        std::fs::write(&path, r#"{"version":2,"grants":{}}"#).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let grants = Arc::new(Mutex::new(GrantStore::load(&path).unwrap()));
+        let grants = Arc::new(Mutex::new(
+            GrantStore::load_with_roots(&path, vec![apps]).unwrap(),
+        ));
         let manager = ApprovalManager::start(config, Arc::clone(&grants), None).unwrap();
         Fixture {
             _directory: directory,
@@ -878,11 +905,14 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(2)),
             Ok(ApprovalResult::AllowOnce)
         );
-        assert!(!fixture
-            .grants
-            .lock()
-            .unwrap()
-            .is_allowed("User::Pkg::org.example.app"));
+        assert_eq!(
+            fixture
+                .grants
+                .lock()
+                .unwrap()
+                .check("User::Pkg::org.example.app"),
+            crate::grants::GrantCheck::NotGranted
+        );
     }
 
     #[test]
@@ -908,11 +938,52 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(2)),
             Ok(ApprovalResult::AllowAlways)
         );
-        assert!(fixture
-            .grants
-            .lock()
-            .unwrap()
-            .is_allowed("User::Pkg::org.example.app"));
+        assert_eq!(
+            fixture
+                .grants
+                .lock()
+                .unwrap()
+                .check("User::Pkg::org.example.app"),
+            crate::grants::GrantCheck::Allowed
+        );
+    }
+
+    #[test]
+    fn always_denies_when_package_identity_is_missing() {
+        let fixture = fixture(test_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let (ask, reply) = request("User::Pkg::org.example.missing");
+        fixture.manager.handle().request(ask).unwrap();
+        let prompt = read_json(&mut ui);
+        fixture
+            .manager
+            .handle()
+            .decide(
+                1,
+                "decision-1".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Always,
+            )
+            .unwrap();
+        let response = read_json(&mut ui);
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "package_identity_unavailable");
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(2)),
+            Ok(ApprovalResult::Denied(
+                "denied",
+                "package_identity_unavailable"
+            ))
+        );
+        assert_eq!(
+            fixture
+                .grants
+                .lock()
+                .unwrap()
+                .check("User::Pkg::org.example.missing"),
+            crate::grants::GrantCheck::NotGranted
+        );
     }
 
     #[test]
@@ -1080,6 +1151,24 @@ mod tests {
         assert_eq!(
             second_reply.recv_timeout(Duration::from_secs(1)),
             Ok(ApprovalResult::Denied("busy", "request_already_pending"))
+        );
+    }
+
+    #[test]
+    fn prompt_queue_full_is_rejected() {
+        let mut config = test_config();
+        config.prompt_queue_max = 2;
+        let fixture = fixture(config);
+        let _ui = attach_ui(&fixture.manager, 1);
+        let (first, _first_reply) = request("User::Pkg::org.example.one");
+        fixture.manager.handle().request(first).unwrap();
+        let (second, _second_reply) = request("User::Pkg::org.example.two");
+        fixture.manager.handle().request(second).unwrap();
+        let (third, third_reply) = request("User::Pkg::org.example.three");
+        fixture.manager.handle().request(third).unwrap();
+        assert_eq!(
+            third_reply.recv_timeout(Duration::from_secs(1)),
+            Ok(ApprovalResult::Denied("busy", "prompt_queue_full"))
         );
     }
 

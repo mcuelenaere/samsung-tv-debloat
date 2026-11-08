@@ -284,7 +284,9 @@ fn prepare_socket_directory(socket: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no parent"))?;
     fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+    // Traverse-only for apps: enough to connect to the known socket path,
+    // but not to list the daemon log or other runtime entries.
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o711))
 }
 
 fn remove_stale_socket(socket: &Path) -> io::Result<()> {

@@ -3,6 +3,7 @@ pub mod executor;
 pub mod grants;
 pub mod identity;
 pub mod logger;
+pub mod package_identity;
 pub mod protocol;
 pub mod server;
 

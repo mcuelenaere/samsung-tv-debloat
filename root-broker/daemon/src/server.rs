@@ -1,6 +1,6 @@
 use crate::approval::{ApprovalHandle, ApprovalRequest, ApprovalResult};
 use crate::executor;
-use crate::grants::GrantStore;
+use crate::grants::{GrantCheck, GrantStore};
 use crate::identity::{package_from_label, PeerIdentity};
 use crate::logger::Logger;
 use crate::protocol::{
@@ -392,19 +392,42 @@ fn handle_exec(
         }
     };
 
-    let allowed = broker
+    let grant_check = broker
         .grants
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .is_allowed(&identity.label);
+        .check(&identity.label);
 
-    if allowed {
+    if grant_check.is_allowed() {
+        if grant_check == GrantCheck::Migrated {
+            log(
+                broker,
+                &format!("grant_fingerprint_migrated label={}", identity.label),
+            );
+        }
         // Granted packages run without asking, but the user still sees a
         // (coalesced) notice of who ran what.
         let _ = broker
             .approvals
             .notice(identity.label.clone(), request.command.clone());
     } else {
+        match grant_check {
+            GrantCheck::Stale => log(
+                broker,
+                &format!(
+                    "grant_stale label={} reason=package_identity_changed",
+                    identity.label
+                ),
+            ),
+            GrantCheck::IdentityUnavailable => log(
+                broker,
+                &format!(
+                    "grant_stale label={} reason=package_identity_unavailable",
+                    identity.label
+                ),
+            ),
+            _ => {}
+        }
         log(
             broker,
             &format!(
@@ -584,6 +607,7 @@ mod tests {
 
     struct Fixture {
         _directory: tempfile::TempDir,
+        apps: PathBuf,
         broker: Arc<Broker>,
         _manager: ApprovalManager,
         config: ServerConfig,
@@ -595,14 +619,31 @@ mod tests {
 
     fn fixture_with(prompt_timeout: Duration) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
+        let apps = directory.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        let package = apps.join("org.example.allowed");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let signature = package.join("author-signature.xml");
+        std::fs::write(&signature, b"server-test-signature").unwrap();
+        std::fs::set_permissions(&signature, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fingerprint = crate::package_identity::package_fingerprint(
+            "User::Pkg::org.example.allowed",
+            std::slice::from_ref(&apps),
+        )
+        .unwrap();
         let path = directory.path().join("grants.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"grants":{"User::Pkg::org.example.allowed":{"granted_at":1}}}"#,
+            format!(
+                r#"{{"version":2,"grants":{{"User::Pkg::org.example.allowed":{{"granted_at":1,"package_fingerprint":"{fingerprint}"}}}}}}"#
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let grants = Arc::new(Mutex::new(GrantStore::load(&path).unwrap()));
+        let grants = Arc::new(Mutex::new(
+            GrantStore::load_with_roots(&path, vec![apps.clone()]).unwrap(),
+        ));
         let approval_config = ApprovalConfig {
             ui_app_id: "org.tvauth.ui".into(),
             app_launcher: PathBuf::from("/nonexistent/tv-auth-launcher"),
@@ -625,6 +666,7 @@ mod tests {
         };
         Fixture {
             _directory: directory,
+            apps,
             broker,
             _manager: manager,
             config,
@@ -640,13 +682,29 @@ mod tests {
         fn send(&mut self, value: Value) {
             let mut bytes = serde_json::to_vec(&value).unwrap();
             bytes.push(b'\n');
-            self.writer.write_all(&bytes).unwrap();
+            self.send_raw(&bytes);
+        }
+
+        fn send_raw(&mut self, bytes: &[u8]) {
+            loop {
+                match self.writer.write_all(bytes) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("send: {error}"),
+                }
+            }
         }
 
         fn read(&mut self) -> Value {
-            let mut line = String::new();
-            self.reader.read_line(&mut line).unwrap();
-            serde_json::from_str(&line).unwrap()
+            loop {
+                let mut line = String::new();
+                match self.reader.read_line(&mut line) {
+                    Ok(0) => panic!("connection closed before a response"),
+                    Ok(_) => return serde_json::from_str(&line).unwrap(),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read: {error}"),
+                }
+            }
         }
     }
 
@@ -705,6 +763,36 @@ mod tests {
     }
 
     #[test]
+    fn changed_package_identity_returns_to_approval() {
+        let fixture = fixture();
+        std::fs::write(
+            fixture
+                .apps
+                .join("org.example.allowed/author-signature.xml"),
+            b"changed-package-identity",
+        )
+        .unwrap();
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
+        client.send(exec_request("exec-1", "printf should-not-run"));
+        let response = client.read();
+        // The stale grant must not execute. With no UI and a missing launcher,
+        // the approval path fails closed.
+        assert_eq!(response["status"], "ui_unavailable");
+        assert_eq!(response["error"], "ui_launch_failed");
+        drop(client);
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .grants
+                .lock()
+                .unwrap()
+                .check("User::Pkg::org.example.allowed"),
+            GrantCheck::NotGranted
+        );
+    }
+
+    #[test]
     fn unknown_package_without_ui_fails_closed() {
         let fixture = fixture();
         let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.unknown", 5001);
@@ -739,12 +827,15 @@ mod tests {
         let response = client.read();
         assert_eq!(response["status"], "ok");
         assert_eq!(response["revoked"], true);
-        assert!(!fixture
-            .broker
-            .grants
-            .lock()
-            .unwrap()
-            .is_allowed("User::Pkg::org.example.allowed"));
+        assert_eq!(
+            fixture
+                .broker
+                .grants
+                .lock()
+                .unwrap()
+                .check("User::Pkg::org.example.allowed"),
+            GrantCheck::NotGranted
+        );
 
         drop(client);
         handle.join().unwrap().unwrap();
@@ -818,7 +909,21 @@ mod tests {
     fn malformed_json_is_rejected() {
         let fixture = fixture();
         let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
-        client.writer.write_all(b"{not-json}\n").unwrap();
+        client.send_raw(b"{not-json}\n");
+        let response = client.read();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "malformed_request");
+        drop(client);
+        assert!(handle.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_and_closes() {
+        let fixture = fixture();
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
+        let mut line = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        line.push(b'\n');
+        client.send_raw(&line);
         let response = client.read();
         assert_eq!(response["status"], "error");
         assert_eq!(response["error"], "malformed_request");

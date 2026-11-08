@@ -101,6 +101,7 @@ approval flow. M2 errors include:
 | `prompt_queue_full` | the global approval queue is full |
 | `request_already_pending` | this package already has a queued or active request |
 | `grant_persist_failed` | Always allow could not be saved; the command did not run |
+| `package_identity_unavailable` | Always allow could not bind the grant to the installed package signature; the command did not run |
 | `ui_role` | the approval UI attempted to send `exec` |
 | `too_many_requests` | the connection exceeded its request limit; the daemon closes it |
 | `approval_wait_timeout` | the daemon-side wait for the approval manager expired |
@@ -234,9 +235,14 @@ Semantics:
 
 - `deny` — the pending request returns `status: denied`, `error: user_denied`;
 - `once` — the pending request executes once; the next command prompts again;
-- `always` — the package label is persisted in the root-only grant file before
-  the pending request executes; later requests from that exact label bypass
-  prompting until revoked.
+- `always` — the package label and a SHA-256 of its installed
+  `author-signature.xml` are persisted before the pending request executes;
+  later requests bypass prompting only while the installed package identity
+  still matches. A package upgrade, changed reinstall, or signer change
+  invalidates the grant and returns to prompting. Version-1 label-only grants
+  are migrated on first use by binding them to the currently installed package.
+  An optional `notify` value from the live per-app toast branch is preserved for
+  compatibility, but this branch does not interpret it.
 
 ## `grants.list`
 

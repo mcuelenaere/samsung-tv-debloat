@@ -417,7 +417,13 @@ pub fn truncate_text(value: &str, maximum: usize) -> (String, bool) {
 pub fn read_message(reader: &mut impl BufRead, maximum: usize) -> io::Result<Vec<u8>> {
     let mut line = Vec::with_capacity(maximum.min(1024));
     loop {
-        let available = reader.fill_buf()?;
+        let available = loop {
+            match reader.fill_buf() {
+                Ok(available) => break available,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        };
         if available.is_empty() {
             if line.is_empty() {
                 return Err(io::Error::new(

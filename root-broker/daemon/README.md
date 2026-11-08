@@ -2,9 +2,11 @@
 
 `tv-authd` runs as root, listens on a local Unix socket, identifies callers
 through `SO_PEERCRED`/`SO_PEERSEC`, and executes a shell command only after an
-exact package-level grant. M1 validated the headless broker. M2 adds the
+exact package-level grant. M1 validated the headless broker. M2 added the
 interactive approval flow, persistent **Always allow** grants, and the managed
-.NET grant manager under `root-broker/ui/`.
+.NET grant manager under `root-broker/ui/`. The live branch also has per-app
+execution toasts; M4 binds grants to the installed package signature and adds
+failure-path/probe coverage.
 
 The wire contract is in [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -43,10 +45,14 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests cover request parsing, framing limits, strict grant-file parsing, role
-separation, approval queueing, deny/once/always, nonce rejection, timeouts, UI
-disconnect, grant persistence/revocation, execution, process-group timeouts, and
-output truncation. Linux integration tests run in Docker:
+Tests cover request parsing, framing limits, oversized frames, strict
+grant-file parsing and corruption, package-signature binding and legacy
+migration (including preserving `notify`), per-app notify modes, role
+separation, approval queueing and queue exhaustion, deny/once/always, nonce
+rejection, timeouts, UI disconnect, requester hangup, grant
+persistence/revocation, execution, process-group timeouts, output truncation in
+both streams, and EINTR handling. The integrated suite is 64 Linux tests. Linux
+integration tests run in Docker:
 
 ```sh
 docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
@@ -62,10 +68,11 @@ docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
 This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 11 s
-(the previous fully emulated build took about 100 s). With `rustix` and
-`lexopt` the binary is 558,812 bytes. The validated M2 build is 546,388 bytes,
-SHA-256 `d93890d3f4104fee7fc537e927010dc05b8c06777944a671c2262a558c4a5ae1`
-(M1 was 461,940 bytes).
+(the previous fully emulated build took about 100 s). This main-branch M4 port
+preserves the earlier toast implementation and builds as 586,316 bytes, SHA-256
+`a5e4094044c142e97a0a54cd893b1d81940edc05104a15fcf18e6e4c9c44ff74`
+(the live TV currently runs the per-app toast branch build: 584,452 bytes,
+`7903c0ba…`). M2 was 546,388 bytes; M1 was 461,940 bytes.
 
 ## CLI defaults
 
@@ -88,7 +95,7 @@ SHA-256 `d93890d3f4104fee7fc537e927010dc05b8c06777944a671c2262a558c4a5ae1`
 The launcher inherits the daemon's systemd environment. On this TV that includes
 `XDG_RUNTIME_DIR=/run`, which AUL's launcher path uses. Do not clear it.
 
-## Grant file
+## Grant file and package identity
 
 The default path is `/opt/tv-auth/grants.json`. It is root-only mode `0600` and
 must not be group- or world-writable. The approval UI creates **Always allow**
@@ -96,20 +103,41 @@ entries and removes them on revoke:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "grants": {
     "User::Pkg::org.example.consumer": {
-      "granted_at": 1790000000
+      "granted_at": 1790000000,
+      "notify": "first",
+      "package_fingerprint": "sha256:..."
     }
   }
 }
 ```
 
-The key is the exact SMACK package label observed by the daemon. Updates use a
-temporary file plus `rename`, so a crash cannot leave a partial JSON document.
-Corrupt or unreadable grants fail closed. A root administrator may still pre-seed
-the file manually; the running daemon only reads it at startup, so restart the
-service after external edits.
+The key is the exact SMACK package label observed by the daemon. `notify` is
+optional and preserved for compatibility with grants written by the live per-app
+toast branch; this branch's simpler toast code does not interpret it.
+`package_fingerprint` is a SHA-256 of the installed package's
+`author-signature.xml`:
+
+- TPK: `/opt/usr/apps/<pkgid>/author-signature.xml` (or `/usr/apps/...`);
+- WGT: `/opt/usr/apps/<pkgid>/res/wgt/author-signature.xml` (or `/usr/apps/...`).
+
+The signature covers the manifest and signed files. A package upgrade, changed
+reinstall, or different signer produces a different fingerprint; the grant is
+removed and the next request prompts again. An identical reinstall keeps the
+grant. The signature file and package directory must not be symlinks or
+group/world-writable, and missing identity fails closed. Version-1 label-only
+grants are migrated on first use by binding them to the package currently
+installed under that label; a preserved `notify` value is retained.
+
+Daemons from before `notify` existed reject grant files that contain it, so roll
+back only after resetting it to `every`. Updates use a temporary file plus
+`rename`, so a crash cannot leave a partial JSON document. A corrupt or untrusted
+grants file prevents startup (fail closed); move it aside to recover, then
+re-approve applications. A root administrator may still pre-seed the file
+manually; the running daemon only reads it at startup, so restart the service
+after external edits.
 
 ## Runtime layout
 
@@ -131,9 +159,12 @@ service after external edits.
 
 The systemd unit **bind-mounts** the root-only binary at `/run/opt/tv-auth`
 (a private read-only mount, outside UEP's checked prefixes) and runs it from
-there — nothing is copied into `/run`. The socket is mode `0660`, owner
-`root:users` (gid 100 on this TV), so UID-5001 apps in the `users` group can
-connect; package identity is still enforced by the daemon.
+there — nothing is copied into `/run`. `/run/tv-auth` is mode `0711`: apps can
+traverse it to connect to the known socket path but cannot list runtime entries.
+The socket is mode `0660`, owner `root:users` (gid 100 on this TV), so UID-5001
+apps in the `users` group can connect; package identity is still enforced by the
+daemon. The daemon log is mode `0600` (and repaired from older `0644` files on
+startup).
 
 ## Approval UI
 
@@ -162,6 +193,10 @@ broker `exec` request and save the response under `/tmp/tvauth-<probe>.response`
 They were used for M1 with a pre-seeded grant. In M2 they are useful as
 untrusted requesters: the daemon should launch the UI instead of returning
 `not_granted`. Their hard-coded response handling is unchanged.
+
+`./test-clients/build-upgrade-client.sh` builds a 0.1.1 `brokerone` with changed
+content for the M4 package-upgrade test (same package ID/signer, different
+signed DLL/manifest, so the grant fingerprint must change).
 
 ## Deployment status
 
@@ -199,3 +234,29 @@ services were active, the unit environment included
 `XDG_RUNTIME_DIR=/run HOME=/root`, and the persisted grant allowed an execution
 without launching the UI. The test requester package, test grant, `/tmp` files,
 and `/run/tvauth-test` were removed afterwards.
+
+M3/Vetro is live on the toast branch (`1471212`), and M4 was deployed on top of
+it on 2026-11-08 with a short restart:
+
+- Binary `7903c0ba…` (584,452 bytes). Vetro's label-only grant migrated on its
+  next command to `sha256:ed44a7da…` with `notify: first` preserved; Vetro
+  commands and toasts continued, and `notice_sent` was suppressed after the
+  first-use notice.
+- `fsprobe`/`uiprobe` passed; post-M4 `/run/tv-auth` is `0711`, the daemon log is
+  `0600` and app-read denied.
+- `brokerone` 0.1.0 was granted Always; the changed 0.1.1 upgrade logged
+  `grant_stale reason=package_identity_changed` and prompted, while an identical
+  0.1.1 reinstall kept the grant. The test package/grant were removed.
+- Normal operation: `tv-authd` 328 kB RSS / 356 kB HWM, 3 threads, ~0.4% CPU
+  during Vetro polling. Under 64 MiB tmpfs pressure it stayed at 304 kB RSS /
+  384 kB HWM; the UI stayed at 50,288 kB RSS / 53,036 kB HWM; no restart/OOM.
+- The UI manager-refresh fix is in source but not installed: the live
+  `org.tvauth.ui` is signed with a different author certificate and `pkgcmd -i`
+  rejects the update (`Author certificate not match`). Re-sign with the installed
+  profile or uninstall/reinstall.
+- This main-branch port builds as 586,316 bytes (`a5e40940…`) and preserves the
+  earlier toast code. It is not the binary currently deployed. The TV runs the
+  toast-branch build `7903c0ba…` (584,452 bytes). Do not deploy the main binary
+  over the live toast UI without merging that branch.
+- Optional remaining check: a cold boot with the live toast-branch M4 binary and
+  v2 grant.

@@ -38,9 +38,16 @@ When an app without a persistent grant connects, the daemon launches
 - sends `ui.decision` with the prompt ID and nonce;
 - exits shortly after the daemon acknowledges the decision.
 
+**Always allow** is bound to a SHA-256 of the installed package's
+`author-signature.xml`. A package upgrade, changed reinstall, or signer change
+invalidates the grant and the next request prompts again. If the daemon cannot
+verify the package identity, it fails closed and reports
+`package_identity_unavailable`.
+
 RETURN activates the focused button. BACK denies the pending prompt (it does not
 silently dismiss the request). Arrow-key focus movement uses Elementary's normal
-focus handling and must be re-verified on the TV for the three-button layout.
+focus handling; RETURN, Right/Left, and BACK were validated on the TV with
+`input_keyevent`.
 
 ### Execution toast
 
@@ -60,7 +67,9 @@ lingers shows the manager.
 
 If the UI is opened from the launcher with no pending prompt, or after a decision
 or reconnect, it shows the persistent-grant list. Each row has a **Revoke**
-button. The list is refreshed after a revoke and via the **Refresh** button.
+button. The list is refreshed when the manager opens, after a revoke, and via
+the **Refresh** button, so an app granted by a prompt is not missing from a
+stale list.
 The first 5 grants are shown.
 
 ### Failure behavior
@@ -109,9 +118,9 @@ out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
 Observed local artifacts:
 
 ```text
-Managed assembly: 37,376 bytes
-Unsigned TPK:     17,995 bytes
-Signed TPK:       25,545 bytes
+Managed assembly: 43,520 bytes
+Unsigned TPK:     20,423 bytes
+Signed TPK:       27,965 bytes
 ```
 
 ## Signing and installation
@@ -123,8 +132,13 @@ with the M1 test packages:
 tizen package -t tpk -s <profile> -- org.tvauth.ui-0.1.0.tpk
 ```
 
-No certificate material or passwords belong in this repository. The signed TPK
-must be installed through `pkgcmd` on the TV:
+No certificate material or passwords belong in this repository. The installed
+`org.tvauth.ui` on the current TV was signed with a different author certificate;
+`pkgcmd -i` rejects an update signed by another author with
+`Author certificate not match`. Sign with the same profile as the installed UI,
+or uninstall/reinstall (which changes the package signer).
+
+The signed TPK must be installed through `pkgcmd` on the TV:
 
 ```sh
 /usr/bin/pkgcmd -i -t tpk -p /path/to/org.tvauth.ui-0.1.0-signed.tpk

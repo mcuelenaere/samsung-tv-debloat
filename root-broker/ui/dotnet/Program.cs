@@ -213,6 +213,10 @@ namespace TvAuthUi
             if (mainShown || window == IntPtr.Zero)
                 return;
             mainShown = true;
+            // A prompt may have granted or revoked an app since the last list;
+            // never render the manager from a stale cache.
+            Log("manager grants refresh");
+            broker?.RequestGrants();
             backGrabbed = Interop.eext_win_keygrab_set(window, BackKey) == 1;
             if (!backGrabbed)
                 Log("XF86Back keygrab failed");
@@ -268,6 +272,11 @@ namespace TvAuthUi
             {
                 exitAt = null;
                 managerMessage = null;
+                if (mainShown)
+                {
+                    Log("manager grants refresh");
+                    broker?.RequestGrants();
+                }
                 RenderManager();
             }
             ShowMain();
@@ -555,9 +564,16 @@ namespace TvAuthUi
             }
             else
             {
+                var detail = error switch
+                {
+                    "package_identity_unavailable" =>
+                        "the installed package identity could not be verified; choose Allow once or Deny",
+                    "grant_persist_failed" =>
+                        "the grant could not be saved; choose Allow once or Deny",
+                    _ => string.IsNullOrEmpty(error) ? "unknown" : error
+                };
                 SetHeader("ERROR", "Decision failed", ColorDanger);
-                SetStatus("tv-authd reported: " + (string.IsNullOrEmpty(error) ? "unknown" : error)
-                    + ". The request was not approved.");
+                SetStatus("tv-authd reported: " + detail + ". The request was not approved.");
                 exitAt = DateTime.UtcNow.AddSeconds(2.5);
             }
         }
