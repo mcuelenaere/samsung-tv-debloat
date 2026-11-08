@@ -24,3 +24,19 @@ It sends one version-2 request to `/run/tv-auth/broker.sock` (override with
 commands.
 
 `cargo test` covers request building and JSON string escaping on the host.
+
+## dbusrun
+
+The same build also produces `dbusrun`, a tiny helper that execs a program with
+a different UID/GID (default 5001/100). The TV has no `su`/`setpriv`, and
+UID-5001 session/system-bus objects are only reachable as that UID:
+
+```sh
+/run/dbusrun -- /usr/bin/id
+/run/dbusrun -- /usr/bin/dbus-send --bus=kernel:path=/sys/fs/kdbus/5001-user/bus \
+    --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames
+```
+
+The process keeps the caller's SMACK label (`System::Privileged`), which is
+enough for the kdbus transport. This was used for the M4 investigation into
+`org.tizen.tv.webappservice.server`.

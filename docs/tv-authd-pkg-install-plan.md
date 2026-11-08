@@ -783,3 +783,49 @@ Bugs found and fixed during this validation:
 
 Still pending: WGT installs (blocked by `pkgcmd`'s `-4 Load archive info fail`;
 M4) — the signer itself is format-agnostic and signs WGTs the same way.
+
+## 17. M4 investigation (2026-11-08)
+
+The webappservice path is reachable from the device without a C helper, but
+not from a plain CLI. Findings:
+
+- **The service is on the system bus**, not the UID-5001 session bus:
+  `dbus-send --bus=kernel:path=/sys/fs/kdbus/0-system/bus`. The session bus
+  (`/sys/fs/kdbus/5001-user/bus`) does not carry the name. Root can open the
+  system bus, but kdbus rejected `dbus-send` as root with
+  `File descriptor in bad state` for the user bus; running `dbus-send` as UID
+  5001 (via the new `test-clients/rootcli` `dbusrun`, since the TV has no
+  `su`/`setpriv`) works.
+- Service `org.tizen.tv.webappservice.server`, object
+  `/org/tizen/tv/webappservice/server`, interface
+  `org.tizen.tv.webappservice.server.interface`. Full introspection lists
+  `was_install_webapp_with_translated_error_code`, `was_install_app`,
+  `was_install_app_common`, `was_uninstall_app`, `was_command`, and the
+  `managerclient`/`launcherclient` client interfaces.
+- `was_install_webapp_with_translated_error_code(is_deprecated, obj_name,
+  thread_id, id_type, app_id, packet_path, install_path, event_key,
+  method_call)` has **no out arguments**: the service calls back into a client
+  object that the caller must register, e.g.
+  `org.tizen.tv.webappservice.managerclient.interface.<obj_name>` with a
+  `was_install_result` method (the manager library registers that object on its
+  own GDBus connection). `dbus-send` cannot own an object, so a real GDBus
+  client (C helper or a Rust D-Bus client) is required to drive this method and
+  receive the result.
+- `was_command(cmd, app_id, pkg_path, data)` is a simpler candidate: four
+  string/int arguments and no callback. The `cmd` enum is still unknown; the
+  next step is to map it from `libwas_common.so` (or test candidate values on a
+  throwaway package).
+- `dbusrun` (`test-clients/rootcli/src/bin/dbusrun.rs`) makes UID-5001 calls
+  possible from a root shell, which unblocks experimentation with the system
+  bus.
+
+Next options, in order of effort:
+
+1. Map `was_command`'s enum and use `dbus-send` from `pkginstall.rs` after
+   install/uninstall (no new binary, but relies on an undocumented enum).
+2. Build a dynamically linked helper (C or Rust with `libloading`) that calls
+   `was_execution`/`was_install_webapp_with_translated_error_code` and owns the
+   callback object. Requires the TV glibc sysroot and an ARM toolchain, neither
+   of which is in the repo yet.
+3. Speak the SDB wire protocol to localhost `sdbd` and issue `vd_appinstall`
+   (most work, but exactly what `sdb install` does).

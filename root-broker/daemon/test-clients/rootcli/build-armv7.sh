@@ -14,9 +14,11 @@ docker run --rm \
         rustup target add "$1"
         cargo build --release --target "$1"
         cp "target/cross/$1/release/tvauth-cli" out/tvauth-cli
-        chmod 0755 out/tvauth-cli
+        cp "target/cross/$1/release/dbusrun" out/dbusrun
+        chmod 0755 out/tvauth-cli out/dbusrun
     ' sh "$TARGET"
 
 file "$SCRIPT_DIR/out/tvauth-cli"
 printf 'Size: %s bytes\n' "$(wc -c < "$SCRIPT_DIR/out/tvauth-cli" | tr -d ' ')"
-shasum -a 256 "$SCRIPT_DIR/out/tvauth-cli"
+printf 'Size: %s bytes (dbusrun)\n' "$(wc -c < "$SCRIPT_DIR/out/dbusrun" | tr -d ' ')"
+shasum -a 256 "$SCRIPT_DIR/out/tvauth-cli" "$SCRIPT_DIR/out/dbusrun"
