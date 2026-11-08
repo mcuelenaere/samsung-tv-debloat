@@ -50,12 +50,15 @@ app (any User::Pkg label)
    │  1. stages wgt/tpk where it can write, sends pkg.install{path,type}
    ▼
 tv-authd (root)
-   2. copies to root-only staging /run/tv-auth/staging/<random> (size cap)
-   3. parses manifest + signatures → InstallMeta
-   4. if unsigned: re-sign with enrolled user CA (milestone M3)
-   5. approval manager: ui.prompt kind="install" + metadata
-   6. on approve: ensure trust enrollment, run pkgcmd -i, stream result
-   7. response {status, pkgid, version, log} ; cleanup staging
+   2. copies to staging /opt/tv-auth/staging/<random> (size cap, sha256)
+   3. parses manifest + inspects signatures → InstallMeta
+   4. approval manager: ui.prompt kind="install" + metadata
+   5. on approve:
+      a. if unsigned or signed by an untrusted CA / foreign DUID:
+         re-sign in place with enrolled user CA (milestone M3)
+      b. ensure trust enrollment in PID 1's mount namespace (§4)
+      c. run installer backend (wascmd / pkgcmd + Home registration), stream result
+   6. response {status, pkgid, version, re_signed, log} ; cleanup staging
 ```
 
 ## 4. Trust enrollment (one-time, daemon-managed)
@@ -65,18 +68,25 @@ New daemon module `trust.rs`:
 - Material under `/opt/tv-auth/trust/` (root 0700):
   - `user-root-ca.pem`, `user-author.p12`-equivalents (see §7),
     `fingerprint_list.xml` (copy of stock + user CA SHA-1 added to
-    `tizen-developer` and `tizen-public` domains),
+    `tizen-developer`, `tizen-public`, and partner distributor domains so
+    user-approved homebrew apps can use both public and partner privileges),
     `tizen-ca/` (copy of `/usr/share/ca-certificates/tizen` + user CA).
-- `ensure_enrolled()` is idempotent: verifies the bind-mounts are active
-  (`/proc/self/mounts`) and the fingerprint file contains our CA; repairs if
-  not. Called at daemon start and again right before each approved install
-  (firmware updates / Samsung services may restore stock files).
-- Bind-mounts:
+- **Root mount-namespace requirement (`PID 1`):**
+  - `tv-authd.service` uses `BindReadOnlyPaths=/opt/tv-auth:/run/opt/tv-auth`,
+    which places `tv-authd` in a private slave mount namespace. Any `mount(2)`
+    called directly inside `tv-authd` is invisible to `pkgmgr-server`
+    (`package-manager.service`), which runs in the host (`PID 1`) mount
+    namespace.
+  - `ensure_enrolled()` must therefore inspect `/proc/1/mounts` and perform
+    its bind-mounts inside `/proc/1/ns/mnt` (via a short helper thread/child
+    that `setns(2)`s into `/proc/1/ns/mnt`, or `/usr/bin/nsenter -t 1 -m --
+    /bin/mount --bind ...`).
+  - Because `tv-authd` itself performs enrollment in `PID 1`'s mount namespace
+    at daemon startup and again before each approved install, no separate
+    `tv-auth-trust.service` boot unit is needed.
+- Bind-mounts (in `PID 1`'s mount namespace):
   - `/usr/share/ca-certificates/fingerprint/fingerprint_list.xml` ← ours
   - `/usr/share/ca-certificates/tizen` ← `tizen-ca/` overlay dir
-- Persistence across reboot rides the existing `/opt/etc/parseinfo.sh`
-  dynamic-unit hook: add a `tv-auth-trust.service` that runs
-  `tv-authd --enroll-trust` (one-shot, before `tv-authd.service`).
 
 Distributor DUID gate: the user distributor certificate embeds the TV's DUID
 (`vconftool get db/comss/hwduid`) in a custom X.509 extension
@@ -116,10 +126,11 @@ Success:
 ```
 
 Errors (new): `invalid_path` (outside allowlist / not a regular file),
-`too_large` (staging cap, default 256 MiB), `bad_package` (zip/manifest
-invalid), `manifest_forbidden` (see §8 policy), `install_failed` (pkgcmd
-non-zero; `log_tail_b64` included), `sign_failed`, `user_denied`,
-`prompt_timeout`, plus the existing queue/busy errors.
+`too_large` (staging cap, default 128 MiB), `bad_package` (zip/manifest
+invalid), `manifest_forbidden` (see §8 policy),
+`author_mismatch_requires_reinstall`, `install_failed` (installer non-zero;
+`log_tail_b64` included), `sign_failed`, `user_denied`, `prompt_timeout`,
+plus the existing queue/busy errors.
 
 Request limits: the 64 KiB line cap is fine (path, not data). One pending
 install per app label (mirrors exec).
@@ -127,8 +138,10 @@ install per app label (mirrors exec).
 ### 5.2 `pkg.uninstall` / `pkg.list` (M2)
 
 `pkg.uninstall{pkgid}` prompts with `kind:"uninstall"` — every time, like
-installs (§5.4). `pkg.list` is unauthenticated-read for the calling app (own
-packages only). Both are cheap and make the feature self-contained.
+installs (§5.4). `pkg.list` is unauthenticated-read and returns installed
+user/third-party packages under `/opt/usr/apps` (`pkgid`, `pkg_version`,
+`pkg_type`, `name`) so an app store/manager (such as Vetro) can determine
+which packages are already installed or upgradable.
 
 ### 5.3 Prompt message: new `kind`
 
@@ -156,7 +169,7 @@ UI ship together:
 }
 ```
 
-`signature` ∈ `unsigned_will_resign | user_ca | samsung | unknown`.
+`signature` ∈ `unsigned_will_resign | foreign_will_resign | user_ca | samsung`.
 `kind` ∈ `exec | install | uninstall` (absent ⇒ `exec`).
 
 All metadata strings pass through the existing control/bidi sanitizer.
@@ -181,24 +194,33 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 
 | Module | Change |
 |---|---|
-| `protocol.rs` | v2 structs: `InstallRequest`, `UninstallRequest`, prompt `kind` + `InstallMeta`, `invalid_decision` guard for `always` on non-`exec` kinds, validators, size/character limits |
-| `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/run/tv-auth/staging/<random>` with byte cap, sha256 of staged copy, cleanup guard |
-| `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, version, app name, `<privilege>` list, api-version; detect `author-signature.xml`/`signatureN.xml` |
-| `pkgsign.rs` (new, M3) | on-device re-signing (§7) |
-| `pkginstall.rs` (new) | `trust::ensure_enrolled()`, invoke `/usr/bin/pkgcmd -i -t <type> -p <staged>` with timeout, parse `key[end] val[ok]`, map failure codes (`-12/-14` etc.), tail log |
+| `protocol.rs` | v2 structs: `InstallRequest`, `UninstallRequest`, `ListPackagesRequest`, prompt `kind` + `InstallMeta`, `invalid_decision` guard for `always` on non-`exec` kinds, validators, size/character limits; accept both v1 (`exec`) and v2 |
+| `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>` (`0711` dir, `0644` staged file so `pkgmgr-server`/backends running as `root` or `owner` can read it without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
+| `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
+| `pkgsign.rs` (new, M3) | in-daemon on-device re-signing after user approval (§7.3) |
+| `pkginstall.rs` (new) | `trust::ensure_enrolled()`, invoke installer (`/usr/bin/wascmd` or `/usr/bin/pkgcmd` + Samsung Home app-list registration — see note below) with timeout, parse result status, map failure codes (`-12/-14` etc.), tail log |
 | `grants.rs` | no change (exec-only by design, §5.4) |
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
 | `server.rs` | route `pkg.install`/`pkg.uninstall`/`pkg.list` for ordinary packages; new **root role**: uid 0 clients (e.g. SSH/dropbear, label `System::Privileged`) may call `pkg.*` prompt-free — exec remains package-only; forbid all `pkg.*` for the UI role; per-label pending tracking |
-| `trust.rs` (new) | §4 |
-| `main.rs` | `--enroll-trust` one-shot mode for the boot unit; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label` |
+| `trust.rs` (new) | §4 (`PID 1` mount-namespace enrollment) |
+| `main.rs` | call `trust::ensure_enrolled()` at startup; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label` |
 
-Staging lifecycle: copied at request time (before the prompt) so the file the
-user approves is the file that gets installed (no TOCTOU on the source path).
-On deny/timeout/failure the staged copy is shredded (`rm`, best effort) and
-never reused.
+Staging lifecycle: copied at request time (before the prompt) to
+`/opt/tv-auth/staging/<random>` (on persistent `/opt` flash rather than RAM-backed
+`/run` tmpfs, since the TV has ~437 MiB `MemAvailable` and ~922 MB free on `/opt`)
+so the file the user approves is the file that gets installed (no TOCTOU on the
+source path). On deny/timeout/failure the staged copy is removed and never
+reused; stale staging files are wiped at daemon startup.
 
-`pkgcmd` is invoked via the existing `executor` (setsid, cleared env,
-timeout 120 s, 1 MiB log caps).
+Installer & Samsung Home registration: a plain `/usr/bin/pkgcmd -i` installs the
+package but does not register it under Samsung Home's "My apps" list (`sdb
+install` invokes `/usr/bin/wascmd`). Before implementing `pkginstall.rs`, RE
+`/usr/bin/wascmd` (and `/etc/package-manager/backend/*`) to use the exact
+invocation or post-install registration step that makes installed apps appear in
+Samsung Home.
+
+The installer command is invoked via the existing `executor` (setsid, cleared
+env, timeout 120 s, 1 MiB log caps).
 
 ## 7. Signing
 
@@ -222,34 +244,49 @@ conformance test fixture for the on-device signer.
 
 ### 7.3 On-device re-signing (M3)
 
-For `signature == unsigned` packages, daemon re-signs before prompting so the
-user approves the final artifact:
+For packages with `signature == unsigned_will_resign` or
+`foreign_will_resign` (e.g. community `.wgt`/`.tpk` bundles pre-signed with a
+third-party developer cert for another TV's DUID), the daemon re-signs **after
+the user approves** (avoiding heavy unpack/hash/xmlsec/re-zip work on unapproved
+or denied requests, while verifying the staged file's SHA-256 before signing):
 
-- Helper: `tv-sign` — small static Rust binary next to tv-authd that shells
-  out to the on-TV `xmlsec1` + `openssl` (both present on the firmware) using
-  template XML generated like §7.2. Keeps XML-DSig/C14N correctness out of
-  the daemon.
-- Keys stay in `/opt/tv-auth/trust/`; helper runs as root; the enrolled CA
-  is exactly the one being trusted, so post-sign install passes.
+- Implemented directly in `pkgsign.rs` inside `tv-authd` (no separate `tv-sign`
+  ELF binary to build or bind-mount), shelling out via `executor` to the on-TV
+  `/usr/bin/xmlsec1` + `/usr/bin/openssl` (both present on the firmware) using
+  template XML generated like §7.2. Keeps XML-DSig/C14N implementation out of
+  Rust while avoiding a second binary.
+- Strip any existing `author-signature.xml` and `signature*.xml` when
+  re-signing a `foreign_will_resign` archive, then sign with `tv-user-author`
+  and `tv-user-distributor`.
+- If `is_upgrade == true` and the already-installed package on disk was signed
+  by a different author certificate than `tv-user-author`, reject early with
+  `author_mismatch_requires_reinstall` (Tizen rejects cross-author upgrades with
+  `-12`).
+- Keys stay in `/opt/tv-auth/trust/` (`0600 root`); the enrolled CA is
+  the one being trusted, so post-sign install passes.
 - The prompt clearly states "unsigned — will be signed with your on-device
-  CA" (`re_signed: true` in the response).
+  CA" or "third-party signature — will be re-signed with your on-device CA"
+  (`re_signed: true` in the response).
 
 ## 8. Policy and safety limits
 
 - **Path allowlist**: `/opt/usr/home/owner/**`, `/opt/media/**`, `/tmp/**`;
-  must be a regular file, no symlink, ≤ 256 MiB.
-- **Zip hygiene**: ≤ 4096 entries, ≤ 1 GiB total uncompressed, no absolute
+  must be a regular file, no symlink, ≤ 128 MiB (bounded to fit safely in
+  `/opt/tv-auth/staging`).
+- **Zip hygiene**: ≤ 4096 entries, ≤ 512 MiB total uncompressed, no absolute
   or `..` names (reject, don't sanitize).
 - **Package identity**: reject pkgids starting with `com.samsung.`,
   `org.tizen.`, `samsung.` (no shadowing system apps). Upgrades allowed only
   when the package is already installed *and* the platform same-author rule
   will hold; the stock installer is the backstop, daemon check is UX.
-- **Privilege ceiling**: refuse manifests requesting platform/partner-level
-  privileges (they would fail anyway at `CheckPrivilegeLevel` with a
-  PUBLIC-level user CA) — show the offending list in the denial response.
+- **Privilege ceiling**: enrolling the user distributor CA in both the public
+  and partner fingerprint domains (§4) allows public and partner privileges
+  (which homebrew TV apps and `org.tvauth.ui` itself need). Refuse manifests
+  requesting platform-only privileges if the user CA is not enrolled in the
+  platform domain — show the offending list in the denial response.
 - **One active install globally** (serialize with the prompt queue);
-  120 s hard timeout; staging dir is `0700 root` on tmpfs and is wiped at
-  daemon start.
+  120 s hard timeout; staging dir `/opt/tv-auth/staging` is `0711 root` (with
+  `0644` staged files) and is wiped at daemon start.
 - **Root role**: uid 0 clients may use `pkg.install`/`pkg.uninstall`/
   `pkg.list` without a prompt (convenient over SSH). They run with the same
   staging, policy, and audit pipeline; the pkgid shadowing ban applies to
@@ -272,8 +309,9 @@ user approves the final artifact:
   - Source app (label-derived), package name + id + version, size;
   - privilege list (scrollable; raw URIs mapped to friendly names for the
     ~20 common ones);
-  - signature badge: "Unsigned (will be signed on-device)" / "Signed by your
-    CA" / "Signed by Samsung store";
+  - signature badge: "Unsigned (will be signed on-device)" / "Third-party
+    signature (will be re-signed on-device)" / "Signed by your CA" / "Signed
+    by Samsung store";
   - Buttons: **Deny** and **Install** (or **Remove**) — no "once" wording,
     no Always option for package operations (§5.4); existing timeout
     countdown, key grabs, backdrop.
@@ -293,7 +331,7 @@ with explicit authorization, on the user's TV.
 |---|---|---|---|
 | M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed wgt, `kind=install` prompt, approve/deny | unit tests for protocol/staging/manifest; `sign-wgt.sh` output installs in stock flow (dry-run against device files) | enroll trust, install pre-signed test wgt via broker, prompt UI flow, deny path, reboot persistence of enrollment |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | uninstall/list protocol round-trips, root-role gating, notice queuing | uninstall prompt flow, root CLI install/uninstall without prompt + toast appears, UI deny path |
-| M3 | `tv-sign` on-device re-signing of unsigned packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned wgt → broker signs → installs → launches; `pkgcmd -l` shows it; signature survives reboot |
+| M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned / foreign-signed wgt → user approves → broker re-signs → installs → launches; appears in Samsung Home; signature survives reboot |
 
 Out of scope (documented to avoid creep): delta updates, mount-installed
 (readonly) packages, RPM/rpk installs, restoring stock trust (manual
