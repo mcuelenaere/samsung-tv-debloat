@@ -212,6 +212,30 @@ approval plumbing, and `pkgcmd` invocation with a fake installer. TV validation 
 flow, the prompt, deny and error paths, and cold-boot persistence (see
 `../../docs/tv-authd-pkg-install-plan.md` §14).
 
+### Native UI staging and self-protection
+
+The approval UI is now a native `type="capp"` package. UEP refuses to map an
+ELF under `/opt`, so `ui_alias.rs` bind-mounts the installed binary read-only at
+`/run/tv-auth/ui-bin/tv-auth-ui` (in PID 1's mount namespace) and points
+`bin/tv-auth-ui` at it with a symlink. It runs at daemon start, restores the
+packaged file before an install/upgrade, and re-establishes the alias after a
+successful install or a failed upgrade. `--ui-exec` and `--ui-alias-dir` override
+the defaults. A missing native UI (for example the managed `.NET` package) is a
+no-op.
+
+Because the UI is signed with the on-device CA, Tizen's same-author check would
+otherwise let an ordinary package replace or remove it. `pkg.install` and
+`pkg.uninstall` for `--ui-package` are therefore root-only; ordinary packages
+get `manifest_forbidden` / `protected_package`. Both guards were exercised on
+the live TV on 2026-11-08.
+
+The native UI was deployed live on 2026-11-08 (daemon `86a7bcee…`, UI TPK
+`0b71a21f…`). A cold boot recreated the `/run` alias (`ui_alias=mounted`), kept
+the Home row and Vetro grant, and the UI rendered the manager with the expected
+SMACK label and a `/run/tv-auth/ui-bin/tv-auth-ui` mapping. The previous M4
+daemon is at `/opt/tv-auth/tv-authd.m4-20261108`; the managed UI rollback TPK is
+`ui/out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet-signed.tpk`.
+
 The launcher inherits the daemon's systemd environment. On this TV that includes
 `XDG_RUNTIME_DIR=/run`, which AUL's launcher path uses. Do not clear it.
 

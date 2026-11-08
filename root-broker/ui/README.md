@@ -1,6 +1,6 @@
 # tv-auth approval and grant-manager UI
 
-This is the managed Tizen .NET UI for `tv-authd`. It has four jobs:
+This is the native Tizen `type="capp"` UI for `tv-authd`. It has four jobs:
 
 1. show the daemon-generated approval prompt when an application requests root;
 2. show a package-aware prompt for `pkg.install` (`kind: "install"`) and
@@ -13,13 +13,46 @@ The UI is a normal UID-5001 package with the exact SMACK label
 `User::Pkg::org.tvauth.ui`. It never runs as root and has no network privilege.
 It talks directly to `/run/tv-auth/broker.sock`; there is no helper process.
 
-## Why managed .NET
+## Why a `/run` alias
 
-The M0 spike proved that launchpad will not map a custom unsigned native ELF from
-writable app storage, even when the TPK has valid author and distributor
-signatures. A managed `netcoreapp3.1` Tizen `dotnet` application runs through
-Samsung's signed apphost, so UEP stays enforced. Native calls are confined to
-`dotnet/Interop.cs`.
+Samsung's kernel UEP module (`SfdUepVerifyExecutableBinary`) refuses to `exec`
+or `dlopen` an ELF whose `d_path()` starts with `/opt`, `/tmp`, `/var`, or
+`/home`. A Tizen `type="capp"` package installs its executable under
+`/opt/usr/apps/<pkgid>/bin/`, so launchpad cannot map a custom native UI from
+there even when the TPK is validly signed.
+
+The verifier takes the "UEP disabled" branch when the opened file resolves
+through a mount outside those roots. `tv-authd` therefore:
+
+1. bind-mounts the installed UI executable read-only at
+   `/run/tv-auth/ui-bin/tv-auth-ui` in PID 1's mount namespace;
+2. keeps the real bytes at `bin/tv-auth-ui.real` and replaces
+   `bin/tv-auth-ui` with a symlink to the `/run` path.
+
+Launchpad opens the packaged path, the VFS follows the symlink into the `/run`
+mount, and `d_path()` reports the `/run` path. The package, SMACK domain, AUL
+registration, and Samsung Home entry are unchanged. `daemon/src/ui_alias.rs`
+performs this idempotently at daemon startup and after a root install of the UI
+package.
+
+This path was validated on the TV on 2026-11-08 with the harmless
+`org.tvauth.spike.popup` EFL binary:
+
+```text
+before alias: /proc/<pid>/maps contained only launchpad-loader/liblaunchpad
+after alias:  00466000-004ad000 r-xp /run/tv-auth/spike-popup-bin/efl-popup
+label:        User::Pkg::org.tvauth.spike.popup
+RSS:          ~22.6 MB (the spike's EFL window; the prompt UI is smaller)
+```
+
+The test package and mounts were removed afterwards.
+
+**Why not the AT-HUB gawk hook?** The `#!/usr/bin/gawk -f` hook bypasses UEP for
+*scripts* because gawk does not link `libkUEPUser.so`. It does not change the
+path launchpad opens for a `type="capp"` package, so it would still have to
+rewrite `app_info.exec` or replace the packaged binary, and it would couple UI
+correctness to boot-hook ordering. The `/run` alias stays inside `tv-authd` and
+is re-established on every daemon start.
 
 ## Behavior
 
@@ -29,12 +62,11 @@ When an app without a persistent grant connects, the daemon launches
 `app_launcher -s org.tvauth.ui` and sends a `ui.prompt` frame. The UI:
 
 - raises a full-screen notification-type EFL window (notification level TOP,
-  then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card, so
-  the home screen no longer shows through the prompt;
+  then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card;
 - displays the exact package ID and SMACK label from the daemon, plus the
   daemon-generated **FULL ROOT ACCESS** warning;
-- displays a sanitized display copy of the command (control and bidirectional
-  formatting characters are replaced; long commands are truncated and marked);
+- displays a sanitized display copy of the command (long commands are
+  truncated and marked);
 - offers **Deny**, **Allow once**, and **Always allow**, focusing **Deny** by
   default;
 - shows a live "Denied automatically in N s" countdown for the daemon timeout;
@@ -47,242 +79,185 @@ invalidates the grant and the next request prompts again. If the daemon cannot
 verify the package identity, it fails closed and reports
 `package_identity_unavailable`.
 
-RETURN activates the focused button. BACK denies the pending prompt (it does not
-silently dismiss the request). Arrow-key focus movement uses Elementary's normal
-focus handling; RETURN, Right/Left, and BACK were validated on the TV with
-`input_keyevent`.
-
 ### Package prompt
 
 For `pkg.install` the daemon sends `kind: "install"` with an `install` object.
-The UI replaces the root-access warning with the package facts:
-
-- requester (package ID and SMACK label);
-- package name, package ID, version, type, and staged size;
-- an upgrade note when the daemon believes the package is already installed;
-- a signature badge: "Unsigned — it will be signed with this TV's CA",
-  "Third-party signature — it will be re-signed with this TV's CA", "Signed by
-  your own CA", or "Signed by Samsung". The unsigned/foreign labels are
-  accurate for M3: the daemon re-signs those packages after approval;
-- the requested privileges with friendly names for common Tizen privileges
-  (up to 7 are listed; the rest are summarised);
-- **Deny** and **Install** buttons only. There is deliberately no **Always
-  allow**: every package operation is a fresh decision and the daemon rejects
-  `always` for these prompts.
-
-The app-facing decision value is still `once`. The prompt covers exactly the
-staged package the daemon inspected; changing the source file after the request
-does not change what is installed.
+The UI shows the requester, package name/id/version/type/size, an upgrade note,
+a signature badge, and the requested privileges (up to 7; the rest are
+summarised). It offers **Deny** and **Install** only; there is deliberately no
+**Always allow** for package operations.
 
 For `pkg.uninstall` the daemon sends `kind: "uninstall"` with an `uninstall`
-object (`pkgid`, `name`, `pkg_version`, `pkg_type`) and a `command` of
-`remove <pkgid>`. The same layout shows **REMOVE PACKAGE**, the requester, the
-package facts, **Deny** and **Remove**. A package request without the matching
-object renders "Malformed package request" with only **Deny** (fail closed).
-
-Removing a package through the daemon does not yet clean up its Samsung Home
-`widgetinfo` row; the daemon's installer backend is `pkgcmd`, which never
-contacts `webappservice`. That cleanup and WGT support are M4.
+object and a `remove <pkgid>` command. The same layout shows **REMOVE PACKAGE**,
+the package facts, **Deny**, and **Remove**. A package request without the
+matching object renders "Malformed package request" with only **Deny**.
 
 ### Execution toast
 
-When a granted app executes, the daemon sends a `ui.notice` within 250 ms (see
-`daemon/PROTOCOL.md`), launching the UI if needed with `"launch": "notice"` in
-the hello response. In that case the full-screen window is never shown and BACK
-is not grabbed. Instead a separate notification window in the top-right corner
-(focus-skip, `wm.policy.win.user.geometry`) shows up to three apps, e.g.
-"**org.example.app** ran 3 commands as root" plus the last command's first line.
-There is only ever one toast: new notices update its counters and command in
-place and keep it up until 6 s after the last command. Afterwards the UI stays
-connected but invisible for 5 min so the next toast appears instantly instead of
-waiting about 1 s for an app launch, then exits. Opening the app icon while it
-lingers shows the manager.
+A granted app's executions arrive as `ui.notice` within 250 ms. A notice-only
+launch (`"launch": "notice"`) never shows the full-screen window or grabs BACK.
+A separate focus-skip notification window in the top-right corner shows up to
+three apps, e.g. "**org.example.app** ran 3 commands as root", plus the last
+command's first line. New notices update the counters in place and keep the
+toast up for 6 s after the last command. The UI then stays connected but
+invisible for 60 s so a burst of notices does not relaunch it, and exits.
 
-Prompt-free root package operations also arrive as `ui.notice`, with
-`kind: "install"`/`"uninstall"` and `package: "root"`. The toast then reads
-**PACKAGE CHANGE** / "**root** installed a package" / "**root** removed a
-package" with `$ install <pkgid>-<version>` or `$ remove <pkgid>`, instead of the
-root-command wording.
+Prompt-free root package operations also arrive as `ui.notice` with
+`kind: "install"`/`"uninstall"` and `package: "root"`, rendered as
+**PACKAGE CHANGE**.
 
 ### Grant manager
 
-If the UI is opened from the launcher with no pending prompt, or after a decision
-or reconnect, it shows the persistent-grant list. Each row has a toast toggle
-that cycles **Toast: every** → **Toast: first use** (first command after 30 min
-idle, for apps that poll) → **Toast: never**, and a **Revoke** button. Focus
-starts on the toggle, not on Revoke. The list is refreshed when the manager
-opens, after each change, and via the **Refresh** button, so an app granted by a
-prompt is not missing from a stale list.
-The first 5 grants are shown.
+Opening the app icon with no pending prompt shows the persistent-grant list.
+Each row has a toast toggle that cycles **Toast: every** → **Toast: first use**
+(first command after 30 min idle) → **Toast: never**, and a **Revoke** button.
+Focus starts on the toggle, not Revoke. The list refreshes when the manager
+opens, after each change, and via **Refresh**. The first 5 grants are shown.
 
 ### Failure behavior
 
-- UI timeout or no decision: the UI enforces the daemon's `timeout_ms` locally,
-  logs `prompt expired`, shows a timeout message, and exits after two seconds;
-  the daemon independently denies.
-- UI crash or socket loss: the daemon sees EOF and denies the active request; the
-  UI clears the dead prompt and reconnects in manager mode.
+- UI timeout: the UI enforces the daemon's `timeout_ms` locally, logs
+  `prompt expired`, shows a timeout message, and exits after two seconds; the
+  daemon independently denies.
+- UI crash or socket loss: the daemon sees EOF and denies the active request;
+  the UI clears the dead prompt and reconnects in manager mode.
 - Broker restart: the UI reconnects every two seconds, re-sends `ui.hello`, and
   refreshes grants.
 - After sending a decision, the UI has a five-second safety exit even if the
   broker stops responding.
-- The manager list normally appears about two seconds after launch while the
-  .NET runtime initializes and the grants round-trip completes.
 
 The UI is a **best-effort consent interface**, not a proven secure-attention
 path. Notification priority and key grab do not prevent another app from
-imitating or obscuring the prompt. The daemon-side nonce still prevents a
-different app from forging the decision message, but visual spoofing is outside
-this milestone.
+imitating or obscuring the prompt. The daemon-side nonce prevents a different
+app from forging the decision message, but visual spoofing is outside this
+milestone.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `dotnet/Program.cs` | EFL window, prompt/manager views, event-loop dispatch |
-| `dotnet/BrokerClient.cs` | direct Unix-socket NDJSON client and reconnect loop |
-| `dotnet/Interop.cs` | the complete P/Invoke surface |
-| `dotnet/tizen-manifest.xml` | package/app `org.tvauth.ui` |
-| `build-ui.sh` | .NET Core 3.1 publish and unsigned TPK assembly |
+| `rust/src/main.rs` | EFL window, prompt/package/manager views, timer dispatch |
+| `rust/src/client.rs` | direct Unix-socket NDJSON client and reconnect loop |
+| `rust/src/efl.rs` | the complete raw EFL/Tizen FFI surface |
+| `rust/src/model.rs` | protocol v2 prompt/notice/grant types |
+| `rust/src/log.rs` | bounded `/tmp/tvauth-ui.log` writer |
+| `rust/tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |
+| `build-ui.sh` | ARMv7 soft-float cross-build and unsigned TPK assembly |
+| `dotnet/` | legacy managed implementation, kept for reference |
+| `build-ui-dotnet.sh` | legacy managed build |
 
 ## Build
 
 ```sh
+../sysroot/fetch-tv-sysroot.sh   # read-only TV access; needs authorization
 ./build-ui.sh
 ```
 
-This uses `mcr.microsoft.com/dotnet/sdk:3.1` and produces:
+`build-ui.sh` uses
+`rust:1.85.0-slim-bullseye@sha256:a78439ac2ee14dc1c2c188fef0ff0b197e1cc1918d4b3daf486776ac0f60029a`,
+target `armv7-unknown-linux-gnueabi`, and Debian's soft-float
+`arm-linux-gnueabi-gcc`. It links against the TV's seven direct EFL libraries
+(`capi-appfw-application`, `capi-ui-efl-util`, `efl-extension`, `elementary`,
+`evas`, `ecore`, `ecore_wl2`) and passes `--allow-shlib-undefined` for their
+transitive dependencies.
 
-```text
-out/tv-auth-ui/org.tvauth.ui-0.1.0.tpk
-out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
+Host checks:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo check --all-targets
+cargo test          # library-only: pure formatting/protocol helpers
 ```
 
-Observed local artifacts (after rebasing package-prompt work onto M4):
+Observed artifact (2026-11-08, host cross-build):
 
 ```text
-Managed assembly: 57,856 bytes
-Unsigned TPK:     29,051 bytes
-Signed TPK:       36,637 bytes (Partner profile `tvauth-partner`, SHA-256
-                  `20358bf4f31587d9da14ee7c808f5faa38677af92ce3596459ecb27f3cd9dd22`;
-                  installed TvAuthUi.dll SHA-256
-                  `f627f35c688afb2fc143422df0e90e3de3fc88658acdf5142ea3bf542c9bc910`)
+ELF 32-bit LSB pie executable, ARM, EABI5, stripped
+ELF flags:       0x5000200 (Version5 EABI, soft-float ABI)
+Size:            476,888 bytes
+Unsigned TPK:    ~258 KB (zip timestamps make the hash differ per build)
+NEEDED:          capi-appfw-application, elementary, evas, capi-ui-efl-util,
+                 efl-extension, ecore, ecore_wl2
 ```
 
 ## Signing and installation
 
-Sign the unsigned TPK with the existing TV certificate through Tizen Studio, as
-with the M1 test packages:
+`tv-authd` re-signs unsigned TPKs on-device with its author/distributor CAs.
+Install with the root-role client:
 
 ```sh
-tizen package -t tpk -s <profile> -- org.tvauth.ui-0.1.0.tpk
+/run/tvauth-cli install tpk /tmp/org.tvauth.ui-0.1.0.tpk
 ```
 
-No certificate material or passwords belong in this repository. The installed
-`org.tvauth.ui` on the current TV is signed with the Apps2Samsung **Partner**
-certificate (profile `tvauth-partner` on the build Mac). Sign with that
-author/distributor profile for an in-place update; another author is rejected
-with `Author certificate not match` / `Check certificate error [-12]`. If a
-mismatch occurs, uninstall/reinstall (which changes the package signer). With a
-profile name that does not exist, `tizen package` still prints "created
-successfully" but leaves the TPK unsigned, so check that it contains
-`author-signature.xml`.
+The package is `org.tvauth.ui`; after install the daemon re-runs the `/run`
+alias setup. The old managed UI is Partner-signed, so switching to the on-device
+CA requires a one-time uninstall/reinstall (Tizen refuses cross-author
+upgrades).
 
-Install it through SDB, which uses Samsung's installer (`wascmd`):
+Order matters during the migration:
+
+1. deploy a `tv-authd` build containing `ui_alias.rs` and the root-only UI
+   package guard (the current live daemon predates both), and restart it;
+2. `/run/tvauth-cli uninstall org.tvauth.ui` (root role);
+3. `/run/tvauth-cli install tpk /tmp/org.tvauth.ui-0.1.0.tpk`;
+4. confirm the daemon log contains `ui_alias=mounted` and the UI launches with
+   `/proc/<pid>/maps` pointing at `/run/tv-auth/ui-bin/tv-auth-ui`.
+
+For rollback, signing `out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet.tpk`
+with the `tvauth-partner` profile and installing it restores the managed UI
+(uninstall the Rust build first because the author differs).
+
+The legacy managed build can still be produced with `./build-ui-dotnet.sh` and
+signed with the `tvauth-partner` profile for rollback:
 
 ```sh
-sdb connect <tv-ip>
-sdb install org.tvauth.ui-0.1.0.tpk
+tizen package -t tpk -s tvauth-partner -- org.tvauth.ui-0.1.0.dotnet.tpk
 ```
 
-A plain `pkgcmd -i` over SSH also installs and runs the app, but Samsung Home
-does not list it under "Mijn apps"/"My apps"; only an SDB install registers it
-there (validated 2026-11-08). The manifest also sets `taskmanage="true"`, which
-every app Home lists has.
+## Validation status
 
-The daemon expects the installed label `User::Pkg::org.tvauth.ui` and UID 5001 by
-default. If the package ID changes, update `--ui-package` and `--ui-app-id`.
-
-## TV acceptance results
-
-Completed on 2026-11-05 with `org.tvauth.ui` installed and the M2 daemon running:
-
-1. Signed TPK installed; the process label was
-   `User::Pkg::org.tvauth.ui` and notification level TOP was accepted.
-2. An ungranted test package triggered the prompt; the UI attached and rendered.
-3. **Deny**: `denied`/`user_denied`; the command did not run.
-4. **Allow once**: a root `id` result; no grant persisted; the next request
-   prompted again.
-5. **Always allow**: the grant persisted and executed; later requests ran with no
-   prompt, including after a daemon restart and a cold boot.
-6. Manager **Revoke** returned `revoked=true`, emptied the grant file, and the
-   next request prompted.
-7. Prompt timeout returned `denied`/`prompt_timeout`; killing the UI while a
-   prompt was pending returned `ui_unavailable`/`ui_disconnected`. Neither
-   executed. The UI also logs `prompt expired` and dismisses a stale prompt at
-   the daemon's timeout.
-8. `/usr/bin/input_keyevent` verified RETURN activation, Right/Left focus
-   movement, and BACK. The manager list renders about two seconds after launch,
-   so automated tests must wait for the grants response before injecting keys.
-
-On 2026-11-08 the M4 manager-refresh UI was installed in place with the
-Apps2Samsung **Partner** certificate (DLL SHA-256 `53f446fb…`). The update
-succeeded without uninstalling; `manager grants refresh` and two
-`ui_grants_list` requests were observed, and the manager showed Vetro with
-`Toast: first use`.
-
-After the 2026-11-08 cold boot (boot ID
-`c0b55e8d-22a6-4fb6-8c70-a755bbfcab86`), the UI launched again, reattached as
-`User::Pkg::org.tvauth.ui`, refreshed the manager grants, and showed Vetro with
-`Toast: first use`.
-
-Pause/resume and repeat-key hardening remain hardening items.
-
-Package prompts and package toasts were validated on 2026-11-08 with the M2
-daemon:
-
-- the app-role uninstall prompt (from `org.tvauth.pkgprobe`) rendered
-  **REMOVE PACKAGE**, requester, "Package install test · org.tvauth.pkgtest ·
-  version 0.1.0 · TPK", **Deny**/ **Remove** and the countdown;
-- Deny returned `user_denied` with the package intact; Remove returned
-  `status: ok` and the package was gone;
-- root `pkg.install` and `pkg.uninstall` showed **PACKAGE CHANGE** toasts,
-  "root installed a package" / "root removed a package", with the command line.
-
-The M3 badge text was verified on the TV on 2026-11-08 while installing a
-foreign-signed TPK: the package panel read "Third-party signature — it will be
-re-signed with this TV's CA", and approval installed the newly signed package.
-
-The execution toast was validated on the TV on 2026-11-08 with Vetro holding an
-Always-allow grant: Vetro bursts of ~20 execs/s were coalesced into single
-notices; the notice-only launch never showed the full-screen window; `-topvwins`
-reported the toast at 696x147+1176+48 in `NOTIFICATION_TOP`, unfocused; it hid
-after 8 s, the UI exited 30 s later, and the next notice relaunched it; the
-toast was confirmed visually. Tizen 6.5 exports focus skip as
-`elm_win_prop_focus_skip_set` (not `elm_win_focus_skip_set`).
-
-The card layout was re-verified on the TV on 2026-11-05 using
-`enlightenment_info -dump_screen`. The window reported 1920x1080; the scrim
-dims the home screen to about 45% brightness; the prompt rendered with a live
-countdown and timed out to `denied`/`prompt_timeout`; and `input_keyevent
-XF86Back` closed the manager. No monospace font is installed, so the command
-falls back to the proportional UI font.
-
-## Known limitations
-
-- `enlightenment_info -dump_screen` does not capture the execution toast, so
-  check it with `-topvwins` (geometry/visibility) or by eye. Size/timing
-  constants are at the top of `Program.cs`.
-
-- No friendly package-name resolution: the UI shows the exact package ID and
-  SMACK label, which are the security-relevant identities. A display-name lookup
-  is a future convenience, not a trust input.
-- No scrolling: long command lines are truncated to 12 wrapped lines and manager
-  lists to 5 entries.
-- Notification TOP, three-button focus movement, RETURN, and BACK were validated
-  on the target, but spoofing, occlusion, held/repeat keys, pause/resume,
-  compositor restart, and relaunch-while-running remain M4 hardening items.
-- The UI can be visually imitated by another app. Only the IPC decision is
-  authenticated.
-- The daemon records the UI package label and UID, not a signing certificate.
-  Package replacement/upgrade policy is an M4 hardening item.
+- **Host:** `cargo check`, `cargo clippy -D warnings`, and `cargo test` pass.
+  The ARMv7 soft-float artifact links against the seven TV libraries.
+- **TV (spike):** the native ELF loads from the `/run` alias, carries
+  `User::Pkg::org.tvauth.spike.popup`, and maps the aliased binary. Without the
+  alias, only launchpad happens.
+- **TV (Rust UI smoke test, 2026-11-08):** the built `tv-auth-ui` was packaged
+  as `org.tvauth.spike.ui` (so the live UI was untouched), installed through the
+  daemon's root-role client (`rootcli install tpk`:
+  `re_signed=true`, `backend=was`, `result=installed`), staged through a `/run`
+  alias, and launched through AUL. It created a 1920x1080 notification window
+  titled "Root access", logged `notification level TOP accepted`, and rendered
+  the manager card, empty-grant state, and Refresh button. RSS was 16–30 MB
+  across runs (well below the `.NET` UI's ~50 MB). The daemon rejected
+  `ui.hello` with `not_ui` as expected for the smoke package id, and the UI
+  displayed that status. `rootcli uninstall` removed the package, its Home row,
+  and the directory.
+- **TV (full UI, 2026-11-08):** the daemon with `ui_alias.rs` and the
+  root-only UI-package guard was deployed, the managed `.NET` UI was replaced by
+  this Rust build (`rootcli install tpk`: `re_signed=true`, `backend=was`,
+  `result=installed`), and the daemon logged `ui_alias=mounted`. The running
+  process maps `/run/tv-auth/ui-bin/tv-auth-ui`, carries
+  `User::Pkg::org.tvauth.ui`, and used 25–31 MB RSS.
+- **Exec prompt:** Deny returned `denied/user_denied`; Allow once returned a
+  root `id` and did not persist; Always allow persisted a grant and later
+  executions ran without a prompt.
+- **Package prompts:** install rendered name/id/version/type/size, signature
+  badge and privileges; Deny left nothing installed, Install returned
+  `status: ok` and created the Home row; uninstall rendered **REMOVE PACKAGE**
+  and removed the package with `backend=was`.
+- **Toasts and manager:** the execution toast appeared at 696×147 +1176+48 in
+  the top notification layer with `TOP` accepted; the manager listed both
+  grants, the toast-mode toggle changed `every` → `first`, and **Revoke**
+  removed the selected grant.
+- **Protection:** an ordinary package's `pkg.install` of `org.tvauth.ui` was
+  denied with `manifest_forbidden`; `pkg.uninstall` was denied with
+  `protected_package`; no prompt was shown and the UI stayed installed.
+- **Cold boot (boot ID `48ee2d01…`):** `tv-authd` restarted from
+  `/opt/tv-auth/tv-authd`, logged `ui_alias=mounted`, recreated the read-only
+  `/run` mount and symlink, kept the `org.tvauth.ui` Home row, loaded the Vetro
+  grant, and Vetro resumed executing without a prompt. The UI launched and
+  rendered the manager post-boot.
+- **Rollback:** `out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet-signed.tpk`
+  (Partner profile) restores the managed UI; the previous daemon is at
+  `/opt/tv-auth/tv-authd.m4-20261108`.

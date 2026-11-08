@@ -1,6 +1,6 @@
 # `tv-authd`: a small SuperSU-like root broker for Samsung Tizen TVs
 
-*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. All M4 acceptance checks, including cold boot, are complete. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
+*Status: M0 platform spikes, M1 headless broker, M2 approval UI, M3 Vetro cutover, and the per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. All M4 acceptance checks, including cold boot, are complete. The approval UI was migrated to the native Rust/EFL `type="capp"` build through the validated `/run` alias on 2026-11-08; prompts, package install/uninstall, toasts, manager actions, the root-only UI-package guard, and cold boot all passed. Initial target: the S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-1720.7` documented in this repository.*
 
 ## 1. Summary
 
@@ -28,7 +28,7 @@ The main components are:
 
 Rust remains the choice for the privileged daemon: it can be built as a static ARMv7 binary and run from `/run` with systemd, as validated on the target.
 
-The approval UI cannot use a custom native ELF packaged in `/opt/usr/apps`: UEP prevents launchpad from executing unsigned native binaries from writable app storage, even when the TPK itself has valid author/distributor signatures. The UI must therefore be a managed Tizen .NET application (`netcoreapp3.1`, `type="dotnet"`), which runs through Samsung's signed apphost. Its small C# layer calls the required EFL functions directly; this path was installed, launched, and displayed above YouTube on the target.
+A custom native ELF cannot be executed directly from `/opt/usr/apps`: UEP blocks it even when the TPK itself has valid author/distributor signatures. The production UI is nonetheless a native Rust/EFL `type="capp"` package. `tv-authd` bind-mounts the installed binary at `/run/tv-auth/ui-bin/tv-auth-ui` (outside UEP's `/opt:/tmp:/var:/home` scope) and replaces the packaged `bin/tv-auth-ui` with a symlink to that mount. Launchpad then opens the `/run` file and UEP skips verification. A 2026-11-08 TV spike with a harmless EFL package validated the mapping and SMACK identity. The managed `.NET` UI remains as a rollback path and historical evidence.
 
 ## 2. Goals and non-goals
 
@@ -268,15 +268,19 @@ If an app chooses “Always allow” on its first request, later commands run wi
 
 ## 7. Approval UI
 
-Write the approval UI as a small **managed Tizen .NET application** (`.NET Core 3.1`, `type="dotnet"` in the TPK manifest). Do not put Wayland/EFL code in the root daemon and do not run the UI as root.
+Write the approval UI as a small **native Tizen `type="capp"` Rust/EFL application** (`ui/rust`). Do not put Wayland/EFL code in the root daemon and do not run the UI as root.
 
-### Why the native ELF path was rejected
+### Why a directly packaged native ELF fails
 
-The first UI spike was a Rust executable cross-linked against the TV's soft-float EFL libraries. The TPK installed successfully, but launchpad never mapped the executable: only `launchpad-loader` appeared in the process maps and the app entry point never ran. UEP blocks unsigned native ELF execution from writable app storage even when the TPK has valid author and distributor signatures.
+The first UI spike was a Rust executable cross-linked against the TV's soft-float EFL libraries. The TPK installed successfully, but launchpad never mapped the executable: only `launchpad-loader` appeared in the process maps and the app entry point never ran. UEP blocks native ELF execution from `/opt`, `/tmp`, `/var`, and `/home` even when the TPK has valid author and distributor signatures.
 
-System native apps work because they live on the read-only rootfs. A custom native approval app would therefore require UEP signing/bypass or a root-staged read-only-view workaround, neither of which is acceptable for the normal installed UI. The Rust UI source remains as negative-path evidence; it is not the production direction.
+### The `/run` alias path
 
-### Validated managed path
+The kernel verifier calls `d_path()` on the opened file and skips verification when the path resolves through a mount outside that set. `tv-authd` therefore bind-mounts the installed UI ELF read-only at `/run/tv-auth/ui-bin/tv-auth-ui` in PID 1's mount namespace, keeps the real bytes in `bin/tv-auth-ui.real`, and replaces `bin/tv-auth-ui` with a symlink to the `/run` path. The package, SMACK domain (`User::Pkg::org.tvauth.ui`), AUL entry, and Samsung Home row are unchanged. `daemon/src/ui_alias.rs` re-establishes the mount and symlink idempotently at startup and after a root install/upgrade of the UI.
+
+The 2026-11-08 spike (`org.tvauth.spike.popup`) confirmed the mechanism on the TV: without the alias only launchpad mapped; with it, `/proc/<pid>/maps` contained `/run/tv-auth/spike-popup-bin/efl-popup`, the process kept `User::Pkg::org.tvauth.spike.popup`, and the EFL window displayed. The test package and mounts were removed afterwards.
+
+### Previous managed path (rollback)
 
 A managed .NET assembly has no custom native ELF. Tizen's signed `dotnet-launcher` loads it while UEP remains enforced. On the target, the managed UI package:
 
@@ -307,12 +311,29 @@ disconnect, launcher failure, stale nonce, or malformed decision as a denial. Do
 not modify `/opt/dbspace/.syspopup.db` or depend on Samsung's alert-syspopup
 package.
 
-M2 UI status: implemented, signed, installed, and TV-validated. The final
-managed DLL is 34,816 bytes; the unsigned TPK is 16,535 bytes and the signed TPK
-is 24,073 bytes. Notification level TOP was accepted. `input_keyevent` was used
-to verify RETURN activation, Right/Left focus movement, and BACK handling without
-a physical remote. The manager view renders grants after roughly two seconds, so
-test scripts must wait for the grants response before sending keys.
+Managed UI status (rollback path): implemented, signed, installed, and
+TV-validated. It renders grants after roughly two seconds because of CoreCLR
+startup, and uses ~50 MB RSS. The native Rust UI replaces it: the cross-build is
+`476,888` bytes (soft-float ARMv7), the unsigned TPK is ~`258 KB`, and it
+links only the EFL/application libraries. A smoke build packaged as
+`org.tvauth.spike.ui` installed through the daemon's `rootcli` (`backend=was`,
+re-signed), launched from a `/run` alias, rendered the manager at 1920x1080 with
+TOP notification level, and used 16–30 MB RSS.
+
+On 2026-11-08 the live `org.tvauth.ui` package was replaced with this native
+build (daemon `86a7bcee…`, installed TPK `0b71a21f…`, binary `a1f996fa…`). The
+daemon logged `ui_alias=mounted`; the process mapped
+`/run/tv-auth/ui-bin/tv-auth-ui` with `User::Pkg::org.tvauth.ui` and 25–31 MB
+RSS. Deny/Once/Always, package install/uninstall prompts, the 696×147 execution
+toast in the top notification layer, manager toast-mode cycling and Revoke,
+and the root-only UI-package guard all passed. A cold boot (boot ID
+`48ee2d01…`) recreated the alias, kept the Home row and Vetro grant, and Vetro
+resumed executing without a prompt. The previous daemon is backed up at
+`/opt/tv-auth/tv-authd.m4-20261108`; the Partner-signed managed TPK remains as a
+rollback artifact.
+
+`input_keyevent` was used to verify RETURN activation, Right/Left focus
+movement, and BACK handling without a physical remote.
 
 Fallback if notification priority/key-grab fails for a developer-signed app:
 

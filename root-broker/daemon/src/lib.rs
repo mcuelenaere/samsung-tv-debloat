@@ -12,6 +12,7 @@ pub mod pkgstage;
 pub mod protocol;
 pub mod server;
 pub mod trust;
+pub mod ui_alias;
 pub mod wasinstall;
 
 pub use approval::{
@@ -21,3 +22,4 @@ pub use grants::GrantStore;
 pub use identity::PeerIdentity;
 pub use logger::Logger;
 pub use server::{handle_connection, Broker, PackageConfig, ServerConfig, DEFAULT_INSTALLED_ROOTS};
+pub use ui_alias::{UiAliasConfig, UiAliasOutcome};

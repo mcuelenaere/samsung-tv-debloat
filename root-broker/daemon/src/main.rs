@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, pkglist, pkgsign, pkgstage, trust, wasinstall, ApprovalConfig, ApprovalManager,
-    Broker, GrantStore, Logger, PackageConfig, ServerConfig,
+    identity, pkglist, pkgsign, pkgstage, trust, ui_alias, wasinstall, ApprovalConfig,
+    ApprovalManager, Broker, GrantStore, Logger, PackageConfig, ServerConfig, UiAliasConfig,
 };
 
 struct Args {
@@ -131,6 +131,17 @@ fn run(args: Args) -> io::Result<()> {
     ));
 
     prepare_socket_directory(&args.socket)?;
+    if let Some(alias) = &args.server.ui_alias {
+        // The native UI is a normal package under `/opt`, which UEP refuses
+        // to map. Stage it through `/run` before any prompt can launch it.
+        if let Some(pkgid) = args.server.ui_package() {
+            match ui_alias::ensure(alias, pkgid) {
+                Ok(outcome) => logger.log(&format!("ui_alias={outcome}"))?,
+                // A missing .NET UI or a not-yet-migrated package is normal.
+                Err(error) => logger.log(&format!("ui_alias_failed={error}"))?,
+            }
+        }
+    }
     remove_stale_socket(&args.socket)?;
     let listener = UnixListener::bind(&args.socket)?;
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o660))?;
@@ -231,6 +242,8 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut ui_package = "org.tvauth.ui".to_owned();
     let mut ui_uid = 5001_u32;
     let mut ui_app_id: Option<String> = None;
+    let mut ui_exec = ui_alias::DEFAULT_EXEC_NAME.to_owned();
+    let mut ui_alias_dir = PathBuf::from(ui_alias::DEFAULT_ALIAS_DIR);
     let mut app_launcher = PathBuf::from("/usr/bin/app_launcher");
     let mut prompt_timeout_ms = 60_000_u64;
     let mut ui_launch_timeout_ms = 10_000_u64;
@@ -260,6 +273,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             Long("ui-package") => ui_package = value(&mut parser, "ui-package")?,
             Long("ui-uid") => ui_uid = value(&mut parser, "ui-uid")?,
             Long("ui-app-id") => ui_app_id = Some(value(&mut parser, "ui-app-id")?),
+            Long("ui-exec") => ui_exec = value(&mut parser, "ui-exec")?,
+            Long("ui-alias-dir") => ui_alias_dir = path(&mut parser)?,
             Long("app-launcher") => app_launcher = path(&mut parser)?,
             Long("prompt-timeout-ms") => {
                 prompt_timeout_ms = value(&mut parser, "prompt-timeout-ms")?
@@ -301,6 +316,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --ui-package PKGID           approval UI package (default org.tvauth.ui)\n\
                      --ui-uid UID                 approval UI uid (default 5001)\n\
                      --ui-app-id APPID            app_launcher id (default: --ui-package)\n\
+                     --ui-exec NAME               native UI exec (default tv-auth-ui)\n\
+                     --ui-alias-dir PATH          UEP-exempt UI mount (default /run/tv-auth/ui-bin)\n\
                      --app-launcher PATH          app launcher (default /usr/bin/app_launcher)\n\
                      --prompt-timeout-ms MS       decision timeout (default 60000)\n\
                      --ui-launch-timeout-ms MS    UI connect timeout (default 10000)\n\
@@ -328,6 +345,14 @@ fn parse_args() -> Result<Option<Args>, String> {
 
     if !identity::is_valid_package_id(&ui_package) {
         return Err("--ui-package must be a valid package id".into());
+    }
+    if ui_exec.is_empty()
+        || ui_exec.contains('/')
+        || ui_exec.contains('\0')
+        || ui_exec == "."
+        || ui_exec == ".."
+    {
+        return Err("--ui-exec must be a plain file name".into());
     }
     if max_connections == 0
         || prompt_timeout_ms == 0
@@ -400,6 +425,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         ui_uid,
         approval_wait_timeout: approval.approval_wait_timeout(),
         packages: packages.clone(),
+        ui_alias: Some(UiAliasConfig::new(ui_exec, ui_alias_dir)),
     };
 
     Ok(Some(Args {

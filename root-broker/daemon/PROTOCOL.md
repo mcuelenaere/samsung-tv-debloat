@@ -46,6 +46,12 @@ The UI package and UID are daemon settings (`--ui-package`, `--ui-uid`). Missing
 unexpected, or non-package labels fail closed; UID 0 with any other label is
 also refused.
 
+Only the **root** role may install, upgrade, or remove the approval UI's own
+package (`--ui-package`, default `org.tvauth.ui`). Ordinary packages receive
+`denied`/`manifest_forbidden` for an install and `denied`/`protected_package`
+for an uninstall. This prevents a package signed with the same on-device author
+key from replacing the consent UI.
+
 ## `exec`
 
 Request:

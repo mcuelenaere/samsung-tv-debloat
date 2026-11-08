@@ -39,6 +39,12 @@ copy_as /usr/lib/libelementary.so.1.25.1 libelementary.so \
     4cc002554bf81679f726c48d3e07a9cfa5c6d3880226d5988125b5ebe737d722
 copy_as /usr/lib/libevas.so.1.25.1 libevas.so \
     c03f352e860b78fed4fcd2690003d4db96cf77a412d3df98f239ba2c545d2585
+# Ecore's timer integrates the broker poll with the EFL main loop;
+# ecore_wl2 selects the Wayland notification window type.
+copy_as /usr/lib/libecore.so.1.25.1 libecore.so \
+    49727cc58a8f15ab472ae84ef14700a5fb4741099dd4fddb12e32e8f9c3c8758
+copy_as /usr/lib/libecore_wl2.so.1.25.1 libecore_wl2.so \
+    304b5ca9f60c6b7b0d27b36a5c0b26199e600b4087ee49128d2152ff693954f2
 
 printf 'Collected minimal sysroot from %s (%s)\n' "$HOST" "$actual_target"
 find "$DEST" -maxdepth 1 -type f -print0 | sort -z | xargs -0 shasum -a 256

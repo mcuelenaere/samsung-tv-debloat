@@ -1,9 +1,17 @@
 # EFL approval-popup spike
 
-**Outcome (2026-11-05): the native Rust ELF is not viable as an installed TV app
-under UEP, but the managed .NET/EFL equivalent is validated on-device.** The
-managed popup installed, launched through AUL, set notification TOP, appeared
-over YouTube, and dismissed with OK/RETURN.
+**Outcome (2026-11-08): a native Rust ELF is viable through a `/run` bind-mount
+alias, but not when launchpad opens it directly from `/opt`.** The original
+2026-11-05 result (direct packaging blocked by UEP) still holds and is preserved
+below. On 2026-11-08 the same signed TPK was installed, its `bin/efl-popup` was
+replaced by a symlink to a read-only bind mount at
+`/run/tv-auth/spike-popup-bin/efl-popup`, and `app_launcher -s
+org.tvauth.spike.popup` then mapped the custom ELF and displayed the window.
+Production uses this path in `daemon/src/ui_alias.rs` and `ui/rust/`.
+
+The managed .NET/EFL equivalent was previously validated on-device: it
+installed, launched through AUL, set notification TOP, appeared over YouTube, and
+dismissed with OK/RETURN.
 
 This document preserves both the native cross-link work and the UEP result. The
 production approval UI should use the managed implementation in `dotnet/`; the
@@ -291,6 +299,43 @@ through Tizen Studio did not change the binary or lift UEP.
 This makes a custom native approval UI unsuitable unless the project takes on a
 UEP bypass or partner/platform signing path, both outside the desired design.
 
+### UEP `/run` alias result (2026-11-08)
+
+A second run kept the same signed TPK but staged the executable through a
+mount outside UEP's path scope:
+
+```sh
+mkdir -p /run/tv-auth/spike-popup-bin
+touch /run/tv-auth/spike-popup-bin/efl-popup
+nsenter -t 1 -m -- /bin/mount --bind \
+    /opt/usr/apps/org.tvauth.spike.popup/bin/efl-popup \
+    /run/tv-auth/spike-popup-bin/efl-popup
+mv /opt/usr/apps/org.tvauth.spike.popup/bin/efl-popup \
+   /opt/usr/apps/org.tvauth.spike.popup/bin/efl-popup.real
+ln -s /run/tv-auth/spike-popup-bin/efl-popup \
+      /opt/usr/apps/org.tvauth.spike.popup/bin/efl-popup
+/usr/bin/app_launcher -s org.tvauth.spike.popup
+```
+
+Observed, with the correct package label and no UEP denial:
+
+```text
+pid 20629 label User::Pkg::org.tvauth.spike.popup
+00466000-004ad000 r-xp ... /run/tv-auth/spike-popup-bin/efl-popup
+004bd000-004bf000 r--p ... /run/tv-auth/spike-popup-bin/efl-popup
+004bf000-004c0000 rw-p ... /run/tv-auth/spike-popup-bin/efl-popup
+VmRSS: ~22.6 MB
+```
+
+Before the alias, the same launch produced a process whose maps contained only
+`launchpad-loader` and `liblaunchpad`; the ELF entry point never ran. The spike
+package, symlink, bind mount, and `/run` directory were removed afterwards.
+`build-tpk.sh` packages the binary for this test without certificate material.
+For this minimal manifest, install a Partner-signed copy with
+`pkgcmd -i -t tpk`; the daemon's `wascmd` path timed out because the spike has
+no Home icon (`nodisplay="true"`, no `<icon>`). The production Rust UI manifest
+has both, and `rootcli install tpk` succeeded for it (`backend=was`).
+
 ## Managed .NET/EFL UI
 
 The working implementation is `dotnet/Program.cs`, built with .NET Core 3.1 and
@@ -336,9 +381,9 @@ temporary log were removed afterwards.
 These are future instructions, not actions performed by this spike. Obtain
 explicit authorization before installing or launching anything on the TV.
 
-1. **ABI/link proof.** Complete for the native path locally and for the managed
-   path on-device. The native ELF itself is rejected by UEP and is no longer a
-   production candidate.
+1. **ABI/link proof.** Complete for the native path locally; the `/run` alias
+   run on 2026-11-08 also proved the loader/UEP path on-device. Direct `/opt`
+   execution remains blocked.
 2. **Package validation.** Complete for the managed `org.tvauth.spike.popupdotnet`
    package: signed TPK installed with the Public certificate and public
    `window.priority.set` privilege.

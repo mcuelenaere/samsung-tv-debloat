@@ -17,6 +17,7 @@ use crate::protocol::{
     MAX_REQUEST_BYTES,
 };
 use crate::trust::{self, TrustPaths};
+use crate::ui_alias::{self, UiAliasConfig};
 use crate::wasinstall::{self, WasConfig, WasError};
 use rustix::io::Errno;
 use rustix::net::RecvFlags;
@@ -131,6 +132,8 @@ pub struct ServerConfig {
     pub approval_wait_timeout: Duration,
     /// Present when package installation is enabled.
     pub packages: Option<PackageConfig>,
+    /// Native UI staging under `/run` (UEP bypass); `None` disables it.
+    pub ui_alias: Option<UiAliasConfig>,
 }
 
 impl Default for ServerConfig {
@@ -143,6 +146,7 @@ impl Default for ServerConfig {
             ui_uid: 5001,
             approval_wait_timeout: Duration::from_secs(300),
             packages: None,
+            ui_alias: None,
         }
     }
 }
@@ -150,6 +154,33 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn is_ui(&self, identity: &PeerIdentity) -> bool {
         identity.label == self.ui_label && identity.uid == self.ui_uid
+    }
+
+    /// The approval UI's package id, derived from its SMACK label.
+    pub fn ui_package(&self) -> Option<&str> {
+        package_from_label(&self.ui_label)
+    }
+}
+
+/// Installing or removing the approval UI itself is a root-only operation.
+/// Once the UI is signed with the on-device CA, an ordinary package could
+/// otherwise pass Tizen's same-author check and replace or remove it.
+fn is_protected_ui_package(config: &ServerConfig, pkgid: &str) -> bool {
+    config.ui_package() == Some(pkgid)
+}
+
+/// Re-stage the native UI after a root install/upgrade. Failures are logged
+/// only: the package is installed and the next daemon start retries.
+fn refresh_ui_alias(broker: &Arc<Broker>, config: &ServerConfig, pkgid: &str) {
+    if !is_protected_ui_package(config, pkgid) {
+        return;
+    }
+    let Some(alias) = &config.ui_alias else {
+        return;
+    };
+    match ui_alias::ensure(alias, pkgid) {
+        Ok(outcome) => log(broker, &format!("pkgid={pkgid} ui_alias={outcome}")),
+        Err(error) => log(broker, &format!("pkgid={pkgid} ui_alias_failed={error}")),
     }
 }
 
@@ -922,6 +953,29 @@ fn handle_install(
         }
     };
 
+    // The approval UI is signed with the on-device CA. Without this check an
+    // ordinary package could replace it with its own build (the author now
+    // matches) or remove it, then impersonate the consent prompt.
+    if prompt && is_protected_ui_package(config, &meta.pkgid) {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.install pkgid={} denied=protected_package",
+                identity.label, request.id, meta.pkgid
+            ),
+        );
+        send(
+            writer,
+            &Response::error_with_detail(
+                &request.id,
+                "denied",
+                "manifest_forbidden",
+                Some("the approval UI package can only be installed by root".into()),
+            ),
+        )?;
+        return Ok(());
+    }
+
     // The pkgmgr database is authoritative; a leftover app directory after an
     // uninstall must not turn this into an "upgrade" (which would also trip the
     // author check against stale signature files).
@@ -1165,6 +1219,22 @@ fn handle_install(
         }
     }
 
+    // An upgrade may overwrite `bin/<exec>` in place. Put the packaged file
+    // back first so the installer cannot write through the `/run` symlink.
+    if is_protected_ui_package(config, &install_meta.pkgid) {
+        if let Some(alias) = &config.ui_alias {
+            if let Err(error) = ui_alias::restore(alias, &install_meta.pkgid) {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} ui_alias_restore_failed={error}",
+                        identity.label, request.id, install_meta.pkgid
+                    ),
+                );
+            }
+        }
+    }
+
     let install_result = install_package(
         packages,
         &install_meta.pkgid,
@@ -1186,6 +1256,7 @@ fn handle_install(
                     backend
                 ),
             );
+            refresh_ui_alias(broker, config, &install_meta.pkgid);
             if !prompt {
                 notify_package_operation(
                     broker,
@@ -1209,6 +1280,9 @@ fn handle_install(
             )?;
         }
         Err((detail, log_tail)) => {
+            // The pre-install restore unmounted the old UI; put it back so the
+            // existing package stays launchable after a failed upgrade.
+            refresh_ui_alias(broker, config, &install_meta.pkgid);
             log(
                 broker,
                 &format!(
@@ -1266,6 +1340,25 @@ fn handle_uninstall(
         )?;
         return Ok(());
     };
+    if prompt && is_protected_ui_package(config, &request.pkgid) {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.uninstall pkgid={} denied=protected_package",
+                identity.label, request.id, request.pkgid
+            ),
+        );
+        send(
+            writer,
+            &Response::error_with_detail(
+                &request.id,
+                "denied",
+                "protected_package",
+                Some("the approval UI package can only be removed by root".into()),
+            ),
+        )?;
+        return Ok(());
+    }
     if pkgmeta::is_reserved_pkgid(&request.pkgid) {
         log(
             broker,
@@ -1813,6 +1906,7 @@ mod tests {
             ui_uid: 5001,
             approval_wait_timeout: Duration::from_secs(3),
             packages: None,
+            ui_alias: None,
         };
         Fixture {
             _directory: directory,
@@ -2498,6 +2592,42 @@ mod tests {
         let response = client.read();
         assert_eq!(response["status"], "denied");
         assert_eq!(response["error"], "invalid_path");
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn ordinary_packages_cannot_install_or_remove_the_ui() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let home = fixture._directory.path().join("home/owner");
+        let source = home.join("org.tvauth.ui-0.1.0.wgt");
+        write_wgt(&source, "org.tvauth.ui");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "manifest_forbidden");
+        assert!(response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("approval UI package"));
+
+        client.send(json!({
+            "version": 2,
+            "id": "uninst-1",
+            "method": "pkg.uninstall",
+            "pkgid": "org.tvauth.ui",
+            "timeout_ms": 5000
+        }));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "protected_package");
+
         drop(client);
         handle.join().unwrap().unwrap();
     }
