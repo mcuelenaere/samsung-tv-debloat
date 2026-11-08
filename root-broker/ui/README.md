@@ -1,9 +1,10 @@
 # tv-auth approval and grant-manager UI
 
-This is the M2 managed Tizen .NET UI for `tv-authd`. It has two jobs:
+This is the M2 managed Tizen .NET UI for `tv-authd`. It has three jobs:
 
 1. show the daemon-generated approval prompt when an application requests root;
-2. list and revoke persistent **Always allow** grants.
+2. list and revoke persistent **Always allow** grants;
+3. show a small toast when an **Always allow** app runs a root command.
 
 The UI is a normal UID-5001 package with the exact SMACK label
 `User::Pkg::org.tvauth.ui`. It never runs as root and has no network privilege.
@@ -40,6 +41,19 @@ When an app without a persistent grant connects, the daemon launches
 RETURN activates the focused button. BACK denies the pending prompt (it does not
 silently dismiss the request). Arrow-key focus movement uses Elementary's normal
 focus handling and must be re-verified on the TV for the three-button layout.
+
+### Execution toast
+
+When a granted app executes, the daemon sends a coalesced `ui.notice` (see
+`daemon/PROTOCOL.md` for the throttling), launching the UI if needed with
+`"launch": "notice"` in the hello response. In that case the full-screen window
+is never shown and BACK is not grabbed. Instead a separate notification window
+in the top-right corner (focus-skip, `wm.policy.win.user.geometry`) shows up to
+three apps, e.g. "**org.example.app** ran 3 commands as root" plus the last
+command's first line. Further notices merge into the visible toast and restart
+its 8 s timer. Afterwards the UI stays connected but invisible for 30 s so the
+next notice does not need another launch, then exits. Opening the app icon while
+it lingers shows the manager.
 
 ### Grant manager
 
@@ -142,6 +156,14 @@ Completed on 2026-11-05 with `org.tvauth.ui` installed and the M2 daemon running
 
 Pause/resume and repeat-key hardening remain M4 items.
 
+The execution toast was validated on the TV on 2026-11-08 with Vetro holding an
+Always-allow grant: Vetro bursts of ~20 execs/s were coalesced into single
+notices; the notice-only launch never showed the full-screen window; `-topvwins`
+reported the toast at 696x147+1176+48 in `NOTIFICATION_TOP`, unfocused; it hid
+after 8 s, the UI exited 30 s later, and the next notice relaunched it; the
+toast was confirmed visually. Tizen 6.5 exports focus skip as
+`elm_win_prop_focus_skip_set` (not `elm_win_focus_skip_set`).
+
 The card layout was re-verified on the TV on 2026-11-05 using
 `enlightenment_info -dump_screen`. The window reported 1920x1080; the scrim
 dims the home screen to about 45% brightness; the prompt rendered with a live
@@ -150,6 +172,10 @@ XF86Back` closed the manager. No monospace font is installed, so the command
 falls back to the proportional UI font.
 
 ## Known limitations
+
+- `enlightenment_info -dump_screen` does not capture the execution toast, so
+  check it with `-topvwins` (geometry/visibility) or by eye. Size/timing
+  constants are at the top of `Program.cs`.
 
 - No friendly package-name resolution: the UI shows the exact package ID and
   SMACK label, which are the security-relevant identities. A display-name lookup

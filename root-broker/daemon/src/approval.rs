@@ -1,6 +1,8 @@
 use crate::grants::GrantStore;
 use crate::logger::Logger;
-use crate::protocol::{write_json, write_response, Decision, PromptMessage, Response};
+use crate::protocol::{
+    write_json, write_response, Decision, NoticeEntry, NoticeMessage, PromptMessage, Response,
+};
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -19,6 +21,15 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 /// next queued prompt).
 const MAX_PROMPT_UI_RETRIES: u8 = 2;
 
+/// While granted apps keep executing, the gap between notices doubles up to
+/// this multiple of `notice_interval`; one quiet interval resets it.
+const NOTICE_BACKOFF_MAX: u32 = 30;
+
+/// Distinct packages coalesced into one notice.
+// ponytail: further packages are dropped until the next flush; only
+// user-approved grants reach this path, so 16 concurrently active is plenty.
+const MAX_NOTICE_PACKAGES: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct ApprovalConfig {
     pub ui_app_id: String,
@@ -28,6 +39,8 @@ pub struct ApprovalConfig {
     pub launch_cooldown: Duration,
     pub prompt_queue_max: usize,
     pub max_launch_attempts: usize,
+    /// Minimum gap between `ui.notice` messages for granted executions.
+    pub notice_interval: Duration,
 }
 
 impl ApprovalConfig {
@@ -59,12 +72,18 @@ enum ApprovalCommand {
     Request(ApprovalRequest),
     AttachUi {
         token: u64,
+        hello_id: String,
         label: String,
         writer: Arc<Mutex<UnixStream>>,
         control: UnixStream,
     },
     DetachUi {
         token: u64,
+    },
+    /// A granted package executed a command without prompting.
+    Notice {
+        label: String,
+        command: String,
     },
     /// The requester went away: drop its queued or active prompt.
     Cancel {
@@ -99,19 +118,27 @@ impl ApprovalHandle {
         self.send(ApprovalCommand::Cancel { ticket })
     }
 
+    /// Register a UI connection; the manager answers `hello_id` itself so the
+    /// response is ordered before any prompt or notice.
     pub fn attach_ui(
         &self,
         token: u64,
+        hello_id: String,
         label: String,
         writer: Arc<Mutex<UnixStream>>,
         control: UnixStream,
     ) -> io::Result<()> {
         self.send(ApprovalCommand::AttachUi {
             token,
+            hello_id,
             label,
             writer,
             control,
         })
+    }
+
+    pub fn notice(&self, label: String, command: String) -> io::Result<()> {
+        self.send(ApprovalCommand::Notice { label, command })
     }
 
     pub fn detach_ui(&self, token: u64) -> io::Result<()> {
@@ -206,6 +233,8 @@ struct LaunchState {
     attempts: usize,
     last_attempt: Option<Instant>,
     awaiting_until: Option<Instant>,
+    /// The outstanding launch was only for notices (no prompt was waiting).
+    for_notice: bool,
 }
 
 struct Manager {
@@ -216,6 +245,9 @@ struct Manager {
     queue: VecDeque<PendingRequest>,
     active: Option<ActivePrompt>,
     launch: LaunchState,
+    notices: Vec<NoticeEntry>,
+    notice_next_at: Instant,
+    notice_gap: Duration,
 }
 
 impl Manager {
@@ -224,6 +256,7 @@ impl Manager {
         grants: Arc<Mutex<GrantStore>>,
         logger: Option<Arc<Logger>>,
     ) -> Self {
+        let notice_gap = config.notice_interval;
         Self {
             config,
             grants,
@@ -232,6 +265,9 @@ impl Manager {
             queue: VecDeque::new(),
             active: None,
             launch: LaunchState::default(),
+            notices: Vec::new(),
+            notice_next_at: Instant::now(),
+            notice_gap,
         }
     }
 
@@ -244,6 +280,7 @@ impl Manager {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             self.tick();
+            self.flush_notices();
         }
         if let Some(active) = self.active.take() {
             self.reply(
@@ -260,10 +297,12 @@ impl Manager {
             ApprovalCommand::Request(request) => self.handle_request(request),
             ApprovalCommand::AttachUi {
                 token,
+                hello_id,
                 label,
                 writer,
                 control,
-            } => self.handle_attach(token, label, writer, control),
+            } => self.handle_attach(token, &hello_id, label, writer, control),
+            ApprovalCommand::Notice { label, command } => self.handle_notice(&label, &command),
             ApprovalCommand::DetachUi { token } => self.handle_detach(token),
             ApprovalCommand::Cancel { ticket } => self.handle_cancel(ticket),
             ApprovalCommand::Decision {
@@ -308,10 +347,27 @@ impl Manager {
     fn handle_attach(
         &mut self,
         token: u64,
+        hello_id: &str,
         label: String,
         writer: Arc<Mutex<UnixStream>>,
         control: UnixStream,
     ) {
+        let notice_only = self.launch.for_notice
+            && self.launch.attempts > 0
+            && self.active.is_none()
+            && self.queue.is_empty();
+        let hello = Response::hello(hello_id, notice_only.then_some("notice"));
+        let written = {
+            let mut stream = writer.lock().unwrap_or_else(|error| error.into_inner());
+            write_response(&mut *stream, &hello)
+        };
+        if let Err(error) = written {
+            self.log(&format!(
+                "ui_hello_write_failed token={token} error={error}"
+            ));
+            let _ = control.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         if let Some(old) = self.ui.take() {
             let _ = old.control.shutdown(std::net::Shutdown::Both);
             self.log(&format!(
@@ -332,8 +388,62 @@ impl Manager {
             control,
         });
         self.launch = LaunchState::default();
-        self.log(&format!("ui_attached token={token} label={label}"));
+        self.log(&format!(
+            "ui_attached token={token} label={label} notice_only={notice_only}"
+        ));
         self.ensure_prompt();
+        self.flush_notices();
+    }
+
+    fn handle_notice(&mut self, label: &str, command: &str) {
+        if let Some(entry) = self.notices.iter_mut().find(|entry| entry.label == label) {
+            entry.count = entry.count.saturating_add(1);
+            entry.set_command(command);
+        } else if self.notices.len() < MAX_NOTICE_PACKAGES {
+            self.notices.push(NoticeEntry::new(label, command));
+        }
+        self.flush_notices();
+    }
+
+    /// Leading-edge throttle: the first granted exec after a quiet period is
+    /// shown at once; executions during the following gap are coalesced per
+    /// package into one update. The gap doubles while activity continues.
+    fn flush_notices(&mut self) {
+        let now = Instant::now();
+        if now < self.notice_next_at {
+            return;
+        }
+        if self.notices.is_empty() {
+            self.notice_gap = self.config.notice_interval;
+            return;
+        }
+        // A prompt owns the screen; hold notices until it is decided.
+        if self.active.is_some() || !self.queue.is_empty() {
+            return;
+        }
+        let Some(ui) = &self.ui else {
+            self.launch_if_needed();
+            return;
+        };
+        let notices = std::mem::take(&mut self.notices);
+        let summary = notices
+            .iter()
+            .map(|entry| format!("{}x{}", entry.label, entry.count))
+            .collect::<Vec<_>>()
+            .join(",");
+        let written = {
+            let mut writer = ui.writer.lock().unwrap_or_else(|error| error.into_inner());
+            write_json(&mut *writer, &NoticeMessage::new(notices))
+        };
+        match written {
+            Ok(()) => self.log(&format!("notice_sent {summary}")),
+            Err(error) => self.log(&format!(
+                "notice_write_failed error={error} dropped={summary}"
+            )),
+        }
+        self.notice_next_at = now + self.notice_gap;
+        self.notice_gap =
+            (self.notice_gap * 2).min(self.config.notice_interval * NOTICE_BACKOFF_MAX);
     }
 
     fn handle_detach(&mut self, token: u64) {
@@ -360,9 +470,8 @@ impl Manager {
             }
         }
         self.launch = LaunchState {
-            attempts: 0,
             last_attempt: Some(Instant::now()),
-            awaiting_until: None,
+            ..LaunchState::default()
         };
     }
 
@@ -462,7 +571,9 @@ impl Manager {
             return;
         }
         if self.queue.is_empty() {
-            self.launch = LaunchState::default();
+            if self.notices.is_empty() {
+                self.launch = LaunchState::default();
+            }
             return;
         }
         if self.ui.is_none() {
@@ -562,6 +673,7 @@ impl Manager {
                 self.launch.attempts += 1;
                 self.launch.last_attempt = Some(now);
                 self.launch.awaiting_until = Some(now + self.config.ui_launch_timeout);
+                self.launch.for_notice = self.queue.is_empty();
                 self.log(&format!(
                     "ui_launch_attempt={} app={}",
                     self.launch.attempts, self.config.ui_app_id
@@ -628,6 +740,12 @@ impl Manager {
                 pending.request,
                 ApprovalResult::Denied("ui_unavailable", error),
             );
+        }
+        if !self.notices.is_empty() {
+            // Best effort: never retry a broken UI for every granted exec.
+            self.notices.clear();
+            self.notice_next_at = Instant::now() + self.notice_gap;
+            self.log(&format!("notices_dropped={error}"));
         }
         self.launch = LaunchState::default();
     }
@@ -701,6 +819,7 @@ mod tests {
             launch_cooldown: Duration::from_millis(10),
             prompt_queue_max: 4,
             max_launch_attempts: 1,
+            notice_interval: Duration::from_millis(300),
         }
     }
 
@@ -711,9 +830,19 @@ mod tests {
         let writer = Arc::new(Mutex::new(daemon));
         manager
             .handle()
-            .attach_ui(token, "User::Pkg::org.tvauth.ui".into(), writer, control)
+            .attach_ui(
+                token,
+                "hello-1".into(),
+                "User::Pkg::org.tvauth.ui".into(),
+                writer,
+                control,
+            )
             .unwrap();
-        BufReader::new(ui)
+        let mut reader = BufReader::new(ui);
+        let hello = read_json(&mut reader);
+        assert_eq!(hello["id"], "hello-1");
+        assert_eq!(hello["status"], "ok");
+        reader
     }
 
     fn request(label: &str) -> (ApprovalRequest, mpsc::Receiver<ApprovalResult>) {
@@ -971,5 +1100,89 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(2)),
             Ok(ApprovalResult::Denied("ui_unavailable", "ui_launch_failed"))
         );
+    }
+
+    #[test]
+    fn notices_are_immediate_then_coalesced() {
+        let fixture = fixture(test_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let handle = fixture.manager.handle();
+        let one = "User::Pkg::org.example.one";
+        let two = "User::Pkg::org.example.two";
+
+        handle.notice(one.into(), "first".into()).unwrap();
+        let notice = read_json(&mut ui);
+        assert_eq!(notice["type"], "ui.notice");
+        assert_eq!(notice["notices"][0]["package"], "org.example.one");
+        assert_eq!(notice["notices"][0]["count"], 1);
+
+        // Within the gap: nothing is sent until it elapses, then one update.
+        let started = Instant::now();
+        for command in ["second", "third"] {
+            handle.notice(one.into(), command.into()).unwrap();
+        }
+        handle.notice(two.into(), "other\u{202e}".into()).unwrap();
+        let batch = read_json(&mut ui);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let notices = batch["notices"].as_array().unwrap();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0]["count"], 2);
+        assert_eq!(notices[0]["command"], "third");
+        assert_eq!(notices[1]["package"], "org.example.two");
+        assert_eq!(notices[1]["command"], "other\u{FFFD}");
+    }
+
+    #[test]
+    fn notices_wait_for_an_active_prompt() {
+        let fixture = fixture(test_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let handle = fixture.manager.handle();
+        let (ask, _reply) = request("User::Pkg::org.example.asking");
+        handle.request(ask).unwrap();
+        let prompt = read_json(&mut ui);
+        handle
+            .notice("User::Pkg::org.example.granted".into(), "id".into())
+            .unwrap();
+        handle
+            .decide(
+                1,
+                "decision-1".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Deny,
+            )
+            .unwrap();
+        assert_eq!(read_json(&mut ui)["status"], "ok");
+        assert_eq!(read_json(&mut ui)["type"], "ui.notice");
+    }
+
+    #[test]
+    fn notice_only_launch_is_flagged_in_hello() {
+        let mut config = test_config();
+        config.app_launcher = PathBuf::from("/usr/bin/true");
+        config.ui_launch_timeout = Duration::from_secs(5);
+        let fixture = fixture(config);
+        let handle = fixture.manager.handle();
+        handle
+            .notice("User::Pkg::org.example.granted".into(), "id".into())
+            .unwrap();
+        // Let the manager spawn the (dummy) launcher before the UI attaches.
+        thread::sleep(Duration::from_millis(100));
+
+        let (ui, daemon) = UnixStream::pair().unwrap();
+        ui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let control = daemon.try_clone().unwrap();
+        handle
+            .attach_ui(
+                1,
+                "hello-1".into(),
+                "User::Pkg::org.tvauth.ui".into(),
+                Arc::new(Mutex::new(daemon)),
+                control,
+            )
+            .unwrap();
+        let mut ui = BufReader::new(ui);
+        assert_eq!(read_json(&mut ui)["launch"], "notice");
+        assert_eq!(read_json(&mut ui)["type"], "ui.notice");
     }
 }

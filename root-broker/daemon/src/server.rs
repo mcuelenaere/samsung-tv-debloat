@@ -236,14 +236,13 @@ fn handle_ui_request(
             let control = control.try_clone()?;
             match broker.approvals.attach_ui(
                 token,
+                request.id.clone(),
                 identity.label.clone(),
                 Arc::clone(writer),
                 control,
             ) {
-                Ok(()) => {
-                    *ui_token = Some(token);
-                    send(writer, &Response::ok(&request.id))?;
-                }
+                // The approval manager writes the hello response.
+                Ok(()) => *ui_token = Some(token),
                 Err(error) => {
                     log(
                         broker,
@@ -399,7 +398,13 @@ fn handle_exec(
         .unwrap_or_else(|error| error.into_inner())
         .is_allowed(&identity.label);
 
-    if !allowed {
+    if allowed {
+        // Granted packages run without asking, but the user still sees a
+        // (coalesced) notice of who ran what.
+        let _ = broker
+            .approvals
+            .notice(identity.label.clone(), request.command.clone());
+    } else {
         log(
             broker,
             &format!(
@@ -606,6 +611,7 @@ mod tests {
             launch_cooldown: Duration::from_millis(10),
             prompt_queue_max: 4,
             max_launch_attempts: 1,
+            notice_interval: Duration::from_secs(10),
         };
         let manager = ApprovalManager::start(approval_config, Arc::clone(&grants), None).unwrap();
         let broker = Arc::new(Broker::new(grants, manager.handle(), None));
@@ -861,6 +867,30 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(reader);
         trickle.join().unwrap();
+    }
+
+    #[test]
+    fn granted_exec_notifies_the_ui() {
+        let fixture = fixture();
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 1, "id": "hello-1", "method": "ui.hello"}));
+        let hello = ui.read();
+        assert_eq!(hello["status"], "ok");
+        assert!(hello.get("launch").is_none());
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
+        client.send(exec_request("exec-1", "printf hello"));
+        // The command result itself is platform dependent (setsid on Linux).
+        let _ = client.read();
+        let notice = ui.read();
+        assert_eq!(notice["type"], "ui.notice");
+        assert_eq!(notice["notices"][0]["package"], "org.example.allowed");
+        assert_eq!(notice["notices"][0]["command"], "printf hello");
+        assert_eq!(notice["notices"][0]["count"], 1);
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
     }
 
     #[test]

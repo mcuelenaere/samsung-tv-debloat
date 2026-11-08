@@ -39,6 +39,18 @@ namespace TvAuthUi
         private const int CardWidth = 1200;
         private const int CardPadding = 56;
 
+        // Execution-notice toast (top-right). Tune these on the TV.
+        private static readonly IntPtr ToastName = Interop.Ansi("org.tvauth.ui.toast");
+        private const int ToastWidth = 640;
+        private const int ToastPadding = 28;
+        private const int ToastMargin = 48;
+        private const int ToastShownSeconds = 8;
+        private const int ToastMaxApps = 3;
+        private const int ToastCommandChars = 52;
+        // Stay connected (invisible) this long after a toast so the next notice
+        // does not pay for another app launch.
+        private const int IdleLingerSeconds = 30;
+
         private static IntPtr window;
         private static IntPtr accentBar;
         private static IntPtr countdownLabel;
@@ -58,6 +70,18 @@ namespace TvAuthUi
         private static bool exiting;
         private static bool backGrabbed;
         private static bool connected;
+        private static int screenW = 1920;
+        private static int screenH = 1080;
+        private static bool mainShown;
+        private static bool helloSeen;
+        private static int appControlCount;
+        private static bool exitWhenIdle;
+        private static DateTime? lingerUntil;
+
+        private static IntPtr toastWindow;
+        private static IntPtr toastLabel;
+        private static DateTime? toastHideAt;
+        private static readonly List<NoticeInfo> toastEntries = new List<NoticeInfo>();
 
         private static int Main(string[] args)
         {
@@ -103,7 +127,7 @@ namespace TvAuthUi
             SetWindowTitle("Root access");
             Interop.elm_win_modal_set(window, 1);
             Interop.elm_win_floating_mode_set(window, 1);
-            SetHighestNotificationLevel();
+            SetHighestNotificationLevel(window);
 
             Interop.evas_object_smart_callback_add(window, DeleteRequest, BackDelegate, IntPtr.Zero);
             Interop.eext_object_event_callback_add(
@@ -111,9 +135,6 @@ namespace TvAuthUi
                 Interop.EextCallbackBack,
                 BackDelegate,
                 IntPtr.Zero);
-            backGrabbed = Interop.eext_win_keygrab_set(window, BackKey) == 1;
-            if (!backGrabbed)
-                Log("XF86Back keygrab failed");
 
             // Full-screen dimmed scrim with a solid, centered card. The old
             // elm_bg is transparent in the TV theme, so the home screen showed
@@ -162,6 +183,8 @@ namespace TvAuthUi
 
             broker = new BrokerClient(UiQueue, Log);
             broker.PromptReceived += OnPrompt;
+            broker.NoticeReceived += OnNotice;
+            broker.HelloAccepted += OnHelloAccepted;
             broker.GrantsReceived += OnGrants;
             broker.DecisionFinished += OnDecisionFinished;
             broker.RevokeFinished += OnRevokeFinished;
@@ -169,20 +192,44 @@ namespace TvAuthUi
             broker.StatusMessage += OnStatusMessage;
             broker.Start();
 
-            Interop.elm_win_screen_size_get(window, out _, out _, out var screenW, out var screenH);
-            if (screenW <= 0 || screenH <= 0)
+            Interop.elm_win_screen_size_get(window, out _, out _, out var w, out var h);
+            if (w > 0 && h > 0)
             {
-                screenW = 1920;
-                screenH = 1080;
+                screenW = w;
+                screenH = h;
             }
             Log("screen " + screenW + "x" + screenH);
             Interop.evas_object_resize(window, screenW, screenH);
             Interop.elm_win_center(window, 1, 1);
+            // The full-screen window stays hidden until we know why we were
+            // launched: a notice-only launch must not cover the screen.
+            return true;
+        }
+
+        private static void ShowMain()
+        {
+            if (mainShown || window == IntPtr.Zero)
+                return;
+            mainShown = true;
+            backGrabbed = Interop.eext_win_keygrab_set(window, BackKey) == 1;
+            if (!backGrabbed)
+                Log("XF86Back keygrab failed");
             Interop.evas_object_show(window);
             Interop.elm_win_raise(window);
             Interop.elm_win_activate(window);
             Log("window shown/raised/activated");
-            return true;
+        }
+
+        private static void HideMain()
+        {
+            if (!mainShown)
+                return;
+            mainShown = false;
+            if (backGrabbed)
+                Interop.eext_win_keygrab_unset(window, BackKey);
+            backGrabbed = false;
+            Interop.evas_object_hide(window);
+            Log("window hidden");
         }
 
         private static void AppTerminate(IntPtr userData)
@@ -195,6 +242,9 @@ namespace TvAuthUi
                 Interop.eext_win_keygrab_unset(window, BackKey);
             Interop.evas_object_del(window);
             window = IntPtr.Zero;
+            if (toastWindow != IntPtr.Zero)
+                Interop.evas_object_del(toastWindow);
+            toastWindow = IntPtr.Zero;
         }
 
         private static void AppPause(IntPtr userData)
@@ -207,6 +257,18 @@ namespace TvAuthUi
 
         private static void AppControl(IntPtr appControl, IntPtr userData)
         {
+            // The first call is our own launch. A later one means the icon was
+            // opened while we were running invisibly for a toast.
+            if (appControlCount++ == 0)
+                return;
+            Log("relaunched while running");
+            if (currentPrompt == null)
+            {
+                exitAt = null;
+                managerMessage = null;
+                RenderManager();
+            }
+            ShowMain();
         }
 
         private static bool OnTimer(IntPtr data)
@@ -248,11 +310,25 @@ namespace TvAuthUi
             if (exitAt.HasValue && DateTime.UtcNow >= exitAt.Value)
             {
                 exitAt = null;
-                if (!exiting)
-                {
-                    exiting = true;
-                    Interop.ui_app_exit();
-                }
+                HideMain();
+                exitWhenIdle = true;
+            }
+
+            if (toastHideAt.HasValue && DateTime.UtcNow >= toastHideAt.Value)
+            {
+                toastHideAt = null;
+                toastEntries.Clear();
+                Interop.evas_object_hide(toastWindow);
+                exitWhenIdle = true;
+                lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+            }
+
+            if (exitWhenIdle
+                && !mainShown
+                && !toastHideAt.HasValue
+                && (!lingerUntil.HasValue || DateTime.UtcNow >= lingerUntil.Value))
+            {
+                ExitNow();
                 return false;
             }
             return true;
@@ -318,10 +394,136 @@ namespace TvAuthUi
             }
             currentPrompt = prompt;
             exitAt = null;
+            ShowMain();
             promptExpiresAt = DateTime.UtcNow.AddMilliseconds(
                 prompt.TimeoutMs > 0 ? prompt.TimeoutMs : 60_000);
             Log("prompt received package=" + prompt.Package + " request=" + prompt.RequestId);
             RenderPrompt();
+        }
+
+        private static void OnHelloAccepted(string launch)
+        {
+            // Only the first registration decides; a reconnect after a broker
+            // restart must not pop the manager over whatever the user watches.
+            if (helloSeen)
+                return;
+            helloSeen = true;
+            if (launch == "notice")
+            {
+                Log("notice-only launch");
+                exitWhenIdle = true;
+                lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+                return;
+            }
+            ShowMain();
+        }
+
+        private static void OnNotice(List<NoticeInfo> notices)
+        {
+            foreach (var notice in notices)
+            {
+                var entry = toastEntries.FirstOrDefault(e => e.Label == notice.Label);
+                if (entry == null)
+                {
+                    toastEntries.Add(notice);
+                }
+                else
+                {
+                    entry.Count += notice.Count;
+                    entry.Command = notice.Command;
+                    entry.CommandTruncated = notice.CommandTruncated;
+                }
+                Log("notice package=" + notice.Package + " count=" + notice.Count);
+            }
+            if (toastEntries.Count == 0)
+                return;
+            ShowToast();
+        }
+
+        private static void ShowToast()
+        {
+            if (toastWindow == IntPtr.Zero && !CreateToastWindow())
+                return;
+            SetText(toastLabel, ToastMarkup());
+            // Elementary grows the window to the content's minimum height.
+            Interop.evas_object_resize(toastWindow, ToastWidth + 2 * ToastPadding, 1);
+            Interop.evas_object_move(toastWindow,
+                screenW - ToastWidth - 2 * ToastPadding - ToastMargin, ToastMargin);
+            Interop.evas_object_show(toastWindow);
+            toastHideAt = DateTime.UtcNow.AddSeconds(ToastShownSeconds);
+        }
+
+        private static bool CreateToastWindow()
+        {
+            toastWindow = Interop.elm_win_add(IntPtr.Zero, ToastName, Interop.ElmWinNotification);
+            if (toastWindow == IntPtr.Zero)
+            {
+                Log("toast elm_win_add failed");
+                return false;
+            }
+            var waylandWindow = Interop.elm_win_wl_window_get(toastWindow);
+            if (waylandWindow != IntPtr.Zero)
+                Interop.ecore_wl2_window_type_set(waylandWindow, Interop.EcoreWl2WindowTypeNotification);
+            // Never take focus or keys from the app the user is watching.
+            Interop.elm_win_prop_focus_skip_set(toastWindow, 1);
+            SetHighestNotificationLevel(toastWindow);
+            var hint = Interop.Ansi("wm.policy.win.user.geometry");
+            var one = Interop.Ansi("1");
+            try { Interop.elm_win_aux_hint_add(toastWindow, hint, one); }
+            finally
+            {
+                Marshal.FreeHGlobal(hint);
+                Marshal.FreeHGlobal(one);
+            }
+
+            var card = Panel(toastWindow, ColorCard, ToastPadding, ToastPadding - 6, out var box);
+            Interop.elm_win_resize_object_add(toastWindow, card);
+            var bar = CreateRect(box, ColorDanger, 255);
+            Interop.evas_object_size_hint_min_set(bar, ToastWidth, 6);
+            AddToBox(box, bar);
+            toastLabel = AddToBox(box, CreateLabel(box, ""));
+            Interop.elm_label_line_wrap_set(toastLabel, 0);
+            return true;
+        }
+
+        private static string ToastMarkup()
+        {
+            var builder = new StringBuilder(
+                "<font_size=18><b><color=#e5484d>ROOT COMMAND</color></b></font_size>");
+            foreach (var entry in toastEntries.Take(ToastMaxApps))
+            {
+                var what = entry.Count == 1
+                    ? " ran a command as root"
+                    : " ran " + entry.Count + " commands as root";
+                builder.Append("<br/><font_size=26><b>")
+                    .Append(Escape(Shorten(entry.Package, 36)))
+                    .Append("</b>").Append(what).Append("</font_size><br/>")
+                    .Append(Small("$ " + Shorten(entry.Command, ToastCommandChars, entry.CommandTruncated),
+                        "#8a8f99"));
+            }
+            if (toastEntries.Count > ToastMaxApps)
+            {
+                var more = toastEntries.Count - ToastMaxApps;
+                builder.Append("<br/>").Append(Small(
+                    "+ " + more + (more == 1 ? " more app" : " more apps"), "#8a8f99"));
+            }
+            return builder.ToString();
+        }
+
+        /// <summary>First line only, cut to fit the toast; marks any cut with an ellipsis.</summary>
+        private static string Shorten(string text, int max, bool alreadyTruncated = false)
+        {
+            text = text ?? "";
+            var newline = text.IndexOf('\n');
+            var cut = alreadyTruncated || newline >= 0;
+            if (newline >= 0)
+                text = text.Substring(0, newline).TrimEnd('\r');
+            if (text.Length > max)
+            {
+                text = text.Substring(0, max - 1);
+                cut = true;
+            }
+            return cut ? text + "\u2026" : text;
         }
 
         private static void OnGrants(List<GrantInfo> list)
@@ -372,6 +574,9 @@ namespace TvAuthUi
         private static void OnConnectionChanged(bool isConnected)
         {
             connected = isConnected;
+            // Could not even register: show the manager with the error.
+            if (!isConnected && !helloSeen)
+                ShowMain();
             if (!isConnected)
             {
                 if (currentPrompt != null)
@@ -725,7 +930,7 @@ namespace TvAuthUi
                 .Replace(">", "&gt;");
         }
 
-        private static void SetHighestNotificationLevel()
+        private static void SetHighestNotificationLevel(IntPtr target)
         {
             var levels = new[]
             {
@@ -736,7 +941,7 @@ namespace TvAuthUi
             };
             foreach (var item in levels)
             {
-                var result = Interop.efl_util_set_notification_window_level(window, item.Item2);
+                var result = Interop.efl_util_set_notification_window_level(target, item.Item2);
                 if (result == 0)
                 {
                     Log("notification level " + item.Item1 + " accepted");

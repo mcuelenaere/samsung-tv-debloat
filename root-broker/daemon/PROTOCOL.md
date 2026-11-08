@@ -48,7 +48,8 @@ Request:
 }
 ```
 
-If the caller has a persistent grant, it executes immediately. Otherwise the
+If the caller has a persistent grant, it executes immediately and the daemon
+queues a `ui.notice` for the UI (see below). Otherwise the
 daemon sends a prompt to the registered UI and waits for a decision. The
 connection blocks until the prompt is answered, cancelled, or times out.
 
@@ -128,6 +129,11 @@ Response:
 {"version": 1, "id": "hello-1", "status": "ok"}
 ```
 
+When the daemon launched the UI only to show execution notices (no prompt was
+waiting), the response carries `"launch": "notice"`. The UI should then stay
+out of the way: no full-screen window, no key grabs. The approval manager writes
+this response, so it always precedes any `ui.prompt` or `ui.notice`.
+
 Errors: `not_ui` (wrong label or UID), `already_registered` (this connection
 already registered), `ui_register_failed`.
 
@@ -160,6 +166,42 @@ are truncated with `command_truncated: true`.
 
 Only one prompt is visible globally. The UI should treat the prompt as a request
 for **full root access**, not as approval for a specific high-level action.
+
+## `ui.notice` (daemon to UI)
+
+Granted packages run without prompting, but the user still sees who ran root
+commands. After `ui.hello`, the daemon may send:
+
+```json
+{
+  "version": 1,
+  "type": "ui.notice",
+  "notices": [
+    {
+      "label": "User::Pkg::org.example.app",
+      "package": "org.example.app",
+      "count": 3,
+      "command": "id",
+      "command_truncated": false
+    }
+  ]
+}
+```
+
+Each entry coalesces one package's executions since the previous notice;
+`command` is a display copy (sanitized like `ui.prompt`, at most 256 bytes) of
+the most recent one. Throttling keeps the screen quiet:
+
+- the first granted exec after a quiet period is sent at once;
+- later execs are held and sent as one message when the gap (10 s) elapses;
+- while execs keep coming, the gap doubles up to 5 min; one full quiet gap
+  resets it;
+- notices are held while a prompt is active or queued;
+- if no UI is connected the daemon launches it (same launcher and attempt
+  limits as prompts); if that fails the notices are dropped. Notices never
+  delay or block execution.
+
+Execs that were just approved by a prompt do not produce a notice.
 
 ## `ui.decision`
 

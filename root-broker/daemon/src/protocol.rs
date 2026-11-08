@@ -9,6 +9,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 pub const MAX_PROMPT_COMMAND_BYTES: usize = 4096;
+pub const MAX_NOTICE_COMMAND_BYTES: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,6 +193,10 @@ pub struct Response {
     pub revoked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `ui.hello` only: `"notice"` when the daemon launched the UI just to
+    /// show execution notices, so it should stay out of the way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch: Option<&'static str>,
 }
 
 impl Response {
@@ -208,6 +213,7 @@ impl Response {
             grants: None,
             revoked: None,
             error: None,
+            launch: None,
         }
     }
 
@@ -230,6 +236,7 @@ impl Response {
             grants: None,
             revoked: None,
             error: None,
+            launch: None,
         }
     }
 
@@ -249,6 +256,60 @@ impl Response {
         let mut response = Self::base(id, "ok");
         response.revoked = Some(revoked);
         response
+    }
+
+    pub fn hello(id: &str, launch: Option<&'static str>) -> Self {
+        let mut response = Self::base(id, "ok");
+        response.launch = launch;
+        response
+    }
+}
+
+/// One package's granted executions since the last `ui.notice`.
+#[derive(Debug, Clone, Serialize)]
+pub struct NoticeEntry {
+    pub label: String,
+    pub package: String,
+    pub count: u32,
+    /// Display copy of the most recent command.
+    pub command: String,
+    pub command_truncated: bool,
+}
+
+impl NoticeEntry {
+    pub fn new(label: &str, command: &str) -> Self {
+        let mut entry = Self {
+            label: label.to_owned(),
+            package: package_from_label(label).unwrap_or(label).to_owned(),
+            count: 1,
+            command: String::new(),
+            command_truncated: false,
+        };
+        entry.set_command(command);
+        entry
+    }
+
+    pub fn set_command(&mut self, command: &str) {
+        (self.command, self.command_truncated) =
+            truncate_text(&display_safe(command), MAX_NOTICE_COMMAND_BYTES);
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoticeMessage {
+    pub version: u32,
+    #[serde(rename = "type")]
+    pub message_type: &'static str,
+    pub notices: Vec<NoticeEntry>,
+}
+
+impl NoticeMessage {
+    pub fn new(notices: Vec<NoticeEntry>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            message_type: "ui.notice",
+            notices,
+        }
     }
 }
 

@@ -85,6 +85,12 @@ namespace TvAuthUi
         public static extern void elm_win_alpha_set(IntPtr obj, byte alpha);
 
         [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void elm_win_prop_focus_skip_set(IntPtr obj, byte skip);
+
+        [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int elm_win_aux_hint_add(IntPtr obj, IntPtr hint, IntPtr value);
+
+        [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern void elm_win_screen_size_get(IntPtr obj, out int x, out int y, out int w, out int h);
 
         [DllImport("libelementary.so.1", CallingConvention = CallingConvention.Cdecl)]
@@ -146,6 +152,12 @@ namespace TvAuthUi
 
         [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern void evas_object_show(IntPtr obj);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void evas_object_hide(IntPtr obj);
+
+        [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void evas_object_move(IntPtr obj, int x, int y);
 
         [DllImport("libevas.so.1", CallingConvention = CallingConvention.Cdecl)]
         public static extern void evas_object_del(IntPtr obj);

@@ -22,6 +22,15 @@ namespace TvAuthUi
         public int TimeoutMs;
     }
 
+    internal sealed class NoticeInfo
+    {
+        public string Label;
+        public string Package;
+        public int Count;
+        public string Command;
+        public bool CommandTruncated;
+    }
+
     internal sealed class GrantInfo
     {
         public string Label;
@@ -48,6 +57,9 @@ namespace TvAuthUi
         private long lastGrantsId;
 
         public event Action<PromptInfo> PromptReceived;
+        public event Action<List<NoticeInfo>> NoticeReceived;
+        /// <summary>ui.hello accepted; the argument is the daemon's launch reason ("" or "notice").</summary>
+        public event Action<string> HelloAccepted;
         public event Action<List<GrantInfo>> GrantsReceived;
         public event Action<bool, string> DecisionFinished;
         public event Action<bool, string> RevokeFinished;
@@ -255,6 +267,28 @@ namespace TvAuthUi
                     return;
                 }
 
+                if (root.TryGetProperty("type", out type)
+                    && type.ValueKind == JsonValueKind.String
+                    && type.GetString() == "ui.notice"
+                    && root.TryGetProperty("notices", out var notices)
+                    && notices.ValueKind == JsonValueKind.Array)
+                {
+                    var list = new List<NoticeInfo>();
+                    foreach (var item in notices.EnumerateArray())
+                    {
+                        list.Add(new NoticeInfo
+                        {
+                            Label = GetString(item, "label"),
+                            Package = GetString(item, "package"),
+                            Count = Math.Max(1, GetInt(item, "count")),
+                            Command = GetString(item, "command"),
+                            CommandTruncated = GetBool(item, "command_truncated")
+                        });
+                    }
+                    dispatch.Enqueue(() => NoticeReceived?.Invoke(list));
+                    return;
+                }
+
                 var id = GetString(root, "id");
                 var status = GetString(root, "status");
                 var error = GetString(root, "error");
@@ -290,8 +324,15 @@ namespace TvAuthUi
                 if (id == "hello-" + Interlocked.Read(ref lastHelloId))
                 {
                     if (status != "ok")
+                    {
                         dispatch.Enqueue(() => StatusMessage?.Invoke(
                             "tv-authd rejected this UI (" + error + ")."));
+                    }
+                    else
+                    {
+                        var launch = GetString(root, "launch");
+                        dispatch.Enqueue(() => HelloAccepted?.Invoke(launch));
+                    }
                     return;
                 }
 
