@@ -12,6 +12,7 @@ pub mod pkgstage;
 pub mod protocol;
 pub mod server;
 pub mod trust;
+pub mod wasinstall;
 
 pub use approval::{
     ApprovalConfig, ApprovalHandle, ApprovalManager, ApprovalRequest, ApprovalResult,

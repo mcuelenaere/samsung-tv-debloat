@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, pkglist, pkgsign, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker,
-    GrantStore, Logger, PackageConfig, ServerConfig,
+    identity, pkglist, pkgsign, pkgstage, trust, wasinstall, ApprovalConfig, ApprovalManager,
+    Broker, GrantStore, Logger, PackageConfig, ServerConfig,
 };
 
 struct Args {
@@ -90,6 +90,19 @@ fn run(args: Args) -> io::Result<()> {
             packages.pkgcmd.display(),
             packages.db.database.display()
         ))?;
+        if let Some(was) = &packages.was {
+            match wasinstall::prepare_etc(was) {
+                Ok(()) => logger.log(&format!(
+                    "was_ready wascmd={} etc_copy={}",
+                    was.wascmd.display(),
+                    was.etc_copy.display()
+                ))?,
+                Err(error) => {
+                    // Installs will fail with a clear error; keep exec working.
+                    logger.log(&format!("was_etc_failed={error}"))?;
+                }
+            }
+        }
         if let Some(paths) = &packages.trust {
             match trust::ensure_enrolled(paths) {
                 Ok(enrollment) => {
@@ -230,6 +243,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut pkgdb = PathBuf::from("/opt/dbspace/.pkgmgr_parser.db");
     let mut trust_root = Some(PathBuf::from(trust::DEFAULT_TRUST_ROOT));
     let mut package_support = true;
+    let mut was_enabled = true;
     let mut enroll_trust = false;
 
     let mut parser = lexopt::Parser::from_env();
@@ -268,6 +282,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             Long("trust-root") => trust_root = Some(path(&mut parser)?),
             Long("no-trust") => trust_root = None,
             Long("no-package-support") => package_support = false,
+            Long("no-was") => was_enabled = false,
             Long("enroll-trust") => enroll_trust = true,
             Long("help") | Short('h') => {
                 println!(
@@ -298,6 +313,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --trust-root PATH            trust material (default /opt/tv-auth/trust)\n\
                      --no-trust                   skip trust enrollment (development only)\n\
                      --no-package-support         serve exec only\n\
+                     --no-was                     use pkgcmd only (no Home registration)\n\
                      --enroll-trust               verify/repair trust bind mounts and exit",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -364,6 +380,10 @@ fn parse_args() -> Result<Option<Args>, String> {
         xmlsec1,
         trust: trust_paths,
         signing,
+        was: was_enabled.then(wasinstall::WasConfig::new),
+        home_db: PathBuf::from("/opt/dbspace/.webappservice.db"),
+        icon_root: PathBuf::from("/opt/share/webappservice/apps_icon/all"),
+        vconf: PathBuf::from("/usr/bin/vconf"),
         installed_roots: tv_authd::DEFAULT_INSTALLED_ROOTS
             .iter()
             .map(PathBuf::from)

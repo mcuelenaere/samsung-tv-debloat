@@ -4,13 +4,15 @@ Status: proposal, self-contained milestone numbering (M1–M3 below). Builds on
 the completed tv-authd broker and the signature-validation analysis of
 T-PTMDEUC (Tizen 6.5, armv7).
 
-M1–M3 are implemented and TV-validated for the TPK path: M1 covers protocol
+M1–M4 are implemented and TV-validated for the TPK path: M1 covers protocol
 v2, staging, manifest inspection, PID-1 trust enrollment, `pkg.install`, the
 package prompt, deny/timeout/policy paths, and cold-boot persistence; M2 adds
 `pkg.uninstall`, `pkg.list`, and the prompt-free uid-0 root role with package
 toasts; M3 adds on-device re-signing of unsigned and foreign-signed packages
-with two enrolled CAs. WGT installs and Samsung Home registration remain M4
-(§6.1/§13). The work is rebased onto `main` (M4 + `review-fixes`).
+with two enrolled CAs; M4 installs through `webappservice` so TPKs appear in
+Samsung Home and uninstalls clean them up (§18). WGT installation is blocked by
+this firmware for every backend `-4 Load archive info fail`. The work is
+rebased onto `main` (M4 + `review-fixes`).
 
 ## 1. Goal
 
@@ -238,7 +240,7 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>.<wgt\|tpk>` (ensure both `/opt/tv-auth` and `/opt/tv-auth/staging` have `0711` traversal perms, `0644` staged file, and preserved `.wgt`/`.tpk` extension so `webappservice` running as `owner` UID 5001 can copy it and infer package type without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
 | `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, main `appid` (`tizen_id`), version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
 | `pkgsign.rs` (new, M3) | in-daemon on-device re-signing after user approval (§7.3) |
-| `pkginstall.rs` (new) | M1: `trust::ensure_enrolled()`, `pkgcmd -i`/`-u` invocation, timeout, `key[end]` parsing, tail log. M4 replaces the backend with `webappservice` install/uninstall via `libwas_manager_api.so` (`was_install_webapp_with_translated_error_code` / `was_uninstall_webapp`) or `libsdbd_plugin_release.so` (`was_execution`) with UID 5001 session D-Bus env (see §6.1) |
+| `pkginstall.rs` (new) | M1: `pkgcmd -i`/`-u` invocation, timeout, `key[end]` parsing, tail log; retained as the fallback backend. M4 adds `wasinstall.rs` (stock `wascmd` under `unshare -m` with an `/etc` copy without `release`) for Home registration and WGT, with a `pkgcmd` + Home-cleanup fallback for `is_sdk_app` refusals (§18) |
 | `pkglist.rs` (new, M2) | `pkg.list` / uninstall metadata from `/opt/dbspace/.pkgmgr_parser.db` via one `sqlite3 -readonly` query; row parsing, user-vs-system classification, `main_app_id` |
 | `grants.rs` | no change (exec-only by design, §5.4) |
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
@@ -457,7 +459,7 @@ with explicit authorization, on the user's TV.
 | M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | **done (host):** 120 Linux tests, clippy/fmt clean, ARMv7 cross-build; uninstall/list protocol round-trips, root-role gating, notice kinds | **validated 2026-11-08:** app-role uninstall prompt, Deny and Remove, protected/unknown refusals, `pkg.list` from app and root roles, prompt-free root install/uninstall with `PACKAGE CHANGE` toasts |
 | M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | **done (host):** template/reference/signature-file unit tests, archive rewrite, author-mismatch refusal, 127 Linux tests, ARMv7 build | **validated 2026-11-08 (tpk):** foreign-signed tpk → approve → `re_signed: true` → installs; stripped Partner-signed upgrade → `author_mismatch_requires_reinstall`; two-CA domain rule verified. WGT install still blocked by `pkgcmd` (M4) |
-| M4 | WAS install/registration helper so WGT works and installs appear in Samsung Home | helper API/ABI check, DB row comparison with an SDB install | WGT installs and appears in "My apps"; TPK installed via broker appears in "My apps"; launch from Home |
+| M4 | WAS backend (`wascmd` under a private mount namespace) so installs appear in Samsung Home | **done (host):** `/etc` copy without `release`, wascmd invocation, pkgcmd+Home fallback, 130 Linux tests | **validated 2026-11-08 (tpk):** broker install creates the Home row/icon; broker uninstall (WAS and pkgcmd fallback) removes them. WGT still fails with `-4 Load archive info fail` through `pkgcmd`, `sdb install`, and `wascmd` (firmware limitation) |
 
 Out of scope (documented to avoid creep): delta updates, mount-installed
 (readonly) packages, RPM/rpk installs, restoring stock trust (manual
@@ -580,8 +582,10 @@ and extended that on the TV:
 
 Consequences for the design:
 
-1. `pkg.install` via `pkgcmd` is currently a **TPK-only** path on this firmware;
-   WGT needs a WAS-based backend (or the failure must be surfaced clearly).
+1. `pkg.install` is a **TPK-only** path on this firmware. M4's WAS backend
+   (§18) fixed Home registration but WGT still fails with `-4 Load archive info
+   fail` through `pkgcmd`, `sdb install`, and `wascmd`/`webappservice`, so the
+   restriction is in the firmware's package manager, not the backend.
 2. TPKs installed through the broker are not Home-visible unless a WAS
    registration step is added. They still run and can be launched with
    `app_launcher`.
@@ -829,3 +833,73 @@ Next options, in order of effort:
    of which is in the repo yet.
 3. Speak the SDB wire protocol to localhost `sdbd` and issue `vd_appinstall`
    (most work, but exactly what `sdb install` does).
+
+## 18. M4 implementation and TV validation (2026-11-08)
+
+**Chosen approach: the stock `wascmd` under a private mount namespace.** The
+retail-firmware guard is a single `stat("/etc/release")` at the top of
+`main`. Running `/usr/bin/wascmd` with a copy of `/etc` that lacks `release`
+bound over `/etc` inside `unshare -m` makes it run normally, with no helper
+binary and no C toolchain:
+
+```sh
+unshare -m -- /bin/sh -c 'mount --bind /run/tv-auth/etc-norelease /etc;     exec /usr/bin/wascmd -i <pkgid> -p <staged>'
+```
+
+Options 3 (a dynamically linked FFI helper) and 4 (a D-Bus client) from §17
+were not needed: `was_uninstall_webapp` has a multi-argument callback contract,
+and the D-Bus install method is asynchronous with a client-owned object.
+
+Code:
+
+- `daemon/src/wasinstall.rs` (new) — rebuilds `/run/tv-auth/etc-norelease`
+  (12 MiB copy, symlinks preserved, `release` omitted, mode 0700) before every
+  operation; runs `unshare -m -- sh -c 'mount --bind <copy> /etc; exec <wascmd>
+  …'` through `executor` with the request timeout; succeeds only on exit 0 plus
+  `install completed`/`uninstall completed` in the output.
+- `daemon/src/server.rs` — `install_package`/`uninstall_package` pick the WAS
+  backend when configured, else `pkgcmd`. Uninstall tries `wascmd -u` first
+  (which removes the Home tile) and falls back to `pkgcmd -u` plus
+  `clean_home_registration` (delete the `widgetinfo` row via `sqlite3`, remove
+  the cached icon, set `memory/was/app_change=1`) when `is_sdk_app` refuses.
+  `is_upgrade` now comes from the pkgmgr database rather than a leftover app
+  directory, which also keeps the M3 author check from reading stale files.
+- `daemon/src/main.rs` — `--no-was` (keep the `pkgcmd` backend); prepares the
+  `/etc` copy at startup and logs `was_ready`.
+- `daemon/src/pkginstall.rs` — `pkgcmd` remains as the fallback backend.
+
+Deployed: daemon 868,884 bytes, SHA-256
+`f77fec8e99889bb91dfda27fdddcab8c4978e1b0ff40f33a89ea5b095183d56d`.
+
+Validated on the target:
+
+- broker TPK install with re-signing: `result=signed files=7` then
+  `backend=was result=installed`; `/opt/dbspace/.webappservice.db` gained
+  `org.tvauth.pkgtest` with `app_featured=1, app_type=2, install_type=user,
+  is_display=1, install_state=3`, and the icon appeared under
+  `/opt/share/webappservice/apps_icon/all/org.tvauth.pkgtest/`;
+- broker uninstall: `backend=was result=uninstalled`, package, row, and icon
+  all gone;
+- fallback: a `pkgcmd`-installed package (with a manually inserted Home row)
+  uninstalled as `backend=pkgcmd+home`; the row and icon were removed;
+- WGT: a minimal hand-written WGT, a previously built test WGT, and a
+  repackaged copy of the installed Vetro WGT (renamed package) all fail with
+  `install failed[118004][-4:Operation not allowed:Load archive info fail]`
+  through `wascmd`. This matches the earlier `pkgcmd` and `sdb install`
+  results, so WGT cannot be sideloaded on this image.
+
+Bugs found and fixed:
+
+1. `wascmd -u` refuses packages that were not installed through the SDK path
+   (`is_sdk_app`); a `pkgcmd` + Home-cleanup fallback is required for the
+   packages installed by M1–M3.
+2. The upgrade heuristic used app directories, so a leftover
+   `/opt/usr/apps/<pkgid>` after uninstall made the next install look like an
+   upgrade and triggered the M3 author check against stale signature files.
+   `is_upgrade` now comes from `package_info`.
+3. `xmlsec1`/`wascmd` must run with a working directory or explicit absolute
+   paths; the namespace script uses absolute paths throughout.
+
+Known limitation: WGT packages are rejected by the firmware's package manager.
+The WAS backend is in place, so if a future firmware accepts WGT, the daemon
+needs no change.

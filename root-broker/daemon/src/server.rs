@@ -11,14 +11,17 @@ use crate::pkgstage::{self, StageConfig, StageError};
 use crate::protocol::{
     is_valid_request_id, parse_request, prompt_text, read_message, validate_decision,
     validate_exec, validate_install, validate_label, validate_uninstall, write_response,
-    ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind, PackageView,
-    ParseError, PromptKind, Request, Response, SignatureStatus, UninstallMeta, UninstallRequest,
-    MAX_PKGID_BYTES, MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES, MAX_REQUEST_BYTES,
+    ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind, PackageType,
+    PackageView, ParseError, PromptKind, Request, Response, SignatureStatus, UninstallMeta,
+    UninstallRequest, MAX_PKGID_BYTES, MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES,
+    MAX_REQUEST_BYTES,
 };
 use crate::trust::{self, TrustPaths};
+use crate::wasinstall::{self, WasConfig, WasError};
 use rustix::io::Errno;
 use rustix::net::RecvFlags;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::{self, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -45,6 +48,14 @@ pub struct PackageConfig {
     pub trust: Option<TrustPaths>,
     /// On-device re-signing keys; `None` leaves unsigned packages uninstallable.
     pub signing: Option<SigningKeys>,
+    /// Samsung Home / WGT backend (`wascmd` in a private mount namespace);
+    /// `None` falls back to `pkgcmd` with no Home registration.
+    pub was: Option<WasConfig>,
+    /// `webappservice` database and icon root, used to clean up Home entries
+    /// for packages that `wascmd` refuses to uninstall (`is_sdk_app`).
+    pub home_db: PathBuf,
+    pub icon_root: PathBuf,
+    pub vconf: PathBuf,
     /// Directories that indicate an already installed package.
     pub installed_roots: Vec<PathBuf>,
 }
@@ -58,6 +69,10 @@ impl PackageConfig {
             xmlsec1: PathBuf::from("/usr/bin/xmlsec1"),
             trust: Some(TrustPaths::new(trust::DEFAULT_TRUST_ROOT)),
             signing: None,
+            was: Some(WasConfig::new()),
+            home_db: PathBuf::from("/opt/dbspace/.webappservice.db"),
+            icon_root: PathBuf::from("/opt/share/webappservice/apps_icon/all"),
+            vconf: PathBuf::from("/usr/bin/vconf"),
             installed_roots: DEFAULT_INSTALLED_ROOTS.iter().map(PathBuf::from).collect(),
         }
     }
@@ -720,6 +735,13 @@ fn handle_exec(
     Ok(())
 }
 
+/// Backend log tail returned on success.
+type PackageLog = Vec<u8>;
+/// Failure detail plus the backend log tail.
+type PackageFailure = (String, Vec<u8>);
+/// Successful package operation: log tail and backend name.
+type PackageOutcome = (PackageLog, &'static str);
+
 enum ApprovalOutcome {
     Allowed,
     Denied(&'static str, &'static str),
@@ -900,7 +922,13 @@ fn handle_install(
         }
     };
 
-    let is_upgrade = pkginstall::is_installed(&meta.pkgid, &packages.installed_roots);
+    // The pkgmgr database is authoritative; a leftover app directory after an
+    // uninstall must not turn this into an "upgrade" (which would also trip the
+    // author check against stale signature files).
+    let is_upgrade = pkglist::get(&packages.db, &meta.pkgid, pkglist::QUERY_TIMEOUT_MS)
+        .ok()
+        .flatten()
+        .is_some();
     let install_meta = meta.into_install_meta(staged.size_bytes(), is_upgrade);
     // M3: unsigned and foreign-signed packages are re-signed on-device after
     // approval. Tizen refuses cross-author upgrades (-12), so an upgrade of a
@@ -1137,22 +1165,25 @@ fn handle_install(
         }
     }
 
-    match pkginstall::install(
-        &packages.pkgcmd,
+    let install_result = install_package(
+        packages,
+        &install_meta.pkgid,
         request.pkg_type,
         staged.path(),
         timeout_ms,
-    ) {
-        Ok(outcome) => {
+    );
+    match install_result {
+        Ok((log_tail, backend)) => {
             log(
                 broker,
                 &format!(
-                    "requester={} request={} pkgid={} version={} sha256={} result=installed",
+                    "requester={} request={} pkgid={} version={} sha256={} backend={} result=installed",
                     identity.label,
                     request.id,
                     install_meta.pkgid,
                     install_meta.pkg_version,
-                    staged.sha256()
+                    staged.sha256(),
+                    backend
                 ),
             );
             if !prompt {
@@ -1173,25 +1204,21 @@ fn handle_install(
                     &install_meta.pkgid,
                     &install_meta.pkg_version,
                     re_signed,
-                    &outcome.log_tail,
+                    &log_tail,
                 ),
             )?;
         }
-        Err(error) => {
+        Err((detail, log_tail)) => {
             log(
                 broker,
                 &format!(
-                    "requester={} request={} pkgid={} sha256={} result=install_failed detail={error}",
+                    "requester={} request={} pkgid={} sha256={} result=install_failed detail={detail}",
                     identity.label,
                     request.id,
                     install_meta.pkgid,
                     staged.sha256()
                 ),
             );
-            let (detail, log_tail) = match error {
-                InstallError::Spawn(error) => (format!("cannot run pkgcmd: {error}"), Vec::new()),
-                InstallError::Failed { detail, log_tail } => (detail, log_tail),
-            };
             let mut response =
                 Response::error_with_detail(&request.id, "error", "install_failed", Some(detail));
             response.pkgid = Some(install_meta.pkgid.clone());
@@ -1438,18 +1465,28 @@ fn handle_uninstall(
         }
     }
 
-    match pkginstall::uninstall(
-        &packages.pkgcmd,
-        pkg_type,
+    let appid = entry
+        .main_app_id
+        .clone()
+        .filter(|id| crate::identity::is_valid_package_id(id))
+        .unwrap_or_else(|| entry.pkgid.clone());
+    match uninstall_package(
+        packages,
         &uninstall_meta.pkgid,
+        &appid,
+        pkg_type,
         timeout_ms,
     ) {
-        Ok(outcome) => {
+        Ok((log_tail, backend)) => {
             log(
                 broker,
                 &format!(
-                    "requester={} request={} pkgid={} version={} result=uninstalled",
-                    identity.label, request.id, uninstall_meta.pkgid, uninstall_meta.pkg_version
+                    "requester={} request={} pkgid={} version={} backend={} result=uninstalled",
+                    identity.label,
+                    request.id,
+                    uninstall_meta.pkgid,
+                    uninstall_meta.pkg_version,
+                    backend
                 ),
             );
             if !prompt {
@@ -1462,21 +1499,17 @@ fn handle_uninstall(
             }
             send(
                 writer,
-                &Response::uninstall_ok(&request.id, &uninstall_meta.pkgid, &outcome.log_tail),
+                &Response::uninstall_ok(&request.id, &uninstall_meta.pkgid, &log_tail),
             )?;
         }
-        Err(error) => {
+        Err((detail, log_tail)) => {
             log(
                 broker,
                 &format!(
-                    "requester={} request={} pkgid={} result=uninstall_failed detail={error}",
+                    "requester={} request={} pkgid={} result=uninstall_failed detail={detail}",
                     identity.label, request.id, uninstall_meta.pkgid
                 ),
             );
-            let (detail, log_tail) = match error {
-                InstallError::Spawn(error) => (format!("cannot run pkgcmd: {error}"), Vec::new()),
-                InstallError::Failed { detail, log_tail } => (detail, log_tail),
-            };
             let mut response =
                 Response::error_with_detail(&request.id, "error", "uninstall_failed", Some(detail));
             response.pkgid = Some(uninstall_meta.pkgid.clone());
@@ -1574,6 +1607,110 @@ fn handle_list(
         }
     }
     Ok(())
+}
+
+/// Install through `webappservice` when configured (Home registration and
+/// WGT), else the stock `pkgcmd`.
+fn install_package(
+    packages: &PackageConfig,
+    pkgid: &str,
+    pkg_type: PackageType,
+    staged: &std::path::Path,
+    timeout_ms: u64,
+) -> Result<PackageOutcome, PackageFailure> {
+    if let Some(was) = &packages.was {
+        return wasinstall::install(was, pkgid, staged, timeout_ms)
+            .map(|outcome| (outcome.log_tail, "was"))
+            .map_err(was_failure);
+    }
+    pkginstall::install(&packages.pkgcmd, pkg_type, staged, timeout_ms)
+        .map(|outcome| (outcome.log_tail, "pkgcmd"))
+        .map_err(pkgcmd_failure)
+}
+
+fn was_failure(error: WasError) -> (String, Vec<u8>) {
+    match error {
+        WasError::Spawn(error) => (format!("cannot run unshare: {error}"), Vec::new()),
+        WasError::Etc(error) => (
+            format!("cannot prepare the /etc overlay: {error}"),
+            Vec::new(),
+        ),
+        WasError::Failed { detail, log_tail } => (detail, log_tail),
+    }
+}
+
+fn pkgcmd_failure(error: InstallError) -> (String, Vec<u8>) {
+    match error {
+        InstallError::Spawn(error) => (format!("cannot run pkgcmd: {error}"), Vec::new()),
+        InstallError::Failed { detail, log_tail } => (detail, log_tail),
+    }
+}
+
+/// Uninstall, preferring `webappservice` (which also removes the Samsung Home
+/// tile). `wascmd -u` refuses packages that were not installed through it
+/// (`is_sdk_app`), so fall back to `pkgcmd` plus an explicit Home cleanup.
+fn uninstall_package(
+    packages: &PackageConfig,
+    pkgid: &str,
+    appid: &str,
+    pkg_type: PackageType,
+    timeout_ms: u64,
+) -> Result<PackageOutcome, PackageFailure> {
+    let mut was_error = None;
+    if let Some(was) = &packages.was {
+        match wasinstall::uninstall(was, appid, timeout_ms) {
+            Ok(outcome) => return Ok((outcome.log_tail, "was")),
+            Err(error) => was_error = Some(error.to_string()),
+        }
+    }
+    match pkginstall::uninstall(&packages.pkgcmd, pkg_type, pkgid, timeout_ms) {
+        Ok(outcome) => {
+            if packages.was.is_some() {
+                clean_home_registration(packages, pkgid, appid);
+            }
+            Ok((
+                outcome.log_tail,
+                if packages.was.is_some() {
+                    "pkgcmd+home"
+                } else {
+                    "pkgcmd"
+                },
+            ))
+        }
+        Err(error) => {
+            let (detail, log_tail) = pkgcmd_failure(error);
+            let detail = match was_error {
+                Some(was) => format!("{was}; pkgcmd: {detail}"),
+                None => detail,
+            };
+            Err((detail, log_tail))
+        }
+    }
+}
+
+/// Remove a Samsung Home (widgetinfo) entry and cached icon for a package
+/// `wascmd` refused to uninstall.
+fn clean_home_registration(packages: &PackageConfig, pkgid: &str, appid: &str) {
+    if crate::identity::is_valid_package_id(pkgid) {
+        let sql = format!("DELETE FROM widgetinfo WHERE pkgname = '{pkgid}';");
+        let _ = executor::execute_argv(
+            &packages.db.sqlite3,
+            &[packages.home_db.as_os_str(), OsStr::new(&sql)],
+            10_000,
+        );
+    }
+    if crate::identity::is_valid_package_id(appid) {
+        let _ = std::fs::remove_dir_all(packages.icon_root.join(appid));
+    }
+    let _ = executor::execute_argv(
+        &packages.vconf,
+        &[
+            OsStr::new("set"),
+            OsStr::new("memory/was/app_change"),
+            OsStr::new("1"),
+        ],
+        10_000,
+    );
 }
 
 /// Toast for a prompt-free root package operation. Failures to queue it are
@@ -2108,19 +2245,26 @@ mod tests {
     }
 
     /// Wire package support into a fixture and return the source package path.
+    /// The fake package database starts empty (nothing is installed).
     fn with_packages(fixture: &mut Fixture, pkgcmd_body: &str) -> PathBuf {
-        with_packages_and_db(
-            fixture,
-            pkgcmd_body,
-            &package_row(
-                "org.example.app",
-                "wgt",
-                "1.0.0",
-                "org.example.app.Ui",
-                "Example",
-                true,
-            ),
+        with_packages_and_db(fixture, pkgcmd_body, "")
+    }
+
+    /// A database row for the fixture package, for tests that start with it
+    /// already installed.
+    fn installed_example_row() -> String {
+        package_row(
+            "org.example.app",
+            "wgt",
+            "1.0.0",
+            "org.example.app.Ui",
+            "Example",
+            true,
         )
+    }
+
+    fn with_installed_packages(fixture: &mut Fixture, pkgcmd_body: &str) -> PathBuf {
+        with_packages_and_db(fixture, pkgcmd_body, &installed_example_row())
     }
 
     fn with_packages_and_db(fixture: &mut Fixture, pkgcmd_body: &str, rows: &str) -> PathBuf {
@@ -2194,6 +2338,10 @@ mod tests {
                 distributor_cert: trust.join("user-distributor.pem"),
                 distributor_ca: trust.join("user-root-ca.pem"),
             }),
+            was: None,
+            home_db: directory.join("webappservice.db"),
+            icon_root: directory.join("apps_icon"),
+            vconf: directory.join("vconf"),
             installed_roots: Vec::new(),
         });
         source
@@ -2489,7 +2637,8 @@ mod tests {
             return;
         }
         let mut fixture = fixture();
-        let source = with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let source =
+            with_installed_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
         // Pretend the package is installed with a different author certificate.
         let apps = fixture._directory.path().join("installed");
         let installed = apps.join("org.example.app");
@@ -2531,6 +2680,10 @@ mod tests {
             xmlsec1: fixture._directory.path().join("xmlsec1"),
             trust: None,
             signing: None,
+            was: None,
+            home_db: fixture._directory.path().join("webappservice.db"),
+            icon_root: fixture._directory.path().join("apps_icon"),
+            vconf: fixture._directory.path().join("vconf"),
             installed_roots: Vec::new(),
         });
         let source = fixture._directory.path().join("org.example.app-1.0.0.wgt");
@@ -2540,6 +2693,167 @@ mod tests {
         let response = client.read();
         assert_eq!(response["status"], "error");
         assert_eq!(response["error"], "sign_failed");
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    /// Wire a fake WAS backend: `unshare` drops its flags, `mount` succeeds,
+    /// and `wascmd` runs the supplied body. Returns the wascmd argument log.
+    fn with_was(fixture: &mut Fixture, wascmd_body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = fixture._directory.path().join("was");
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = directory.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let unshare = script("unshare", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+        let mount = script("mount", "#!/bin/sh\nexit 0\n");
+        let wascmd_args = directory.join("wascmd-args");
+        let wascmd = script(
+            "wascmd",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{}",
+                wascmd_args.display(),
+                wascmd_body
+            ),
+        );
+        let etc = directory.join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), b"root:x:0:0").unwrap();
+        std::fs::write(etc.join("release"), b"").unwrap();
+
+        let packages = fixture.config.packages.as_mut().unwrap();
+        packages.was = Some(WasConfig {
+            wascmd,
+            unshare,
+            mount,
+            shell: PathBuf::from("/bin/sh"),
+            etc_source: etc,
+            etc_copy: directory.join("etc-copy"),
+        });
+        wascmd_args
+    }
+
+    #[test]
+    fn install_goes_through_wascmd_when_was_is_configured() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let source = with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let args = with_was(
+            &mut fixture,
+            "echo 'app_id[org.example.app] install completed'\n",
+        );
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+        let prompt = ui.read();
+        ui.send(json!({
+            "version": 2,
+            "id": "decision-1",
+            "method": "ui.decision",
+            "prompt_id": prompt["prompt_id"],
+            "nonce": prompt["nonce"],
+            "decision": "once"
+        }));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        use base64::Engine as _;
+        let log = base64::engine::general_purpose::STANDARD
+            .decode(response["log_tail_b64"].as_str().unwrap())
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log).contains("install completed"));
+        let recorded = std::fs::read_to_string(&args).unwrap();
+        assert!(recorded.starts_with("-i\norg.example.app\n-p\n"));
+        assert!(recorded.contains("package.wgt"));
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn was_uninstall_falls_back_to_pkgcmd_and_cleans_home() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let directory = fixture._directory.path().to_path_buf();
+        let with_pkgcmd = with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let _ = with_pkgcmd;
+        let was_args = with_was(&mut fixture, "echo 'uninstall failed[132]'\nexit 1\n");
+
+        // Recording sqlite3 that also serves pkg.list/pkg.uninstall lookups.
+        let rows = package_row(
+            "org.example.app",
+            "wgt",
+            "1.0.0",
+            "org.example.app.Ui",
+            "Example",
+            true,
+        );
+        let rows_path = directory.join("pkg-rows");
+        std::fs::write(&rows_path, format!("{rows}\n")).unwrap();
+        let sql_log = directory.join("sql-log");
+        let sqlite3 = directory.join("sqlite3-recording");
+        std::fs::write(
+            &sqlite3,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*SELECT*) cat '{}' ;;\n*) printf '%s\\n' \"$@\" >> '{}' ;;\nesac\n",
+                rows_path.display(),
+                sql_log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sqlite3, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let vconf_log = directory.join("vconf-log");
+        let vconf = directory.join("vconf");
+        std::fs::write(
+            &vconf,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                vconf_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&vconf, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let packages = fixture.config.packages.as_mut().unwrap();
+        packages.db.sqlite3 = sqlite3;
+        packages.vconf = vconf;
+        let icon = packages.icon_root.join("org.example.app.Ui");
+        std::fs::create_dir_all(&icon).unwrap();
+        std::fs::write(icon.join("icon.png"), b"icon").unwrap();
+
+        let (mut client, handle) = connect(&fixture, "System::Privileged", 0);
+        client.send(uninstall_request("uninst-1", "org.example.app"));
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["pkgid"], "org.example.app");
+        // wascmd refused it; pkgcmd removed it and the Home entry was cleaned.
+        let was = std::fs::read_to_string(&was_args).unwrap();
+        assert!(was.starts_with("-u\norg.example.app.Ui\n"));
+        let sql = std::fs::read_to_string(&sql_log).unwrap();
+        assert!(sql.contains("DELETE FROM widgetinfo WHERE pkgname = 'org.example.app';"));
+        assert!(!icon.exists());
+        assert_eq!(
+            std::fs::read_to_string(&vconf_log).unwrap(),
+            "set\nmemory/was/app_change\n1\n"
+        );
+
         drop(client);
         handle.join().unwrap().unwrap();
     }
@@ -2603,7 +2917,7 @@ mod tests {
         }
         let mut fixture = fixture();
         let marker = fixture._directory.path().join("pkgcmd-args");
-        with_packages(&mut fixture, &recording_pkgcmd(&marker));
+        with_installed_packages(&mut fixture, &recording_pkgcmd(&marker));
         let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
         ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
         assert_eq!(ui.read()["status"], "ok");
@@ -2649,7 +2963,7 @@ mod tests {
         }
         let mut fixture = fixture();
         let marker = fixture._directory.path().join("pkgcmd-ran");
-        with_packages(
+        with_installed_packages(
             &mut fixture,
             &format!(
                 "#!/bin/sh\ntouch '{}'\nprintf 'key[end] val[ok]\\n'\n",
@@ -2747,7 +3061,7 @@ mod tests {
             return;
         }
         let mut fixture = fixture();
-        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        with_installed_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
         let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
         client.send(json!({"version": 2, "id": "list-1", "method": "pkg.list"}));
         let response = client.read();
@@ -2801,7 +3115,7 @@ mod tests {
             return;
         }
         let mut fixture = fixture();
-        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        with_installed_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
         let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
         ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
         assert_eq!(ui.read()["status"], "ok");

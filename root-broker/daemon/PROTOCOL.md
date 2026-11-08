@@ -179,7 +179,11 @@ The request lifecycle:
 6. for `signature` in `unsigned_will_resign`/`foreign_will_resign`: re-sign with
    `xmlsec1` and the on-device keys (`sign_failed` on error); a `user_ca` or
    `samsung` package is installed as-is;
-7. `pkgcmd -i -t <type> -p <staged>` with the request timeout;
+7. install through `wascmd` (`webappservice`), which also registers the app in
+   Samsung Home and supports WGT; the stock `wascmd` runs inside a private
+   mount namespace with an `/etc` copy that has no `release` file. Without the
+   WAS backend (`--no-was`) the daemon falls back to
+   `pkgcmd -i -t <type> -p <staged>` with no Home registration;
 8. response, then the staged copy is deleted on every path.
 
 Policy refusals use `status: denied`; failures after the user approved use
@@ -554,6 +558,15 @@ Response:
 - Package ids starting with `com.samsung.`, `org.tizen.`, or `samsung.` are
   refused, as are platform-only privileges (the installer's
   own privilege check remains authoritative).
+- Installs and removals go through `webappservice` by default: `wascmd -i`
+  (`-u` for removal) runs under `unshare -m` with a copy of `/etc` minus
+  `release`, because the stock binary refuses to run on retail firmware. This
+  is what makes TPKs appear in Samsung Home and keeps their tiles clean on
+  removal. `--no-was` selects the `pkgcmd` backend instead.
+- `wascmd -u` refuses packages that were not installed through the SDK path
+  (`is_sdk_app`); for those the daemon falls back to `pkgcmd -u` and then
+  deletes the `widgetinfo` row, the cached icon, and sets
+  `memory/was/app_change=1`.
 - Trust material lives in `/opt/tv-auth/trust/` (`user-root-ca.pem`,
   `author-root-ca.pem`, `fingerprint_list.xml`, `tizen-ca/`, and the M3 signing
   keys). Enrollment bind-mounts the fingerprint list and CA overlay over the

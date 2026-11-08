@@ -9,7 +9,7 @@ use crate::executor;
 use crate::protocol::{PackageType, MAX_INSTALL_LOG_TAIL_BYTES};
 use std::ffi::OsStr;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug)]
 pub enum InstallError {
@@ -126,15 +126,6 @@ pub fn last_end_value(log: &[u8]) -> Option<String> {
     end
 }
 
-/// True when a directory for `pkgid` already exists under one of the known
-/// install roots. This only drives the `is_upgrade` hint; the installer decides.
-pub fn is_installed(pkgid: &str, roots: &[PathBuf]) -> bool {
-    if !crate::identity::is_valid_package_id(pkgid) {
-        return false;
-    }
-    roots.iter().any(|root| root.join(pkgid).is_dir())
-}
-
 fn tail(log: &[u8], maximum: usize) -> Vec<u8> {
     if log.len() <= maximum {
         return log.to_vec();
@@ -174,18 +165,5 @@ mod tests {
         let log = vec![b'x'; 100];
         assert_eq!(tail(&log, 10), vec![b'x'; 10]);
         assert_eq!(tail(&log, 1000), log);
-    }
-
-    #[test]
-    fn detects_installed_packages() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("apps");
-        std::fs::create_dir_all(root.join("org.example.app")).unwrap();
-        assert!(is_installed("org.example.app", std::slice::from_ref(&root)));
-        assert!(!is_installed("org.example.missing", &[root]));
-        assert!(!is_installed(
-            "../../etc",
-            &[directory.path().to_path_buf()]
-        ));
     }
 }

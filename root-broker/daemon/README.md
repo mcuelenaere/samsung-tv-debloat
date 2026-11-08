@@ -65,8 +65,9 @@ output handling, the full install prompt/approve/deny/failure flows, uninstall
 prompting and policy (`protected_package`, `unknown_package`), `pkg.list`
 database parsing, the root role (prompt-free install/removal with a notice,
 `exec` refused), and re-signing (templates, reference encoding, signature-file
-recognition, author-mismatch refusal, archive rewrite). The integrated suite is
-127 Linux tests. Linux integration
+recognition, author-mismatch refusal, archive rewrite), and the WAS backend
+(`/etc` copy without `release`, wascmd invocation, pkgcmd+Home fallback). The
+integrated suite is 130 Linux tests. Linux integration
 tests run in Docker:
 
 ```sh
@@ -84,11 +85,14 @@ This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 8 s
 (the previous fully emulated build took about 100 s). With package-install M1
-through M3 on top of M4 and the review-fixes hardening the binary is 855,716
+through M4 on top of M4 and the review-fixes hardening the binary is 868,884
 bytes, SHA-256
-`ab637c0287f439221a4b545e5a63a1440acaaf45f007ae95176e9f946d0bdcec`
-(TV-validated for install, uninstall, list, re-signing, and the root role; see
-the package-install plan). The validated M2 build was 787,372 bytes, SHA-256
+`f77fec8e99889bb91dfda27fdddcab8c4978e1b0ff40f33a89ea5b095183d56d`
+(TV-validated for install/uninstall/list/re-signing, the root role, and Samsung
+Home registration; see the package-install plan). The validated M3 build was
+855,716 bytes, SHA-256
+`ab637c0287f439221a4b545e5a63a1440acaaf45f007ae95176e9f946d0bdcec`; the
+validated M2 build was 787,372 bytes, SHA-256
 `50e246fa4275dbd2bf6cedf05dc4b0a080a354d4bf9ef1d2f092ec8f0c37e915`; the
 validated M1 build was 762,228 bytes, SHA-256
 `4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62`; the
@@ -118,6 +122,7 @@ validated M4 build was 584,452 bytes, SHA-256
 | `--sqlite3` | `/usr/bin/sqlite3` | read-only package database access |
 | `--pkgdb` | `/opt/dbspace/.pkgmgr_parser.db` | pkgmgr package database |
 | `--xmlsec1` | `/usr/bin/xmlsec1` | on-device XML-DSig signer |
+| `--no-was` | off | use `pkgcmd` only (no Samsung Home registration) |
 | `--trust-root` | `/opt/tv-auth/trust` | CA material and fingerprint list |
 | `--no-trust` | off | skip trust enrollment (development only) |
 | `--no-package-support` | off | serve `exec` only |
@@ -144,6 +149,23 @@ It rewrites the staged archive in place, sets `re_signed: true`, and lets
 `pkgcmd` validate the result. An upgrade is refused with
 `author_mismatch_requires_reinstall` when the installed package was signed by a
 different author, because Tizen rejects cross-author upgrades (`-12`).
+
+Installs and removals go through **`webappservice`**, the same path `sdb
+install` uses. The daemon runs the stock `/usr/bin/wascmd` under
+`unshare -m` with a copy of `/etc` that has no `release` file, because that
+binary exits immediately on retail firmware:
+
+- TPK installs now create the `widgetinfo` row and cached icon that Samsung
+  Home ("My apps") reads, and removals delete them;
+- the staged package keeps its `0711`/`0644` layout because `webappservice`
+  copies it as UID 5001;
+- `wascmd -u` refuses packages that were not installed through the SDK path
+  (`is_sdk_app`); the daemon then falls back to `pkgcmd -u` plus an explicit
+  Home cleanup (delete the `widgetinfo` row, remove the cached icon, set
+  `memory/was/app_change=1`);
+- `--no-was` restores the `pkgcmd`-only backend. WGT packages cannot be
+  installed on this firmware through any backend (`pkgcmd`, `sdb install`, or
+  `wascmd` all return `-4 Load archive info fail`), so WGT remains blocked.
 
 `pkg.uninstall` reads the installed package's metadata from
 `/opt/dbspace/.pkgmgr_parser.db` through `sqlite3 -readonly` (the
@@ -371,6 +393,21 @@ Uninstalling a package that was installed through `sdb` leaves its Samsung Home
 `widgetinfo` row behind, because `pkgcmd` does not contact `webappservice`; M4
 owns that cleanup. The stale row from the probe was removed manually after
 validation.
+
+M4 (the `webappservice` backend) was deployed and TV-validated on 2026-11-08:
+
+- a broker TPK install returned `backend=was`, and Samsung Home gained the
+  `widgetinfo` row (`app_featured=1`, `app_type=2`, `install_type=user`,
+  `is_display=1`, `install_state=3`) plus the cached icon;
+- a broker uninstall returned `backend=was` and removed the package, the Home
+  row, and the icon;
+- a package installed with `pkgcmd` (the `is_sdk_app` case) uninstalled through
+  the fallback (`backend=pkgcmd+home`), which deleted the manual Home row and
+  icon;
+- WGT remains blocked: a minimal WGT, a previously built test WGT, and a
+  repackaged copy of the installed Vetro WGT all fail with
+  `-4 Load archive info fail` through `wascmd`/`webappservice`, matching the
+  earlier `pkgcmd` and `sdb install` failures.
 
 Cold boot on 2026-11-05 used boot ID
 `7687b045-4e4b-4a7e-9416-68ecc3fc6efc`; AT-HUB logged `start units rc=0`, both
