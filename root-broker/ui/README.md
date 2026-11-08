@@ -136,15 +136,25 @@ tizen package -t tpk -s <profile> -- org.tvauth.ui-0.1.0.tpk
 
 No certificate material or passwords belong in this repository. The installed
 `org.tvauth.ui` on the current TV is signed with the Apps2Samsung **Partner**
-certificate. Sign with that author/distributor profile for an in-place update;
-the Public profile is rejected with `Author certificate not match`. If a
-mismatch occurs, uninstall/reinstall (which changes the package signer).
+certificate (profile `tvauth-partner` on the build Mac). Sign with that
+author/distributor profile for an in-place update; another author is rejected
+with `Author certificate not match` / `Check certificate error [-12]`. If a
+mismatch occurs, uninstall/reinstall (which changes the package signer). With a
+profile name that does not exist, `tizen package` still prints "created
+successfully" but leaves the TPK unsigned, so check that it contains
+`author-signature.xml`.
 
-The signed TPK must be installed through `pkgcmd` on the TV:
+Install it through SDB, which uses Samsung's installer (`wascmd`):
 
 ```sh
-/usr/bin/pkgcmd -i -t tpk -p /path/to/org.tvauth.ui-0.1.0-signed.tpk
+sdb connect <tv-ip>
+sdb install org.tvauth.ui-0.1.0.tpk
 ```
+
+A plain `pkgcmd -i` over SSH also installs and runs the app, but Samsung Home
+does not list it under "Mijn apps"/"My apps"; only an SDB install registers it
+there (validated 2026-11-08). The manifest also sets `taskmanage="true"`, which
+every app Home lists has.
 
 The daemon expects the installed label `User::Pkg::org.tvauth.ui` and UID 5001 by
 default. If the package ID changes, update `--ui-package` and `--ui-app-id`.
