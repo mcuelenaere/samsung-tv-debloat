@@ -27,6 +27,7 @@ namespace TvAuthUi
         private static readonly Interop.EvasSmartCb BackDelegate = OnBack;
         private static readonly Interop.EvasSmartCb DecisionDelegate = OnDecisionClicked;
         private static readonly Interop.EvasSmartCb RevokeDelegate = OnRevokeClicked;
+        private static readonly Interop.EvasSmartCb NotifyDelegate = OnNotifyClicked;
         private static readonly Interop.EvasSmartCb RefreshDelegate = OnRefreshClicked;
         private static readonly Interop.EcoreTimerCb TimerDelegate = OnTimer;
 
@@ -83,6 +84,7 @@ namespace TvAuthUi
         private static IntPtr toastLabel;
         private static DateTime? toastHideAt;
         private static int toastRows;
+        private static string focusNotifyLabel;
         private static readonly List<NoticeInfo> toastEntries = new List<NoticeInfo>();
 
         private static int Main(string[] args)
@@ -190,6 +192,7 @@ namespace TvAuthUi
             broker.GrantsReceived += OnGrants;
             broker.DecisionFinished += OnDecisionFinished;
             broker.RevokeFinished += OnRevokeFinished;
+            broker.NotifyFinished += OnNotifyFinished;
             broker.ConnectionChanged += OnConnectionChanged;
             broker.StatusMessage += OnStatusMessage;
             broker.Start();
@@ -578,6 +581,41 @@ namespace TvAuthUi
             }
         }
 
+        // Cycle order of the per-grant toast setting.
+        private static string NextNotify(string notify) =>
+            notify == "every" ? "first" : notify == "first" ? "never" : "every";
+
+        private static string NotifyButtonText(string notify) =>
+            notify == "first" ? "Toast: first use" : notify == "never" ? "Toast: never" : "Toast: every";
+
+        private static string NotifyDescription(string notify) =>
+            notify == "first"
+                ? "Toast on first command after 30 min idle"
+                : notify == "never" ? "No toasts" : "Toast on every command";
+
+        private static void OnNotifyClicked(IntPtr data, IntPtr obj, IntPtr eventInfo)
+        {
+            if (data == IntPtr.Zero)
+                return;
+            var label = GCHandle.FromIntPtr(data).Target as string;
+            var grant = grants.FirstOrDefault(g => g.Label == label);
+            if (grant == null)
+                return;
+            var next = NextNotify(grant.Notify);
+            Log("notify clicked " + label + " -> " + next);
+            focusNotifyLabel = label;
+            broker?.SetNotify(label, next);
+        }
+
+        private static void OnNotifyFinished(bool ok, string error)
+        {
+            if (currentPrompt != null || ok)
+                return;
+            managerMessage = "Could not change toast setting: "
+                + (string.IsNullOrEmpty(error) ? "unknown" : error);
+            RenderManager();
+        }
+
         private static void OnRevokeFinished(bool revoked, string error)
         {
             if (currentPrompt != null)
@@ -735,13 +773,18 @@ namespace TvAuthUi
 
                     AddToBox(rowBox, CreateLabel(rowBox,
                         "<font_size=28><b>" + Escape(grant.Package) + "</b></font_size><br/>"
-                        + Small(grant.Label, "#8a8f99")));
+                        + Small(grant.Label, "#8a8f99") + "<br/>"
+                        + Small(NotifyDescription(grant.Notify), "#b4b9c2")));
 
                     var handle = GCHandle.Alloc(grant.Label);
                     revokeHandles.Add(GCHandle.ToIntPtr(handle));
-                    var button = CreateButton(rowBox, "Revoke", RevokeDelegate, GCHandle.ToIntPtr(handle));
-                    if (firstButton == IntPtr.Zero)
-                        firstButton = button;
+                    var notify = CreateButton(rowBox, NotifyButtonText(grant.Notify), NotifyDelegate,
+                        GCHandle.ToIntPtr(handle));
+                    Interop.evas_object_size_hint_min_set(notify, 320, 84);
+                    CreateButton(rowBox, "Revoke", RevokeDelegate, GCHandle.ToIntPtr(handle));
+                    // Default focus on the harmless toggle, not Revoke.
+                    if (grant.Label == focusNotifyLabel || firstButton == IntPtr.Zero)
+                        firstButton = notify;
                 }
 
                 if (grants.Count > 5)

@@ -1,3 +1,4 @@
+use crate::grants::NotifyMode;
 use crate::identity::{is_valid_package_label, package_from_label};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
@@ -58,6 +59,16 @@ pub struct GrantsRevokeRequest {
     pub label: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantsNotifyRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+    pub label: String,
+    pub notify: NotifyMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
@@ -73,6 +84,7 @@ pub enum Request {
     UiDecision(UiDecisionRequest),
     GrantsList(GrantsListRequest),
     GrantsRevoke(GrantsRevokeRequest),
+    GrantsNotify(GrantsNotifyRequest),
 }
 
 impl Request {
@@ -83,6 +95,7 @@ impl Request {
             Self::UiDecision(request) => &request.id,
             Self::GrantsList(request) => &request.id,
             Self::GrantsRevoke(request) => &request.id,
+            Self::GrantsNotify(request) => &request.id,
         }
     }
 }
@@ -127,6 +140,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
         "grants.revoke" => {
             serde_json::from_slice::<GrantsRevokeRequest>(bytes).map(Request::GrantsRevoke)
         }
+        "grants.notify" => {
+            serde_json::from_slice::<GrantsNotifyRequest>(bytes).map(Request::GrantsNotify)
+        }
         _ => return Err(ParseError::UnsupportedMethod),
     };
     request.map_err(|_| ParseError::Malformed)
@@ -158,8 +174,8 @@ pub fn validate_decision(request: &UiDecisionRequest) -> Result<(), &'static str
     Ok(())
 }
 
-pub fn validate_revoke(request: &GrantsRevokeRequest) -> Result<(), &'static str> {
-    if !is_valid_package_label(&request.label) {
+pub fn validate_label(label: &str) -> Result<(), &'static str> {
+    if !is_valid_package_label(label) {
         return Err("invalid_label");
     }
     Ok(())
@@ -170,6 +186,7 @@ pub struct GrantView {
     pub label: String,
     pub package: String,
     pub granted_at: u64,
+    pub notify: NotifyMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -548,6 +565,15 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(revoke, Request::GrantsRevoke(_)));
+
+        let notify = parse_request(
+            br#"{"version":1,"id":"f","method":"grants.notify","label":"User::Pkg::org.example.app","notify":"first"}"#,
+        )
+        .unwrap();
+        match notify {
+            Request::GrantsNotify(request) => assert_eq!(request.notify, NotifyMode::First),
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 
     #[test]
@@ -593,9 +619,9 @@ mod tests {
             method: "grants.revoke".into(),
             label: "User::Pkg::org.example.app".into(),
         };
-        assert_eq!(validate_revoke(&revoke), Ok(()));
+        assert_eq!(validate_label(&revoke.label), Ok(()));
         revoke.label = "System::Privileged".into();
-        assert_eq!(validate_revoke(&revoke), Err("invalid_label"));
+        assert_eq!(validate_label(&revoke.label), Err("invalid_label"));
     }
 
     #[test]

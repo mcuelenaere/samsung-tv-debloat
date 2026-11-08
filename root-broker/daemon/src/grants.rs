@@ -23,14 +23,33 @@ struct GrantFile {
 #[serde(deny_unknown_fields)]
 struct GrantEntry {
     granted_at: u64,
-    /// Preserved for compatibility with grants written by the live toast
-    /// branch. This branch's simpler toast code does not interpret it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    notify: Option<serde_json::Value>,
+    /// Omitted when `every`, so files without custom modes stay readable by
+    /// older daemons.
+    #[serde(default, skip_serializing_if = "NotifyMode::is_default")]
+    notify: NotifyMode,
     /// Hash of the installed package's author signature. Version-1 grants
     /// predate this field and are migrated on first use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     package_fingerprint: Option<String>,
+}
+
+/// When a granted package's executions are shown as a UI toast.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyMode {
+    /// Every command.
+    #[default]
+    Every,
+    /// The first command after the package was idle for a while.
+    First,
+    /// Never.
+    Never,
+}
+
+impl NotifyMode {
+    fn is_default(&self) -> bool {
+        *self == Self::Every
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,10 +218,30 @@ impl GrantStore {
         }
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (&str, u64)> {
+    /// The grant's notify mode, or `None` when the label has no grant.
+    pub fn notify_mode(&self, label: &str) -> Option<NotifyMode> {
+        self.grants.get(label).map(|entry| entry.notify)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&str, u64, NotifyMode)> {
         self.grants
             .iter()
-            .map(|(label, entry)| (label.as_str(), entry.granted_at))
+            .map(|(label, entry)| (label.as_str(), entry.granted_at, entry.notify))
+    }
+
+    /// Returns `false` if the label has no grant.
+    pub fn set_notify(&mut self, label: &str, mode: NotifyMode) -> io::Result<bool> {
+        let Some(entry) = self.grants.get_mut(label) else {
+            return Ok(false);
+        };
+        let previous = std::mem::replace(&mut entry.notify, mode);
+        if let Err(error) = self.save() {
+            if let Some(entry) = self.grants.get_mut(label) {
+                entry.notify = previous;
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn grant(&mut self, label: &str) -> Result<bool, GrantError> {
@@ -221,7 +260,8 @@ impl GrantStore {
         let notify = self
             .grants
             .get(label)
-            .and_then(|entry| entry.notify.clone());
+            .map(|entry| entry.notify)
+            .unwrap_or_default();
         let previous = self.grants.insert(
             label.to_owned(),
             GrantEntry {
@@ -374,9 +414,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_grant_is_migrated_and_persisted() {
+    fn legacy_grant_is_migrated_and_preserves_notify_mode() {
         let (directory, mut store) = temp_store();
         let label = "User::Pkg::org.example.allowed";
+        assert_eq!(store.notify_mode(label), Some(NotifyMode::Every));
         assert_eq!(store.check(label), GrantCheck::Migrated);
         assert_eq!(store.check(label), GrantCheck::Allowed);
         drop(store);
@@ -396,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_unknown_notify_field() {
+    fn migration_preserves_a_custom_notify_mode() {
         let directory = tempfile::tempdir().unwrap();
         let apps = directory.path().join("apps");
         fs::create_dir(&apps).unwrap();
@@ -412,6 +453,10 @@ mod tests {
         assert_eq!(
             store.check("User::Pkg::org.example.allowed"),
             GrantCheck::Migrated
+        );
+        assert_eq!(
+            store.notify_mode("User::Pkg::org.example.allowed"),
+            Some(NotifyMode::First)
         );
         drop(store);
 
@@ -587,7 +632,26 @@ mod tests {
         assert!(store.revoke("User::Pkg::org.example.keep").is_err());
         assert!(store
             .entries()
-            .any(|(label, _)| label == "User::Pkg::org.example.keep"));
+            .any(|(label, _, _)| label == "User::Pkg::org.example.keep"));
+    }
+
+    #[test]
+    fn notify_mode_persists_and_default_is_not_written() {
+        let (directory, mut store) = temp_store();
+        let label = "User::Pkg::org.example.allowed";
+        assert_eq!(store.notify_mode(label), Some(NotifyMode::Every));
+        assert!(!store
+            .set_notify("User::Pkg::org.example.none", NotifyMode::Never)
+            .unwrap());
+        assert!(store.set_notify(label, NotifyMode::First).unwrap());
+        drop(store);
+
+        let path = directory.path().join("grants.json");
+        let apps = directory.path().join("apps");
+        let mut store = GrantStore::load_with_roots(&path, vec![apps]).unwrap();
+        assert_eq!(store.notify_mode(label), Some(NotifyMode::First));
+        store.set_notify(label, NotifyMode::Every).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("notify"));
     }
 
     #[test]

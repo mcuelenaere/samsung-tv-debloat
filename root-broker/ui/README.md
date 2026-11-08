@@ -66,10 +66,12 @@ lingers shows the manager.
 ### Grant manager
 
 If the UI is opened from the launcher with no pending prompt, or after a decision
-or reconnect, it shows the persistent-grant list. Each row has a **Revoke**
-button. The list is refreshed when the manager opens, after a revoke, and via
-the **Refresh** button, so an app granted by a prompt is not missing from a
-stale list.
+or reconnect, it shows the persistent-grant list. Each row has a toast toggle
+that cycles **Toast: every** → **Toast: first use** (first command after 30 min
+idle, for apps that poll) → **Toast: never**, and a **Revoke** button. Focus
+starts on the toggle, not on Revoke. The list is refreshed when the manager
+opens, after each change, and via the **Refresh** button, so an app granted by a
+prompt is not missing from a stale list.
 The first 5 grants are shown.
 
 ### Failure behavior
@@ -118,9 +120,9 @@ out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
 Observed local artifacts:
 
 ```text
-Managed assembly: 43,520 bytes
-Unsigned TPK:     20,423 bytes
-Signed TPK:       27,965 bytes
+Managed assembly: 46,592 bytes
+Unsigned TPK:     21,536 bytes
+Signed TPK:       29,094 bytes
 ```
 
 ## Signing and installation

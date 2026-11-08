@@ -36,6 +36,8 @@ namespace TvAuthUi
         public string Label;
         public string Package;
         public long GrantedAt;
+        /// <summary>"every", "first" or "never".</summary>
+        public string Notify;
     }
 
     /// <summary>
@@ -55,6 +57,7 @@ namespace TvAuthUi
         private long lastHelloId;
         private long lastDecisionId;
         private long lastGrantsId;
+        private long lastNotifyId;
 
         public event Action<PromptInfo> PromptReceived;
         public event Action<List<NoticeInfo>> NoticeReceived;
@@ -63,6 +66,7 @@ namespace TvAuthUi
         public event Action<List<GrantInfo>> GrantsReceived;
         public event Action<bool, string> DecisionFinished;
         public event Action<bool, string> RevokeFinished;
+        public event Action<bool, string> NotifyFinished;
         public event Action<bool> ConnectionChanged;
         public event Action<string> StatusMessage;
 
@@ -112,6 +116,23 @@ namespace TvAuthUi
             })))
             {
                 dispatch.Enqueue(() => RevokeFinished?.Invoke(false, "not_connected"));
+            }
+        }
+
+        public void SetNotify(string label, string notify)
+        {
+            var id = Interlocked.Increment(ref nextId);
+            Interlocked.Exchange(ref lastNotifyId, id);
+            if (!SendRaw(JsonSerializer.Serialize(new
+            {
+                version = 1,
+                id = "notify-" + id,
+                method = "grants.notify",
+                label,
+                notify
+            })))
+            {
+                dispatch.Enqueue(() => NotifyFinished?.Invoke(false, "not_connected"));
             }
         }
 
@@ -303,7 +324,8 @@ namespace TvAuthUi
                         {
                             Label = GetString(item, "label"),
                             Package = GetString(item, "package"),
-                            GrantedAt = GetLong(item, "granted_at")
+                            GrantedAt = GetLong(item, "granted_at"),
+                            Notify = GetString(item, "notify") is var n && n.Length > 0 ? n : "every"
                         });
                     }
                     dispatch.Enqueue(() => GrantsReceived?.Invoke(list));
@@ -333,6 +355,14 @@ namespace TvAuthUi
                         var launch = GetString(root, "launch");
                         dispatch.Enqueue(() => HelloAccepted?.Invoke(launch));
                     }
+                    return;
+                }
+
+                if (id == "notify-" + Interlocked.Read(ref lastNotifyId))
+                {
+                    dispatch.Enqueue(() => NotifyFinished?.Invoke(status == "ok", error));
+                    if (status == "ok")
+                        RequestGrants();
                     return;
                 }
 

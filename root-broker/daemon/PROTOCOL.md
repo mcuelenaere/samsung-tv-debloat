@@ -205,7 +205,8 @@ one. Delivery is near real-time:
 Keeping the screen quiet is the UI's job: it shows one toast and updates it in
 place.
 
-Execs that were just approved by a prompt do not produce a notice.
+Execs that were just approved by a prompt do not produce a notice, and the
+grant's `notify` setting (see `grants.notify`) can limit or silence them.
 
 ## `ui.decision`
 
@@ -235,14 +236,13 @@ Semantics:
 
 - `deny` — the pending request returns `status: denied`, `error: user_denied`;
 - `once` — the pending request executes once; the next command prompts again;
-- `always` — the package label and a SHA-256 of its installed
-  `author-signature.xml` are persisted before the pending request executes;
-  later requests bypass prompting only while the installed package identity
-  still matches. A package upgrade, changed reinstall, or signer change
-  invalidates the grant and returns to prompting. Version-1 label-only grants
-  are migrated on first use by binding them to the currently installed package.
-  An optional `notify` value from the live per-app toast branch is preserved for
-  compatibility, but this branch does not interpret it.
+- `always` — the package label, a SHA-256 of its installed
+  `author-signature.xml`, and its notify mode are persisted before the pending
+  request executes; later requests bypass prompting only while the installed
+  package identity still matches. A package upgrade, changed reinstall, or
+  signer change invalidates the grant and returns to prompting. Version-1
+  label-only grants are migrated on first use by binding them to the currently
+  installed package; a non-default `notify` mode is preserved.
 
 ## `grants.list`
 
@@ -261,13 +261,39 @@ Response:
     {
       "label": "User::Pkg::org.example.app",
       "package": "org.example.app",
-      "granted_at": 1770000000
+      "granted_at": 1770000000,
+      "notify": "every"
     }
   ]
 }
 ```
 
 `granted_at` is Unix seconds. Grants are sorted by exact SMACK label.
+
+`notify` is the grant's toast setting (see `grants.notify`).
+
+## `grants.notify`
+
+Sets when a granted package's executions produce a `ui.notice`:
+
+```json
+{
+  "version": 1,
+  "id": "notify-1",
+  "method": "grants.notify",
+  "label": "User::Pkg::org.example.app",
+  "notify": "first"
+}
+```
+
+- `every` (default) — every exec;
+- `first` — only the first exec after the package was idle for 30 minutes,
+  so a polling app shows once when it becomes active;
+- `never` — no notices.
+
+Response: `{"version": 1, "id": "notify-1", "status": "ok"}`. Errors:
+`not_found` (no grant for that label), `invalid_label`, `grant_save_failed`,
+`not_registered`.
 
 ## `grants.revoke`
 

@@ -128,11 +128,8 @@ long-running Vetro command or install is in progress.
 
 ## Results
 
-TV run 2026-11-08 on the live per-app toast branch build, while M3/Vetro was
-active; the probes did not restart the broker or change grants, and they were
-removed afterwards. The main-branch M4 port preserves the `notify` field but
-keeps the earlier toast behavior, so the per-app toast results below are for the
-live branch build.
+TV run 2026-11-08, while M3/Vetro was active; the probes did not restart the
+broker or change grants, and they were removed afterwards.
 
 ### fsprobe: pass
 

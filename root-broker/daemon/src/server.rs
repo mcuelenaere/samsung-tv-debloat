@@ -1,11 +1,11 @@
 use crate::approval::{ApprovalHandle, ApprovalRequest, ApprovalResult};
 use crate::executor;
-use crate::grants::{GrantCheck, GrantStore};
+use crate::grants::{GrantCheck, GrantStore, NotifyMode};
 use crate::identity::{package_from_label, PeerIdentity};
 use crate::logger::Logger;
 use crate::protocol::{
     is_valid_request_id, parse_request, read_message, validate_decision, validate_exec,
-    validate_revoke, write_response, ExecRequest, GrantView, ParseError, Request, Response,
+    validate_label, write_response, ExecRequest, GrantView, ParseError, Request, Response,
     MAX_REQUEST_BYTES,
 };
 use rustix::io::Errno;
@@ -304,10 +304,11 @@ fn handle_ui_request(
                     .unwrap_or_else(|error| error.into_inner());
                 store
                     .entries()
-                    .map(|(label, granted_at)| GrantView {
+                    .map(|(label, granted_at, notify)| GrantView {
                         label: label.to_owned(),
                         package: package_from_label(label).unwrap_or(label).to_owned(),
                         granted_at,
+                        notify,
                     })
                     .collect::<Vec<_>>()
             };
@@ -321,7 +322,7 @@ fn handle_ui_request(
                 )?;
                 return Ok(());
             }
-            if let Err(error) = validate_revoke(&request) {
+            if let Err(error) = validate_label(&request.label) {
                 send(writer, &Response::error(&request.id, "error", error))?;
                 return Ok(());
             }
@@ -349,6 +350,37 @@ fn handle_ui_request(
                     )?;
                 }
             }
+        }
+        Request::GrantsNotify(request) => {
+            if ui_token.is_none() {
+                send(
+                    writer,
+                    &Response::error(&request.id, "error", "not_registered"),
+                )?;
+                return Ok(());
+            }
+            if let Err(error) = validate_label(&request.label) {
+                send(writer, &Response::error(&request.id, "error", error))?;
+                return Ok(());
+            }
+            let result = broker
+                .grants
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set_notify(&request.label, request.notify);
+            let response = match result {
+                Ok(true) => Response::ok(&request.id),
+                Ok(false) => Response::error(&request.id, "error", "not_found"),
+                Err(_) => Response::error(&request.id, "error", "grant_save_failed"),
+            };
+            log(
+                broker,
+                &format!(
+                    "grant_notify label={} notify={:?} status={}",
+                    request.label, request.notify, response.status
+                ),
+            );
+            send(writer, &response)?;
         }
         Request::Exec(request) => {
             log(
@@ -392,11 +424,14 @@ fn handle_exec(
         }
     };
 
-    let grant_check = broker
-        .grants
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .check(&identity.label);
+    let (grant_check, notify) = {
+        let mut store = broker
+            .grants
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let grant_check = store.check(&identity.label);
+        (grant_check, store.notify_mode(&identity.label))
+    };
 
     if grant_check.is_allowed() {
         if grant_check == GrantCheck::Migrated {
@@ -406,10 +441,16 @@ fn handle_exec(
             );
         }
         // Granted packages run without asking, but the user still sees a
-        // (coalesced) notice of who ran what.
-        let _ = broker
-            .approvals
-            .notice(identity.label.clone(), request.command.clone());
+        // (coalesced) notice of who ran what, subject to the per-grant mode.
+        if let Some(mode) = notify {
+            if mode != NotifyMode::Never {
+                let _ = broker.approvals.notice(
+                    identity.label.clone(),
+                    request.command.clone(),
+                    mode == NotifyMode::First,
+                );
+            }
+        }
     } else {
         match grant_check {
             GrantCheck::Stale => log(
@@ -817,6 +858,26 @@ mod tests {
         let grants = response["grants"].as_array().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0]["package"], "org.example.allowed");
+        assert_eq!(grants[0]["notify"], "every");
+
+        client.send(json!({
+            "version": 1,
+            "id": "notify-1",
+            "method": "grants.notify",
+            "label": "User::Pkg::org.example.allowed",
+            "notify": "never"
+        }));
+        assert_eq!(client.read()["status"], "ok");
+        client.send(json!({
+            "version": 1,
+            "id": "notify-2",
+            "method": "grants.notify",
+            "label": "User::Pkg::org.example.missing",
+            "notify": "first"
+        }));
+        assert_eq!(client.read()["error"], "not_found");
+        client.send(json!({"version": 1, "id": "list-2", "method": "grants.list"}));
+        assert_eq!(client.read()["grants"][0]["notify"], "never");
 
         client.send(json!({
             "version": 1,

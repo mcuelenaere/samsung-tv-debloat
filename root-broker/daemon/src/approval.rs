@@ -3,7 +3,7 @@ use crate::logger::Logger;
 use crate::protocol::{
     write_json, write_response, Decision, NoticeEntry, NoticeMessage, PromptMessage, Response,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -24,6 +24,9 @@ const MAX_PROMPT_UI_RETRIES: u8 = 2;
 /// After the UI could not be launched for notices, wait this long before
 /// launching it again, so a broken UI is not respawned for every granted exec.
 const NOTICE_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
+
+/// A `first`-mode package is shown again only after being idle this long.
+const FIRST_USE_IDLE: Duration = Duration::from_secs(30 * 60);
 
 /// Distinct packages coalesced into one notice.
 // ponytail: further packages are dropped until the next flush; only
@@ -84,6 +87,7 @@ enum ApprovalCommand {
     Notice {
         label: String,
         command: String,
+        first_use_only: bool,
     },
     /// The requester went away: drop its queued or active prompt.
     Cancel {
@@ -137,8 +141,13 @@ impl ApprovalHandle {
         })
     }
 
-    pub fn notice(&self, label: String, command: String) -> io::Result<()> {
-        self.send(ApprovalCommand::Notice { label, command })
+    /// `first_use_only`: show it only if the package was idle for a while.
+    pub fn notice(&self, label: String, command: String, first_use_only: bool) -> io::Result<()> {
+        self.send(ApprovalCommand::Notice {
+            label,
+            command,
+            first_use_only,
+        })
     }
 
     pub fn detach_ui(&self, token: u64) -> io::Result<()> {
@@ -247,6 +256,9 @@ struct Manager {
     launch: LaunchState,
     notices: Vec<NoticeEntry>,
     notice_next_at: Instant,
+    /// Last granted exec per package, for `first`-mode grants.
+    // ponytail: never pruned; bounded by the number of labels ever granted.
+    last_exec: HashMap<String, Instant>,
 }
 
 impl Manager {
@@ -265,6 +277,7 @@ impl Manager {
             launch: LaunchState::default(),
             notices: Vec::new(),
             notice_next_at: Instant::now(),
+            last_exec: HashMap::new(),
         }
     }
 
@@ -299,7 +312,11 @@ impl Manager {
                 writer,
                 control,
             } => self.handle_attach(token, &hello_id, label, writer, control),
-            ApprovalCommand::Notice { label, command } => self.handle_notice(&label, &command),
+            ApprovalCommand::Notice {
+                label,
+                command,
+                first_use_only,
+            } => self.handle_notice(&label, &command, first_use_only),
             ApprovalCommand::DetachUi { token } => self.handle_detach(token),
             ApprovalCommand::Cancel { ticket } => self.handle_cancel(ticket),
             ApprovalCommand::Decision {
@@ -392,7 +409,12 @@ impl Manager {
         self.flush_notices();
     }
 
-    fn handle_notice(&mut self, label: &str, command: &str) {
+    fn handle_notice(&mut self, label: &str, command: &str, first_use_only: bool) {
+        let now = Instant::now();
+        let previous = self.last_exec.insert(label.to_owned(), now);
+        if first_use_only && previous.is_some_and(|at| now - at < FIRST_USE_IDLE) {
+            return;
+        }
         if let Some(entry) = self.notices.iter_mut().find(|entry| entry.label == label) {
             entry.count = entry.count.saturating_add(1);
             entry.set_command(command);
@@ -1191,7 +1213,7 @@ mod tests {
         let one = "User::Pkg::org.example.one";
         let two = "User::Pkg::org.example.two";
 
-        handle.notice(one.into(), "first".into()).unwrap();
+        handle.notice(one.into(), "first".into(), false).unwrap();
         let notice = read_json(&mut ui);
         assert_eq!(notice["type"], "ui.notice");
         assert_eq!(notice["notices"][0]["package"], "org.example.one");
@@ -1200,9 +1222,11 @@ mod tests {
         // Within the gap: nothing is sent until it elapses, then one update.
         let started = Instant::now();
         for command in ["second", "third"] {
-            handle.notice(one.into(), command.into()).unwrap();
+            handle.notice(one.into(), command.into(), false).unwrap();
         }
-        handle.notice(two.into(), "other\u{202e}".into()).unwrap();
+        handle
+            .notice(two.into(), "other\u{202e}".into(), false)
+            .unwrap();
         let batch = read_json(&mut ui);
         assert!(started.elapsed() >= Duration::from_millis(200));
         let notices = batch["notices"].as_array().unwrap();
@@ -1222,7 +1246,7 @@ mod tests {
         handle.request(ask).unwrap();
         let prompt = read_json(&mut ui);
         handle
-            .notice("User::Pkg::org.example.granted".into(), "id".into())
+            .notice("User::Pkg::org.example.granted".into(), "id".into(), false)
             .unwrap();
         handle
             .decide(
@@ -1245,7 +1269,7 @@ mod tests {
         let fixture = fixture(config);
         let handle = fixture.manager.handle();
         handle
-            .notice("User::Pkg::org.example.granted".into(), "id".into())
+            .notice("User::Pkg::org.example.granted".into(), "id".into(), false)
             .unwrap();
         // Let the manager spawn the (dummy) launcher before the UI attaches.
         thread::sleep(Duration::from_millis(100));
@@ -1265,5 +1289,28 @@ mod tests {
         let mut ui = BufReader::new(ui);
         assert_eq!(read_json(&mut ui)["launch"], "notice");
         assert_eq!(read_json(&mut ui)["type"], "ui.notice");
+    }
+
+    #[test]
+    fn first_use_only_shows_once_while_active() {
+        let fixture = fixture(test_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let handle = fixture.manager.handle();
+        let quiet = "User::Pkg::org.example.quiet";
+        handle.notice(quiet.into(), "poll".into(), true).unwrap();
+        assert_eq!(
+            read_json(&mut ui)["notices"][0]["package"],
+            "org.example.quiet"
+        );
+
+        // Still active: suppressed, while an every-mode package is not.
+        handle.notice(quiet.into(), "poll".into(), true).unwrap();
+        handle
+            .notice("User::Pkg::org.example.loud".into(), "id".into(), false)
+            .unwrap();
+        let next = read_json(&mut ui);
+        let notices = next["notices"].as_array().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["package"], "org.example.loud");
     }
 }

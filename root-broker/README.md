@@ -2,7 +2,7 @@
 
 This directory contains the implementation work for the SuperSU-like root broker proposed in [`../docs/tv-authd-plan.md`](../docs/tv-authd-plan.md).
 
-The M0 platform spikes, M1 headless broker, M2 approval UI, M3/Vetro cutover, and per-app toast branch are live and validated. M4 hardening is ported onto this main branch and also deployed on the live toast branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed there. The main port preserves the earlier toast code. Optional cold boot and the UI manager-refresh install remain. Sources:
+The M0 platform spikes, M1 headless broker, M2 approval UI, M3/Vetro cutover, and per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. Optional cold boot and the UI manager-refresh install remain. Sources:
 
 - `spikes/armv7-hello/`: static ARMv7 Rust build and execution smoke test;
 - `spikes/peer-identity/`: Unix-socket `SO_PEERCRED` and `SO_PEERSEC` probe;
@@ -22,8 +22,8 @@ Each spike records its own build commands and validation results. Host builds an
 | M1 broker core | 15 Linux tests plus deployment checks pass; TV validated granted/denied requests, daemon restart, dynamic `/opt/tv-units` startup, and cold boot | 461,940 bytes | none |
 | M2 approval UI | 35 Linux tests pass; signed UI installed and TV-validated for deny/once/always/revoke, timeout, crash, focus/keys, daemon restart, and cold boot | 34,816-byte DLL; 24,073-byte signed TPK; 546,388-byte ARM daemon | none |
 | M3/toast live branch | Vetro cutover and per-app notify mode deployed and in use | 584,452-byte ARM daemon | none |
-| M4 hardening | 64 Linux tests pass; main-branch port of grant identity binding + notify-field preservation, private runtime log/dir, EINTR handling, failure-path coverage; fsprobe/uiprobe, 64 MiB pressure, and upgrade/reinstall passed on the live toast branch | 586,316-byte ARM daemon; 43,520-byte UI DLL | Optional cold boot; install manager-refresh UI with the installed signing profile |
+| M4 hardening | 66 Linux tests pass; deployed grant identity binding + notify preservation, private runtime log/dir, EINTR handling, failure-path coverage; fsprobe/uiprobe, 64 MiB pressure, and upgrade/reinstall passed | 584,452-byte ARM daemon; 46,592-byte UI DLL | Optional cold boot; install manager-refresh UI with the installed signing profile |
 
-The development containers returned `ENOPROTOOPT` for `SO_PEERSEC`, while the TV successfully returned SMACK labels for root and packaged app domains. Managed .NET is the validated UI path; native TPK execution is blocked by UEP. M1/M2 test packages and M4 probes were removed after use. The live TV runs the toast branch plus the M4 daemon with a v2 Vetro grant (`notify: first`). The main-branch M4 port preserves that field but keeps the earlier toast behavior; do not deploy its ARM binary over the live toast UI without merging that branch. The M4 UI refresh fix is in source but not installed because the live UI uses a different author certificate.
+The development containers returned `ENOPROTOOPT` for `SO_PEERSEC`, while the TV successfully returned SMACK labels for root and packaged app domains. Managed .NET is the validated UI path; native TPK execution is blocked by UEP. M1/M2 test packages and M4 probes were removed after use. The live TV runs the toast branch plus the M4 daemon with a v2 Vetro grant (`notify: first`). The M4 UI refresh fix is in source but not installed because the live UI uses a different author certificate.
 
 Contributors working in this directory should read [`AGENTS.md`](AGENTS.md) first. In particular, do not access the TV unless the user explicitly makes it available; treat access as read-only unless a new specific write authorization is given.

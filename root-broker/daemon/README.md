@@ -51,7 +51,7 @@ migration (including preserving `notify`), per-app notify modes, role
 separation, approval queueing and queue exhaustion, deny/once/always, nonce
 rejection, timeouts, UI disconnect, requester hangup, grant
 persistence/revocation, execution, process-group timeouts, output truncation in
-both streams, and EINTR handling. The integrated suite is 64 Linux tests. Linux
+both streams, and EINTR handling. The integrated suite is 66 Linux tests. Linux
 integration tests run in Docker:
 
 ```sh
@@ -68,11 +68,10 @@ docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
 This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 11 s
-(the previous fully emulated build took about 100 s). This main-branch M4 port
-preserves the earlier toast implementation and builds as 586,316 bytes, SHA-256
-`a5e4094044c142e97a0a54cd893b1d81940edc05104a15fcf18e6e4c9c44ff74`
-(the live TV currently runs the per-app toast branch build: 584,452 bytes,
-`7903c0ba…`). M2 was 546,388 bytes; M1 was 461,940 bytes.
+(the previous fully emulated build took about 100 s). The integrated M4 build
+(with the live toast branch) is 584,452 bytes, SHA-256
+`7903c0bac20e27ba3fb1de6b8def5424507e9d9f5c8ab77034c9f5cf5000f464`
+(M2 was 546,388 bytes; M1 was 461,940 bytes).
 
 ## CLI defaults
 
@@ -114,11 +113,10 @@ entries and removes them on revoke:
 }
 ```
 
-The key is the exact SMACK package label observed by the daemon. `notify` is
-optional and preserved for compatibility with grants written by the live per-app
-toast branch; this branch's simpler toast code does not interpret it.
-`package_fingerprint` is a SHA-256 of the installed package's
-`author-signature.xml`:
+The key is the exact SMACK package label observed by the daemon. `notify`
+(`every`, `first` or `never`; see `PROTOCOL.md`) is optional and only written
+when it is not `every`. `package_fingerprint` is a SHA-256 of the installed
+package's `author-signature.xml`:
 
 - TPK: `/opt/usr/apps/<pkgid>/author-signature.xml` (or `/usr/apps/...`);
 - WGT: `/opt/usr/apps/<pkgid>/res/wgt/author-signature.xml` (or `/usr/apps/...`).
@@ -129,7 +127,7 @@ removed and the next request prompts again. An identical reinstall keeps the
 grant. The signature file and package directory must not be symlinks or
 group/world-writable, and missing identity fails closed. Version-1 label-only
 grants are migrated on first use by binding them to the package currently
-installed under that label; a preserved `notify` value is retained.
+installed under that label; a non-default `notify` mode is preserved.
 
 Daemons from before `notify` existed reject grant files that contain it, so roll
 back only after resetting it to `every`. Updates use a temporary file plus
@@ -250,13 +248,8 @@ it on 2026-11-08 with a short restart:
 - Normal operation: `tv-authd` 328 kB RSS / 356 kB HWM, 3 threads, ~0.4% CPU
   during Vetro polling. Under 64 MiB tmpfs pressure it stayed at 304 kB RSS /
   384 kB HWM; the UI stayed at 50,288 kB RSS / 53,036 kB HWM; no restart/OOM.
-- The UI manager-refresh fix is in source but not installed: the live
+- The UI manager-refresh fix is in this worktree but not installed: the live
   `org.tvauth.ui` is signed with a different author certificate and `pkgcmd -i`
   rejects the update (`Author certificate not match`). Re-sign with the installed
   profile or uninstall/reinstall.
-- This main-branch port builds as 586,316 bytes (`a5e40940…`) and preserves the
-  earlier toast code. It is not the binary currently deployed. The TV runs the
-  toast-branch build `7903c0ba…` (584,452 bytes). Do not deploy the main binary
-  over the live toast UI without merging that branch.
-- Optional remaining check: a cold boot with the live toast-branch M4 binary and
-  v2 grant.
+- Optional remaining check: a cold boot with the M4 binary and v2 grant.
