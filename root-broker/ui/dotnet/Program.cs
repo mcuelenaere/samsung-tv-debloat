@@ -39,6 +39,43 @@ namespace TvAuthUi
         private const int ColorAccent = 0x3e7bfa;
         private const int CardWidth = 1200;
         private const int CardPadding = 56;
+        // Up to this many privileges are listed; the rest are summarised.
+        private const int MaxPrivilegesShown = 7;
+
+        /// <summary>Friendly labels for the common public Tizen privileges.</summary>
+        private static readonly Dictionary<string, string> PrivilegeNames =
+            new Dictionary<string, string>
+            {
+                { "http://tizen.org/privilege/internet", "Access the internet" },
+                { "http://tizen.org/privilege/filesystem.read", "Read shared files" },
+                { "http://tizen.org/privilege/filesystem.write", "Write shared files" },
+                { "http://tizen.org/privilege/camera", "Use the camera" },
+                { "http://tizen.org/privilege/microphone", "Use the microphone" },
+                { "http://tizen.org/privilege/location", "Use the TV's location" },
+                { "http://tizen.org/privilege/contacts.read", "Read contacts" },
+                { "http://tizen.org/privilege/contacts.write", "Write contacts" },
+                { "http://tizen.org/privilege/calendar.read", "Read the calendar" },
+                { "http://tizen.org/privilege/calendar.write", "Write the calendar" },
+                { "http://tizen.org/privilege/message.read", "Read messages" },
+                { "http://tizen.org/privilege/message.write", "Write messages" },
+                { "http://tizen.org/privilege/bluetooth", "Use Bluetooth" },
+                { "http://tizen.org/privilege/nfc", "Use NFC" },
+                { "http://tizen.org/privilege/download", "Download files" },
+                { "http://tizen.org/privilege/appmanager.launch", "Launch other apps" },
+                { "http://tizen.org/privilege/network.get", "Read network information" },
+                { "http://tizen.org/privilege/network.set", "Change network settings" },
+                { "http://tizen.org/privilege/systeminfo.get", "Read system information" },
+                { "http://tizen.org/privilege/systeminfo.set", "Change system information" },
+                { "http://tizen.org/privilege/telephony", "Use telephony" },
+                { "http://tizen.org/privilege/healthinfo", "Read health information" },
+                { "http://tizen.org/privilege/recorder", "Record audio" },
+                { "http://tizen.org/privilege/vibration", "Control vibration" },
+                { "http://tizen.org/privilege/alarm", "Set alarms" },
+                { "http://tizen.org/privilege/power", "Control power" },
+                { "http://tizen.org/privilege/usb.host", "Use USB devices" },
+                { "http://tizen.org/privilege/mediacontroller", "Control media playback" },
+                { "http://tizen.org/privilege/d2d.datasharing", "Share data with nearby devices" }
+            };
 
         // Execution-notice toast (top-right). Tune these on the TV.
         private static readonly IntPtr ToastName = Interop.Ansi("org.tvauth.ui.toast");
@@ -428,8 +465,12 @@ namespace TvAuthUi
             ShowMain();
             promptExpiresAt = DateTime.UtcNow.AddMilliseconds(
                 prompt.TimeoutMs > 0 ? prompt.TimeoutMs : 60_000);
-            Log("prompt received package=" + prompt.Package + " request=" + prompt.RequestId);
-            RenderPrompt();
+            Log("prompt received package=" + prompt.Package + " request=" + prompt.RequestId
+                + " kind=" + prompt.Kind);
+            if (prompt.IsPackageOperation)
+                RenderPackagePrompt();
+            else
+                RenderPrompt();
         }
 
         private static void OnHelloAccepted(string launch)
@@ -716,21 +757,42 @@ namespace TvAuthUi
             promptExpiresAt = null;
             exitAt = DateTime.UtcNow.AddSeconds(5);
             ClearContent();
-            switch (decision)
+            if (prompt.IsPackageOperation)
             {
-                case "once":
-                    SetHeader("ROOT ACCESS", "Allowed once", ColorAccent);
-                    break;
-                case "always":
-                    SetHeader("ROOT ACCESS", "Always allowed", ColorAccent);
-                    break;
-                default:
-                    SetHeader("ROOT ACCESS", "Denied", ColorDanger);
-                    break;
+                var removing = prompt.Kind == "uninstall";
+                if (decision == "deny")
+                {
+                    SetHeader(removing ? "REMOVE PACKAGE" : "INSTALL PACKAGE", "Denied", ColorDanger);
+                    SetStatus("The package was not changed.");
+                }
+                else
+                {
+                    SetHeader(removing ? "REMOVE PACKAGE" : "INSTALL PACKAGE", "Approved",
+                        ColorAccent);
+                    SetStatus(removing
+                        ? "tv-authd is removing the package..."
+                        : "tv-authd is installing the package...");
+                }
             }
-            SetStatus("Sending decision...");
+            else
+            {
+                switch (decision)
+                {
+                    case "once":
+                        SetHeader("ROOT ACCESS", "Allowed once", ColorAccent);
+                        break;
+                    case "always":
+                        SetHeader("ROOT ACCESS", "Always allowed", ColorAccent);
+                        break;
+                    default:
+                        SetHeader("ROOT ACCESS", "Denied", ColorDanger);
+                        break;
+                }
+                SetStatus("Sending decision...");
+            }
             broker.Decide(prompt, decision);
-            Log("decision sent package=" + prompt.Package + " decision=" + decision);
+            Log("decision sent package=" + prompt.Package + " kind=" + prompt.Kind
+                + " decision=" + decision);
         }
 
         private static void RenderPrompt()
@@ -773,8 +835,171 @@ namespace TvAuthUi
             Interop.elm_object_focus_set(deny, 1);
         }
 
-        private static void RenderManager()
+        /// <summary>
+        /// Package prompts show what is actually being installed instead of the
+        /// root-access warning. There is no "always" option: every package
+        /// operation is a fresh decision (protocol §5.4).
+        /// </summary>
+        private static void RenderPackagePrompt()
         {
+            var prompt = currentPrompt;
+            if (prompt == null)
+                return;
+            var removing = prompt.Kind == "uninstall";
+            var info = prompt.Install;
+            ClearContent();
+            if (info == null && !removing)
+            {
+                // Fail closed: never offer an approval button for a package
+                // request the daemon could not describe.
+                SetHeader("INSTALL PACKAGE", "Malformed package request", ColorDanger);
+                SetStatus("tv-authd did not describe the package. This request cannot be "
+                    + "approved.");
+                var rejectRow = CreateRow(contentBox);
+                AddContent(rejectRow);
+                var reject = CreateButton(rejectRow, "Deny", DecisionDelegate, (IntPtr)1);
+                Interop.elm_object_focus_set(reject, 1);
+                return;
+            }
+
+            SetHeader(
+                removing ? "REMOVE PACKAGE" : "INSTALL PACKAGE",
+                removing ? "An app wants to remove a package" : "An app wants to install a package",
+                removing ? ColorDanger : ColorAccent);
+            if (removing)
+            {
+                SetStatus("The package and its data will be removed from this TV.");
+            }
+            else if (info.IsUpgrade)
+            {
+                SetStatus("This replaces the installed version. Check the publisher "
+                    + "before continuing.");
+            }
+            else
+            {
+                SetStatus("Only install packages you trust. Apps can change how this TV "
+                    + "behaves and reach your data.");
+            }
+
+            var app = Panel(contentBox, ColorRow, 32, 24, out var appBox);
+            AddContent(app);
+            AddToBox(appBox, CreateLabel(appBox, Small("REQUESTED BY", "#8a8f99")));
+            AddToBox(appBox, CreateLabel(appBox,
+                "<font_size=34><b>" + Escape(prompt.Package) + "</b></font_size>"));
+            AddToBox(appBox, CreateLabel(appBox, Small(prompt.Label, "#8a8f99")));
+
+            var name = info != null && !string.IsNullOrEmpty(info.Name) ? info.Name : prompt.Package;
+            var details = new List<string>();
+            if (info != null)
+            {
+                if (!string.IsNullOrEmpty(info.PkgId))
+                    details.Add(info.PkgId);
+                if (!string.IsNullOrEmpty(info.PkgVersion))
+                    details.Add("version " + info.PkgVersion);
+                if (!string.IsNullOrEmpty(info.PkgType))
+                    details.Add(info.PkgType.ToUpperInvariant());
+                if (info.SizeBytes > 0)
+                    details.Add(FormatSize(info.SizeBytes));
+            }
+
+            var packagePanel = Panel(contentBox, ColorInset, 28, 20, out var packageBox);
+            AddContent(packagePanel);
+            AddToBox(packageBox, CreateLabel(packageBox,
+                Small(removing ? "PACKAGE" : "PACKAGE TO INSTALL", "#8a8f99")));
+            AddToBox(packageBox, CreateLabel(packageBox,
+                "<font_size=32><b>" + Escape(name) + "</b></font_size>"));
+            if (details.Count > 0)
+            {
+                AddToBox(packageBox, CreateLabel(packageBox,
+                    Small(string.Join(" \u00b7 ", details), "#b4b9c2")));
+            }
+            if (info != null && info.IsUpgrade)
+            {
+                AddToBox(packageBox, CreateLabel(packageBox,
+                    Small("This upgrades the installed version.", "#ffb74d")));
+            }
+            if (!removing)
+            {
+                AddToBox(packageBox, CreateLabel(packageBox,
+                    SignatureBadge(info?.Signature)));
+            }
+
+            if (!removing && info != null && info.Privileges.Count > 0)
+            {
+                AddContent(CreateLabel(contentBox,
+                    Small("PRIVILEGES (" + info.Privileges.Count + ")", "#8a8f99")));
+                var privileges = Panel(contentBox, ColorRow, 28, 20, out var privilegeBox);
+                AddContent(privileges);
+                var shown = 0;
+                foreach (var privilege in info.Privileges)
+                {
+                    if (shown++ >= MaxPrivilegesShown)
+                        break;
+                    AddToBox(privilegeBox, CreateLabel(privilegeBox,
+                        Small("\u2022 " + PrivilegeLabel(privilege), "#e8e8e8")));
+                }
+                if (info.Privileges.Count > MaxPrivilegesShown)
+                {
+                    var more = info.Privileges.Count - MaxPrivilegesShown;
+                    AddToBox(privilegeBox, CreateLabel(privilegeBox,
+                        Small("+ " + more + (more == 1 ? " more privilege" : " more privileges"),
+                            "#8a8f99")));
+                }
+            }
+
+            var footer = CreateRow(contentBox);
+            AddContent(footer);
+            lastCountdown = -1;
+            countdownLabel = AddToBox(footer, CreateLabel(footer, ""));
+            var deny = CreateButton(footer, "Deny", DecisionDelegate, (IntPtr)1);
+            CreateButton(footer, removing ? "Remove" : "Install", DecisionDelegate, (IntPtr)2);
+            Interop.elm_object_focus_set(deny, 1);
+        }
+
+        private static string SignatureBadge(string signature)
+        {
+            switch (signature)
+            {
+                case "unsigned_will_resign":
+                    return Small("Unsigned package \u2014 no trusted signature.", "#ffb74d");
+                case "foreign_will_resign":
+                    return Small("Third-party signature \u2014 not trusted by this TV.", "#ffb74d");
+                case "user_ca":
+                    return Small("Signed by your own CA.", "#66bb6a");
+                case "samsung":
+                    return Small("Signed by Samsung.", "#90a4ae");
+                default:
+                    return Small("Signed package \u2014 publisher not identified.", "#ffb74d");
+            }
+        }
+
+        private static string PrivilegeLabel(string uri)
+        {
+            if (string.IsNullOrEmpty(uri))
+                return "";
+            if (PrivilegeNames.TryGetValue(uri, out var friendly))
+                return friendly;
+            const string prefix = "http://tizen.org/privilege/";
+            if (uri.StartsWith(prefix, StringComparison.Ordinal))
+                return uri.Substring(prefix.Length).Replace('.', ' ');
+            return uri;
+        }
+
+        private static string FormatSize(long bytes)
+        {
+            const long kilobyte = 1024;
+            const long megabyte = kilobyte * 1024;
+            const long gigabyte = megabyte * 1024;
+            if (bytes >= gigabyte)
+                return (bytes / (double)gigabyte).ToString("0.0") + " GB";
+            if (bytes >= megabyte)
+                return (bytes / (double)megabyte).ToString("0.0") + " MB";
+            if (bytes >= kilobyte)
+                return (bytes / (double)kilobyte).ToString("0") + " KB";
+            return bytes + " B";
+        }
+
+        private static void RenderManager()        {
             if (contentBox == IntPtr.Zero)
                 return;
             ClearContent();

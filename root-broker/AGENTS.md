@@ -1,6 +1,7 @@
 # Root broker working notes
 
 - The authoritative design is `../docs/tv-authd-plan.md`. M0–M3 are complete and validated. M4 hardening is deployed on top of the live toast branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. The manager-refresh UI is installed with the Apps2Samsung Partner certificate. The M4 cold boot passed on 2026-11-08; no M4 acceptance items remain.
+- A separate track, `../docs/tv-authd-pkg-install-plan.md`, covers package installation. Its M1 daemon and UI work is TV-validated for TPK installs (including cold boot); WGT installs and Samsung Home registration remain M4, and M3 signing is not started.
 - Do not commit or otherwise mutate Git history unless the user explicitly asks.
 - The TV is on and Vetro is active. The live broker is the M4 binary `7903c0ba…`; `/opt/tv-auth/grants.json` is v2 with a Vetro fingerprint and `notify: first`; `/run/tv-auth` is `0711` and the log is `0600`. No test packages remain. The live UI is signed with the Apps2Samsung Partner certificate and the manager-refresh fix is installed (DLL `53f446fb…`). Use the Partner profile for UI updates. Do not restart `tv-authd`, change grants, install packages, run memory pressure, or reboot without explicit coordination.
 - Keep each spike self-contained under its assigned `spikes/<name>/` directory. Do not edit another spike's files or shared build files while agents work in parallel.

@@ -2,6 +2,7 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 use rustix::io::Errno;
 use rustix::process::{kill_process_group, Pid, Signal};
+use std::ffi::OsStr;
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -22,26 +23,44 @@ pub struct ExecutionOutcome {
     pub truncated: bool,
 }
 
+/// Run a shell command in its own session with a cleared environment.
 pub fn execute(command: &str, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
+    let mut child = isolated_command();
+    child.arg("/bin/sh").arg("-c").arg(command);
+    run(child, timeout_ms)
+}
+
+/// Run an absolute program with arguments, without a shell.
+pub fn execute_argv(
+    program: &Path,
+    args: &[&OsStr],
+    timeout_ms: u64,
+) -> io::Result<ExecutionOutcome> {
+    let mut child = isolated_command();
+    child.arg(program).args(args);
+    run(child, timeout_ms)
+}
+
+fn isolated_command() -> Command {
     let setsid = if Path::new("/usr/bin/setsid").exists() {
         "/usr/bin/setsid"
     } else {
         "/bin/setsid"
     };
-    let mut child = ChildGuard(Some(
-        Command::new(setsid)
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(command)
-            .env_clear()
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .env("HOME", "/root")
-            .env("LANG", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    ));
+    let mut command = Command::new(setsid);
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", "/root")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn run(mut command: Command, timeout_ms: u64) -> io::Result<ExecutionOutcome> {
+    let mut child = ChildGuard(Some(command.spawn()?));
 
     let stdout = child
         .stdout

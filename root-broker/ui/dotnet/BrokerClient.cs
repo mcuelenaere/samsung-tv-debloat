@@ -16,10 +16,26 @@ namespace TvAuthUi
         public string RequestId;
         public string Label;
         public string Package;
+        public string Kind = "exec";
+        public InstallInfo Install;
         public string Command;
         public int CommandBytes;
         public bool CommandTruncated;
         public int TimeoutMs;
+
+        public bool IsPackageOperation => Kind == "install" || Kind == "uninstall";
+    }
+
+    internal sealed class InstallInfo
+    {
+        public string PkgId;
+        public string Name;
+        public string PkgVersion;
+        public string PkgType;
+        public long SizeBytes;
+        public List<string> Privileges = new List<string>();
+        public string Signature;
+        public bool IsUpgrade;
     }
 
     internal sealed class NoticeInfo
@@ -95,7 +111,7 @@ namespace TvAuthUi
             Interlocked.Exchange(ref lastGrantsId, id);
             if (!SendRaw(JsonSerializer.Serialize(new
             {
-                version = 1,
+                version = 2,
                 id = "grants-" + id,
                 method = "grants.list"
             })))
@@ -109,7 +125,7 @@ namespace TvAuthUi
             var id = Interlocked.Increment(ref nextId);
             if (!SendRaw(JsonSerializer.Serialize(new
             {
-                version = 1,
+                version = 2,
                 id = "revoke-" + id,
                 method = "grants.revoke",
                 label
@@ -125,7 +141,7 @@ namespace TvAuthUi
             Interlocked.Exchange(ref lastNotifyId, id);
             if (!SendRaw(JsonSerializer.Serialize(new
             {
-                version = 1,
+                version = 2,
                 id = "notify-" + id,
                 method = "grants.notify",
                 label,
@@ -142,7 +158,7 @@ namespace TvAuthUi
             Interlocked.Exchange(ref lastDecisionId, id);
             if (!SendRaw(JsonSerializer.Serialize(new
             {
-                version = 1,
+                version = 2,
                 id = "decision-" + id,
                 method = "ui.decision",
                 prompt_id = prompt.PromptId,
@@ -210,7 +226,7 @@ namespace TvAuthUi
             Interlocked.Exchange(ref lastHelloId, id);
             if (!SendRaw(JsonSerializer.Serialize(new
             {
-                version = 1,
+                version = 2,
                 id = "hello-" + id,
                 method = "ui.hello"
             })))
@@ -278,6 +294,8 @@ namespace TvAuthUi
                         RequestId = GetString(root, "request_id"),
                         Label = GetString(root, "label"),
                         Package = GetString(root, "package"),
+                        Kind = GetKind(root),
+                        Install = GetInstall(root),
                         Command = GetString(root, "command"),
                         CommandBytes = GetInt(root, "command_bytes"),
                         CommandTruncated = GetBool(root, "command_truncated"),
@@ -385,6 +403,41 @@ namespace TvAuthUi
                 && value.ValueKind == JsonValueKind.String
                 ? value.GetString() ?? ""
                 : "";
+        }
+
+        /// <summary>Absent kind means exec (protocol v1).</summary>
+        private static string GetKind(JsonElement element)
+        {
+            var kind = GetString(element, "kind");
+            return kind == "install" || kind == "uninstall" ? kind : "exec";
+        }
+
+        private static InstallInfo GetInstall(JsonElement root)
+        {
+            if (!root.TryGetProperty("install", out var element)
+                || element.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var info = new InstallInfo
+            {
+                PkgId = GetString(element, "pkgid"),
+                Name = GetString(element, "name"),
+                PkgVersion = GetString(element, "pkg_version"),
+                PkgType = GetString(element, "pkg_type"),
+                SizeBytes = GetLong(element, "size_bytes"),
+                Signature = GetString(element, "signature"),
+                IsUpgrade = GetBool(element, "is_upgrade")
+            };
+            if (element.TryGetProperty("privileges", out var privileges)
+                && privileges.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var privilege in privileges.EnumerateArray())
+                {
+                    if (privilege.ValueKind == JsonValueKind.String)
+                        info.Privileges.Add(privilege.GetString() ?? "");
+                }
+            }
+            return info;
         }
 
         private static int GetInt(JsonElement element, string name)

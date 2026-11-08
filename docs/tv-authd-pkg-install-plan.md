@@ -4,6 +4,12 @@ Status: proposal, self-contained milestone numbering (M1–M3 below). Builds on
 the completed tv-authd broker and the signature-validation analysis of
 T-PTMDEUC (Tizen 6.5, armv7).
 
+M1 is implemented and TV-validated for the TPK path (protocol v2, staging,
+manifest inspection, PID-1 trust enrollment, `pkg.install`, package prompt,
+deny/timeout/policy paths, cold-boot persistence). WGT installs and Samsung
+Home registration remain M4 (§6.1/§13), and M3 on-device signing is not
+started. The work is rebased onto `main` (M4 + `review-fixes`).
+
 ## 1. Goal
 
 Let packaged apps ask tv-authd to install Tizen packages (wgt/tpk), with a
@@ -77,16 +83,24 @@ New daemon module `trust.rs`:
     called directly inside `tv-authd` is invisible to `pkgmgr-server`
     (`package-manager.service`), which runs in the host (`PID 1`) mount
     namespace.
-  - `ensure_enrolled()` must therefore inspect `/proc/1/mounts` and perform
-    its bind-mounts inside `/proc/1/ns/mnt` (via a short helper thread/child
-    that `setns(2)`s into `/proc/1/ns/mnt`, or `/usr/bin/nsenter -t 1 -m --
-    /bin/mount --bind ...`).
+  - `ensure_enrolled()` must therefore perform its bind-mounts inside
+    `/proc/1/ns/mnt` (`/usr/bin/nsenter -t 1 -m -- /bin/mount --bind ...`).
   - Because `tv-authd` itself performs enrollment in `PID 1`'s mount namespace
     at daemon startup and again before each approved install, no separate
     `tv-auth-trust.service` boot unit is needed.
+- `ensure_enrolled()` is idempotent: it verifies by content that the target
+  fingerprint file contains our CA and that the target `tizen-ca` directory
+  contains our CA, then repairs if not. Called at daemon start and again right
+  before each approved install (firmware updates / Samsung services may restore
+  stock files). This firmware's VDFS reports bind mounts oddly in
+  `/proc/self/mounts`, so content, not the mount table, is authoritative.
 - Bind-mounts (in `PID 1`'s mount namespace):
   - `/usr/share/ca-certificates/fingerprint/fingerprint_list.xml` ← ours
   - `/usr/share/ca-certificates/tizen` ← `tizen-ca/` overlay dir
+- Persistence across reboot rides the existing `/opt/etc/parseinfo.sh`
+  dynamic-unit hook: enrollment is re-established by the daemon at startup and
+  before each install (implemented in M1; see §12 for why a separate one-shot
+  boot unit was dropped).
 
 Distributor DUID gate: the user distributor certificate embeds the TV's DUID
 (`vconftool get db/comss/hwduid`) in a custom X.509 extension
@@ -126,8 +140,8 @@ Success:
 ```
 
 Errors (new): `invalid_path` (outside allowlist / not a regular file),
-`too_large` (staging cap, default 128 MiB), `bad_package` (zip/manifest
-invalid), `manifest_forbidden` (see §8 policy),
+`too_large` (staging cap, default 128 MiB; configurable up to 256 MiB),
+`bad_package` (zip/manifest invalid), `manifest_forbidden` (see §8 policy),
 `author_mismatch_requires_reinstall`, `install_failed` (installer non-zero;
 `log_tail_b64` included), `sign_failed`, `user_denied`, `prompt_timeout`,
 plus the existing queue/busy errors.
@@ -325,8 +339,8 @@ or denied requests, while verifying the staged file's SHA-256 before signing):
 ## 8. Policy and safety limits
 
 - **Path allowlist**: `/opt/usr/home/owner/**`, `/opt/media/**`, `/tmp/**`;
-  must be a regular file, no symlink, ≤ 128 MiB (bounded to fit safely in
-  `/opt/tv-auth/staging`).
+  must be a regular file, no symlink, ≤ 128 MiB by default (up to 256 MiB
+  via `--max-package-bytes`), staged under `/opt/tv-auth/staging`.
 - **Zip hygiene**: ≤ 4096 entries, ≤ 512 MiB total uncompressed, no absolute
   or `..` names (reject, don't sanitize).
 - **Package identity**: reject pkgids starting with `com.samsung.`,
@@ -383,9 +397,10 @@ with explicit authorization, on the user's TV.
 
 | Milestone | Content | Host validation | TV validation |
 |---|---|---|---|
-| M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed wgt, `kind=install` prompt, approve/deny | unit tests for protocol/staging/manifest; `sign-wgt.sh` output installs in stock flow (dry-run against device files) | enroll trust, install pre-signed test wgt via broker, prompt UI flow, deny path, reboot persistence of enrollment |
+| M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | uninstall/list protocol round-trips, root-role gating, notice queuing | uninstall prompt flow, root CLI install/uninstall without prompt + toast appears, UI deny path |
-| M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned / foreign-signed wgt → user approves → broker re-signs → installs → launches; appears in Samsung Home; signature survives reboot |
+| M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned / foreign-signed wgt → user approves → broker re-signs → installs → launches; signature survives reboot |
+| M4 | WAS install/registration helper so WGT works and installs appear in Samsung Home | helper API/ABI check, DB row comparison with an SDB install | WGT installs and appears in "My apps"; TPK installed via broker appears in "My apps"; launch from Home |
 
 Out of scope (documented to avoid creep): delta updates, mount-installed
 (readonly) packages, RPM/rpk installs, restoring stock trust (manual
@@ -403,3 +418,185 @@ Out of scope (documented to avoid creep): delta updates, mount-installed
 4. ~~Manifest-declared opt-in marker (`org.tvauth.allow-install`)~~ — no: the
    prompt is the whole gate, and any malicious package would just copy the
    marker.
+
+## 12. M1 implementation notes (host-validated)
+
+Code (all under `root-broker/`):
+
+- `daemon/src/protocol.rs` — protocol v2 requests and metadata, version gating,
+  install validators, `kind`/`install` in `ui.prompt`, `invalid_decision`.
+- `daemon/src/pkgstage.rs` — allowlist, `lstat` + `O_NOFOLLOW`, streamed copy
+  with byte cap, SHA-256, cleanup guard, startup wipe of the staging root.
+- `daemon/src/pkgmeta.rs` — zip hygiene, wgt/tpk manifest parsing, reserved-id
+  and privilege policy, signature labelling.
+- `daemon/src/trust.rs` — material validation, fingerprint parsing, idempotent
+  bind-mount verification/repair.
+- `daemon/src/pkginstall.rs` — `pkgcmd` invocation and `key[end] val[...]`
+  parsing; `executor::execute_argv` runs it without a shell.
+- `daemon/src/approval.rs`, `server.rs`, `main.rs` — prompt kind plumbing,
+  `always` rejection, per-install global lock, CLI flags
+  (`--staging-dir`, `--max-package-bytes`, `--pkgcmd`, `--trust-root`,
+  `--no-trust`, `--no-package-support`, `--enroll-trust`).
+- `ui/dotnet/BrokerClient.cs`, `Program.cs` — parses `kind`/`install` and renders
+  the package prompt with Deny/Install and no Always option.
+- `daemon/PROTOCOL.md`, `daemon/README.md`, `ui/README.md` — wire contract,
+  limits, errors, and UI behavior.
+
+Host validation (rebased on the M4 + review-fixes branches): `cargo test` (106 tests on Linux/Docker, 102 on macOS where
+installer-spawning tests are skipped),
+`cargo clippy --all-targets -D warnings`, ARMv7 musl cross-build (native
+`rust-lld`, `--help` under QEMU), and the managed UI build via
+`ui/build-ui.sh`.
+
+Deviations from the proposal, and why:
+
+1. **No `tv-auth-trust.service` boot unit, and enrollment targets PID 1's
+   namespace.** `tv-authd.service` uses `BindReadOnlyPaths=`, so systemd puts it
+   in a private mount namespace; a separate oneshot unit would be isolated the
+   same way. Enrollment therefore runs inside tv-authd at startup and before
+   each install. TV inspection confirmed `pkgcmd` delegates to
+   `pkgmgr-server` (`package-manager.service`: `Type=dbus`, `User=app_fw`,
+   `PrivateMounts=no`), which runs in the root namespace. The original
+   assumption that `pkgcmd` inherited the daemon's mounts was wrong. The daemon
+   now enters PID 1's mount namespace with `nsenter -t 1 -m` for both the bind
+   mounts and the verification reads; `--enroll-trust` uses the same path.
+2. **Signature status is a label, not verification.** The daemon extracts the
+   SHA-1 of every certificate embedded in the package's signature XML and
+   compares them with the enrolled CA and the listed roots. It does not verify
+   the XML-DSig or build the issuer chain. Our own signer embeds the user root,
+   so `user_ca` is reliable for our packages; Samsung packages normally embed
+   only leaf/intermediate certificates, so they usually label as `foreign_will_resign`
+   ("publisher not identified") unless a listed root is embedded. The stock
+   installer remains the verifier.
+3. **Privilege ceiling is a conservative deny list**, not a copy of Tizen's full
+   privilege table. Unknown/partner privileges pass the UX check and are still
+   rejected by the installer's `CheckPrivilegeLevel` if needed.
+4. **`is_upgrade` is a directory heuristic** over `/opt/usr/apps` and
+   `/usr/apps`; it only changes the prompt wording.
+5. **`install_busy`** was added so a second concurrent install fails fast
+   (`status: busy`) instead of blocking behind the global install lock.
+6. **`detail`** was added to responses for the offending privilege/pkgid list,
+   bad-package reason, enrollment error, and `pkgcmd` status.
+7. **v1 requests remain accepted** for the v1 methods; `pkg.*` requires v2.
+   Responses and `ui.*` messages always carry `"version": 2`.
+8. **The M1 backend remains `pkgcmd`.** The webappservice/WAS backend described
+   in §6/§6.1 is M4; on this firmware it is required for WGT installs and
+   Samsung Home registration. M1 validates TPK installs only.
+9. **Staging is `/opt/tv-auth/staging`** (`0711`, `0644` files) rather than
+   `/run` tmpfs, avoiding RAM pressure and matching the UID-5001
+   `webappservice` requirement for the M4 backend.
+10. **The fingerprint list enrolls the user CA in `tizen-developer`,
+    `tizen-public`, and `tizen-partner`**; the manifest policy refuses only
+    platform-only privileges (and reserved package ids). The prompt shows the
+    requested privileges before approval.
+
+Remaining validation: cold-boot persistence of enrollment (a restart was
+validated; a reboot was still to be scheduled), WGT installs and Samsung Home
+listing (M4), and user-CA-signed package installs (needs the signer, M3).
+
+## 13. TV investigation: Samsung Home and WGT installs (2026-11-08)
+
+The UI commit `51aca7b` noted that a plain `pkgcmd` install runs but does not
+appear under Samsung Home's "My apps"; only `sdb install` lists it. I verified
+and extended that on the TV:
+
+- A signed TPK installed with `pkgcmd -i -t tpk -p …` works and launches, but
+  creates **no** row in `/opt/dbspace/.webappservice.db` (`widgetinfo`). The same
+  TPK installed with `sdb install` gets a row with `install_type=user`,
+  `is_display=1`, `install_state=3`, `app_type=2`, `pkg_type=tpk`. Those rows are
+  exactly the difference between being Home-listed and not.
+- `pkgcmd -i -q -t … -G` (the command `sdbd` embeds for TPKs) still does not
+  create the row; `-G` alone is not enough.
+- `sdb install` runs the WAS path: `libsdbd_plugin.so` statically contains
+  `plugin_wascmd.cpp` and calls `was_install_webapp_for_debug_mode` from
+  `libwas_manager_api.so`. The install output even says
+  `spend time for wascmd`.
+- The standalone `/usr/bin/wascmd` is stubbed on this retail image
+  (`wascmd cannot working in released image`), including `-l`, so it cannot be
+  used as a registration helper from the daemon.
+- **WGT packages cannot be installed with `pkgcmd` at all** on this image:
+  `key[error] val[-4]`, `error message: :Load archive info fail`,
+  `processing result : Operation not allowed [-4]`. Reproduced with a minimal
+  signed wgt, with `-G`, with `-d`, and with a re-signed package derived from
+  the known-good Vetro wgt. `sdb install` for wgt only pushes the file and
+  installs nothing here either.
+
+Consequences for the design:
+
+1. `pkg.install` via `pkgcmd` is currently a **TPK-only** path on this firmware;
+   WGT needs a WAS-based backend (or the failure must be surfaced clearly).
+2. TPKs installed through the broker are not Home-visible unless a WAS
+   registration step is added. They still run and can be launched with
+   `app_launcher`.
+3. New milestone M4: a `tv-was-install`/`tv-was-register` helper that reproduces
+   the SDB install semantics. Candidates to investigate: calling
+   `libwas_manager_api.so` (`was_install_webapp_for_debug_mode`,
+   `was_webapps_sync`) from a small helper, or writing the `widgetinfo` row and
+   checking that Home picks it up. The WAS CLI is not an option (see above).
+
+Also fixed while investigating: `pkgmeta` now reads wgt privileges from
+`<tizen:privilege name="…"/>` (the real config.xml shape) as well as element
+text, instead of element text only.
+
+
+## 14. TV validation results (2026-11-08)
+
+Deployed: daemon 762,228 bytes, SHA-256
+`4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62`; UI signed
+with the Partner profile (`tvauth-partner`, 36,214 bytes, SHA-256
+`5d37e9e4b2a1fbe769093053a5d5d31480321d8635b34658dda332bf4bb005ca`) and installed with
+`sdb install`. Trust material was generated on the build Mac (user root CA
+SHA-1 `8C:28:28:A4:5E:C0:03:BD:B2:86:EF:97:F4:B7:FC:F2:D9:8D:9F:94`) and
+deployed to `/opt/tv-auth/trust/`; the fingerprint list carries the user CA in
+`tizen-developer`, `tizen-public`, and `tizen-partner`.
+
+Validated on the target:
+
+- daemon start and idempotent enrollment; the daemon mounts in **PID 1's**
+  mount namespace (`nsenter -t 1 -m`), and a subsequent check there shows the
+  target fingerprint list contains our CA and the target `tizen-ca` directory
+  contains `user-root-ca.pem`. This is the namespace `pkgmgr-server` uses
+  (`PrivateMounts=no`), unlike the daemon's private namespace;
+- `pkg.install` approve path with a Partner-signed TPK from
+  `org.tvauth.pkgprobe`: the prompt showed name, pkgid, version, type, size,
+  upgrade state, privileges and signature badge; approving returned
+  `status: ok`, `pkgid`, `pkg_version`, `re_signed: false`, and the `pkgcmd`
+  log tail; the package installed and launched;
+- Deny (`XF86Back`) returned `denied/user_denied`; an unattended prompt
+  returned `prompt_timeout`; the staging directory was empty afterwards;
+- `invalid_path` for `/etc/shadow`, `bad_package` for a non-zip file, and
+  `manifest_forbidden` for a manifest requesting
+  `http://tizen.org/privilege/appmanager.admin` (detail lists it);
+- the existing Vetro grant continued to execute through the upgrade and
+  `/opt/tv-auth/grants.json` was unchanged.
+
+Bugs found and fixed during this validation:
+
+1. `pkgcmd` prefixes its status pairs with `__return_cb …`; `last_end_value`
+   now scans the whole line instead of requiring it to start with `key[`.
+2. Tizen signatures embed leaf/intermediate certificates, not the root;
+   classification now checks the whole chain. Samsung packages therefore
+   usually label as "publisher not identified" unless a listed root is
+   embedded.
+3. wgt privileges use `<tizen:privilege name="…"/>`; `pkgmeta` now accepts both
+   that shape and element text.
+4. Trust enrollment originally mounted in the daemon's private mount namespace.
+   `pkgcmd` delegates validation to `pkgmgr-server` in the root namespace, so
+   those mounts were invisible to the validator. Enrollment now enters PID 1's
+   namespace with `nsenter -t 1 -m` for mounts and verification.
+5. Extracting the stock CA directory on macOS leaves AppleDouble `._*.pem`
+   sidecars. Uploading those into `tizen-ca` makes *every* certificate chain
+   fail (`-12 Invalid certificate chain`) even for stock-signed packages.
+   Clean them before deployment (`find … -name '._*' -delete` or
+   `COPYFILE_DISABLE=1 tar`), and keep the CA directory free of non-PEM files.
+
+Cold boot validated on 2026-11-08 at 21:40: the AT-HUB hook started
+`tv-authd` (`start units rc=0`), the daemon recreated
+`/opt/tv-auth/staging`, re-enrolled trust in PID 1 (fingerprint list has the
+user CA in three domains; `tizen-ca/user-root-ca.pem` present), loaded the
+existing Vetro grant unchanged, and a broker TPK install after boot returned
+`status: ok` with `trust_enrollment=AlreadyEnrolled`. The `org.tvauth.ui`
+Home row survived the reboot.
+
+Still pending: WGT installs and Samsung Home registration (M4); approval and
+installation of user-CA-signed packages (needs the M3 signer).

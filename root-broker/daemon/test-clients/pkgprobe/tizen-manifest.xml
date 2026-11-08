@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://tizen.org/ns/packages" package="org.tvauth.pkgprobe" version="0.1.0" api-version="6.5">
+  <profile name="tv"/>
+  <service-application appid="org.tvauth.pkgprobe" exec="PkgProbe.dll" type="dotnet" multiple="false" taskmanage="false" nodisplay="true" auto-restart="false" on-boot="false">
+    <label>Package install probe</label>
+    <icon>icon.png</icon>
+  </service-application>
+  <privileges>
+    <privilege>http://tizen.org/privilege/filesystem.read</privilege>
+    <privilege>http://tizen.org/privilege/filesystem.write</privilege>
+  </privileges>
+</manifest>

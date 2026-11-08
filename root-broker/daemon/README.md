@@ -6,7 +6,9 @@ exact package-level grant. M1 validated the headless broker. M2 added the
 interactive approval flow, persistent **Always allow** grants, and the managed
 .NET grant manager under `root-broker/ui/`. The live branch also has per-app
 execution toasts; M4 binds grants to the installed package signature and adds
-failure-path/probe coverage.
+failure-path/probe coverage. Protocol v2 adds `pkg.install` with staging,
+manifest inspection, trust enrollment, and a package-aware prompt (M1 of
+`../../docs/tv-authd-pkg-install-plan.md`; host-validated, not yet TV-validated).
 
 The wire contract is in [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -51,8 +53,11 @@ migration (including preserving `notify`), per-app notify modes, role
 separation, approval queueing and queue exhaustion, deny/once/always, nonce
 rejection, timeouts, UI disconnect, requester hangup, grant
 persistence/revocation, execution, process-group timeouts, output truncation in
-both streams, and EINTR handling. The integrated suite is 66 Linux tests. Linux
-integration tests run in Docker:
+both streams, EINTR handling, package staging (allowlist, symlinks, size caps,
+cleanup), zip hygiene and manifest parsing, identity/privilege policy,
+signature labelling, trust material and mount parsing, `pkgcmd` output
+handling, and the full install prompt/approve/deny/failure flows. The
+integrated suite is 106 Linux tests. Linux integration tests run in Docker:
 
 ```sh
 docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
@@ -67,11 +72,12 @@ docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
 
 This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
-checks its `--help` output under ARM emulation. A full build takes about 11 s
-(the previous fully emulated build took about 100 s). The integrated M4 build
-(with the live toast branch) is 584,452 bytes, SHA-256
-`7903c0bac20e27ba3fb1de6b8def5424507e9d9f5c8ab77034c9f5cf5000f464`
-(M2 was 546,388 bytes; M1 was 461,940 bytes).
+checks its `--help` output under ARM emulation. A full build takes about 8 s
+(the previous fully emulated build took about 100 s). With package-install M1
+on top of M4 and the review-fixes hardening the binary is 762,228 bytes,
+SHA-256 `4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62` (TV-validated
+for the TPK install flow; see the package-install plan). The validated M4 build was 584,452 bytes, SHA-256
+`7903c0bac20e27ba3fb1de6b8def5424507e9d9f5c8ab77034c9f5cf5000f464`.
 
 ## CLI defaults
 
@@ -90,6 +96,41 @@ checks its `--help` output under ARM emulation. A full build takes about 11 s
 | `--launch-cooldown-ms` | `1000` | relaunch rate limit |
 | `--prompt-queue-max` | `8` | pending requests |
 | `--max-launch-attempts` | `3` | UI launches per request burst |
+| `--staging-dir` | `/opt/tv-auth/staging` | package staging (`0711`, wiped at start) |
+| `--max-package-bytes` | `134217728` (128 MiB) | staged package cap (max 256 MiB) |
+| `--pkgcmd` | `/usr/bin/pkgcmd` | stock installer |
+| `--trust-root` | `/opt/tv-auth/trust` | CA material and fingerprint list |
+| `--no-trust` | off | skip trust enrollment (development only) |
+| `--no-package-support` | off | serve `exec` only |
+| `--enroll-trust` | off | verify/repair the bind mounts and exit |
+
+## Package installation
+
+`pkg.install` stages a wgt/tpk into `/opt/tv-auth/staging/` (`0711`; staged
+files `0644`; wiped at startup), parses its manifest, and prompts with
+`kind: "install"`. Only after
+the user approves does it enroll trust and run `pkgcmd -i -t <type> -p <staged>`.
+The source allowlist is `/opt/usr/home/owner/**`, `/opt/media/**`, and `/tmp/**`;
+packages are capped at 128 MiB by
+default (`--max-package-bytes`, up to 256 MiB), because staging is on the
+`/run` tmpfs. Package operations never use the grant store and
+are always interactive; see `PROTOCOL.md`.
+
+Trust enrollment needs `/opt/tv-auth/trust/` containing `user-root-ca.pem`,
+`fingerprint_list.xml`, and `tizen-ca/`. The daemon verifies the material and
+bind-mounts it over the stock `/usr/share/ca-certificates/...` paths **in PID
+1's mount namespace** (`nsenter -t 1 -m`). This matters: `tv-authd.service`
+uses `BindReadOnlyPaths=`, so the daemon lives in a private mount namespace,
+while `pkgcmd` delegates the install to `pkgmgr-server` (`package-manager.service`,
+`User=app_fw`, `PrivateMounts=no`), which only sees the root namespace. Mounts in
+the daemon's namespace would be invisible to the validator. The mounts are
+re-established at daemon start and before each install; `tv-authd
+--enroll-trust` runs the same check once and exits.
+
+Host validation covers staging, zip hygiene, manifest parsing, policy refusals,
+approval plumbing, and `pkgcmd` invocation with a fake installer. TV validation confirmed the PID-1 root-namespace enrollment, the TPK install
+flow, the prompt, deny and error paths, and cold-boot persistence (see
+`../../docs/tv-authd-pkg-install-plan.md` §14).
 
 The launcher inherits the daemon's systemd environment. On this TV that includes
 `XDG_RUNTIME_DIR=/run`, which AUL's launcher path uses. Do not clear it.
@@ -143,14 +184,19 @@ after external edits.
 /opt/tv-units/
     tv-authd.service
 
-/opt/tv-auth/
+/opt/tv-auth/              # 0711 (traversal for UID 5001)
     tv-authd
-    grants.json
+    grants.json            # 0600
+    staging/               # 0711, 0644 files, wiped at daemon start
+    trust/                 # 0700
+        user-root-ca.pem
+        fingerprint_list.xml
+        tizen-ca/
 
 /run/opt/tv-auth/          # per-service read-only bind mount of /opt/tv-auth
     tv-authd
 
-/run/tv-auth/
+/run/tv-auth/              # 0711
     broker.sock
     tv-authd.log
 ```
@@ -200,7 +246,8 @@ signed DLL/manifest, so the grant fingerprint must change).
 
 M1 deployed and cold-boot validated on 2026-11-05:
 
-1. `/opt/tv-auth` and `/opt/tv-units` are root-owned mode `0700`, SMACK
+1. `/opt/tv-auth` is root-owned mode `0711` (with `grants.json` `0600`,
+   `staging/` `0711`, and `trust/` `0700`); `/opt/tv-units` is `0700`. SMACK
    `System::Shared`.
 2. `/opt/tv-auth/tv-authd` is installed mode `0755`; grants file is `0600`.
 3. The dynamic AT-HUB hook discovers `/opt/tv-units/*.service`; it starts the

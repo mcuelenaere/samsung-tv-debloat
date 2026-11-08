@@ -9,7 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, ApprovalConfig, ApprovalManager, Broker, GrantStore, Logger, ServerConfig,
+    identity, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker, GrantStore, Logger,
+    PackageConfig, ServerConfig,
 };
 
 struct Args {
@@ -19,6 +20,8 @@ struct Args {
     socket_gid: u32,
     server: ServerConfig,
     approval: ApprovalConfig,
+    packages: Option<PackageConfig>,
+    enroll_trust: bool,
 }
 
 struct ActiveConnection(Arc<AtomicUsize>);
@@ -46,6 +49,28 @@ fn main() {
 }
 
 fn run(args: Args) -> io::Result<()> {
+    if args.enroll_trust {
+        let Some(packages) = &args.packages else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--enroll-trust needs package support (remove --no-package-support)",
+            ));
+        };
+        let Some(paths) = &packages.trust else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--enroll-trust needs a trust root (remove --no-trust)",
+            ));
+        };
+        return match trust::ensure_enrolled(paths) {
+            Ok(enrollment) => {
+                println!("trust enrollment: {enrollment}");
+                Ok(())
+            }
+            Err(error) => Err(io::Error::other(error.to_string())),
+        };
+    }
+
     let grants = Arc::new(Mutex::new(GrantStore::load(&args.grants)?));
     let logger = Arc::new(Logger::new(&args.log)?);
     logger.log(&format!(
@@ -56,6 +81,26 @@ fn run(args: Args) -> io::Result<()> {
         args.server.ui_label,
         args.approval.ui_app_id
     ))?;
+
+    if let Some(packages) = &args.packages {
+        pkgstage::prepare_staging_root(&packages.staging.root)?;
+        logger.log(&format!(
+            "staging_ready root={} pkgcmd={}",
+            packages.staging.root.display(),
+            packages.pkgcmd.display()
+        ))?;
+        if let Some(paths) = &packages.trust {
+            match trust::ensure_enrolled(paths) {
+                Ok(enrollment) => {
+                    logger.log(&format!("trust_enrollment={enrollment}"))?;
+                }
+                Err(error) => {
+                    // Exec keeps working; pkg.install will fail with enroll_failed.
+                    logger.log(&format!("trust_enrollment_failed={error}"))?;
+                }
+            }
+        }
+    }
 
     let manager = ApprovalManager::start(
         args.approval.clone(),
@@ -171,6 +216,12 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut prompt_queue_max = 8_usize;
     let mut max_launch_attempts = 3_usize;
     let mut max_connections = 16_usize;
+    let mut staging_dir = PathBuf::from("/opt/tv-auth/staging");
+    let mut max_package_bytes = pkgstage::DEFAULT_MAX_PACKAGE_BYTES;
+    let mut pkgcmd = PathBuf::from("/usr/bin/pkgcmd");
+    let mut trust_root = Some(PathBuf::from(trust::DEFAULT_TRUST_ROOT));
+    let mut package_support = true;
+    let mut enroll_trust = false;
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(argument) = parser.next().map_err(|error| error.to_string())? {
@@ -197,6 +248,15 @@ fn parse_args() -> Result<Option<Args>, String> {
             Long("max-launch-attempts") => {
                 max_launch_attempts = value(&mut parser, "max-launch-attempts")?
             }
+            Long("staging-dir") => staging_dir = path(&mut parser)?,
+            Long("max-package-bytes") => {
+                max_package_bytes = value(&mut parser, "max-package-bytes")?
+            }
+            Long("pkgcmd") => pkgcmd = path(&mut parser)?,
+            Long("trust-root") => trust_root = Some(path(&mut parser)?),
+            Long("no-trust") => trust_root = None,
+            Long("no-package-support") => package_support = false,
+            Long("enroll-trust") => enroll_trust = true,
             Long("help") | Short('h') => {
                 println!(
                     "tv-authd {}\n\
@@ -216,7 +276,14 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --ui-launch-timeout-ms MS    UI connect timeout (default 10000)\n\
                      --launch-cooldown-ms MS      relaunch cooldown (default 1000)\n\
                      --prompt-queue-max COUNT     waiting requests (default 8)\n\
-                     --max-launch-attempts COUNT  UI launch attempts (default 3)",
+                     --max-launch-attempts COUNT  UI launch attempts (default 3)\n\
+                     --staging-dir PATH           package staging root (default /opt/tv-auth/staging)\n\
+                     --max-package-bytes BYTES    staged package cap (default 134217728)\n\
+                     --pkgcmd PATH                stock installer (default /usr/bin/pkgcmd)\n\
+                     --trust-root PATH            trust material (default /opt/tv-auth/trust)\n\
+                     --no-trust                   skip trust enrollment (development only)\n\
+                     --no-package-support         serve exec only\n\
+                     --enroll-trust               verify/repair trust bind mounts and exit",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(None);
@@ -260,6 +327,23 @@ fn parse_args() -> Result<Option<Args>, String> {
         max_launch_attempts,
         notice_interval: Duration::from_millis(250),
     };
+    if !(1024 * 1024..=pkgstage::MAX_PACKAGE_BYTES_LIMIT).contains(&max_package_bytes) {
+        return Err("--max-package-bytes must be between 1 MiB and 256 MiB".into());
+    }
+
+    let packages = package_support.then(|| PackageConfig {
+        staging: pkgstage::StageConfig {
+            root: staging_dir,
+            max_bytes: max_package_bytes,
+            ..pkgstage::StageConfig::default()
+        },
+        pkgcmd,
+        trust: trust_root.map(trust::TrustPaths::new),
+        installed_roots: tv_authd::DEFAULT_INSTALLED_ROOTS
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+    });
     let server = ServerConfig {
         max_connections,
         max_ui_connections: 2,
@@ -267,6 +351,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         ui_label: format!("User::Pkg::{ui_package}"),
         ui_uid,
         approval_wait_timeout: approval.approval_wait_timeout(),
+        packages: packages.clone(),
     };
 
     Ok(Some(Args {
@@ -276,6 +361,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         socket_gid,
         server,
         approval,
+        packages,
+        enroll_trust,
     }))
 }
 

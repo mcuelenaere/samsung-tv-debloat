@@ -1,10 +1,11 @@
 # tv-auth approval and grant-manager UI
 
-This is the M2 managed Tizen .NET UI for `tv-authd`. It has three jobs:
+This is the managed Tizen .NET UI for `tv-authd`. It has four jobs:
 
 1. show the daemon-generated approval prompt when an application requests root;
-2. list and revoke persistent **Always allow** grants;
-3. show a small toast when an **Always allow** app runs a root command.
+2. show a package-aware prompt for `pkg.install` (`kind: "install"`);
+3. list and revoke persistent **Always allow** grants;
+4. show a small toast when an **Always allow** app runs a root command.
 
 The UI is a normal UID-5001 package with the exact SMACK label
 `User::Pkg::org.tvauth.ui`. It never runs as root and has no network privilege.
@@ -48,6 +49,28 @@ RETURN activates the focused button. BACK denies the pending prompt (it does not
 silently dismiss the request). Arrow-key focus movement uses Elementary's normal
 focus handling; RETURN, Right/Left, and BACK were validated on the TV with
 `input_keyevent`.
+
+### Package prompt
+
+For `pkg.install` the daemon sends `kind: "install"` with an `install` object.
+The UI replaces the root-access warning with the package facts:
+
+- requester (package ID and SMACK label);
+- package name, package ID, version, type, and staged size;
+- an upgrade note when the daemon believes the package is already installed;
+- a signature badge: "Unsigned package — no trusted signature", "Third-party
+  signature — not trusted by this TV", "Signed by your own CA", or "Signed by
+  Samsung". Once M3 on-device signing lands, the unsigned/foreign labels will
+  say that the package will be re-signed before installation;
+- the requested privileges with friendly names for common Tizen privileges
+  (up to 7 are listed; the rest are summarised);
+- **Deny** and **Install** buttons only. There is deliberately no **Always
+  allow**: every package operation is a fresh decision and the daemon rejects
+  `always` for these prompts.
+
+The app-facing decision value is still `once`. The prompt covers exactly the
+staged package the daemon inspected; changing the source file after the request
+does not change what is installed.
 
 ### Execution toast
 
@@ -117,12 +140,13 @@ out/tv-auth-ui/org.tvauth.ui-0.1.0.tpk
 out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
 ```
 
-Observed local artifacts:
+Observed local artifacts (after rebasing package-prompt work onto M4):
 
 ```text
-Managed assembly: 46,592 bytes
-Unsigned TPK:     21,536 bytes
-Signed TPK:       29,135 bytes (Partner key)
+Managed assembly: 56,320 bytes
+Unsigned TPK:     28,630 bytes
+Signed TPK:       36,214 bytes (Partner profile `tvauth-partner`, SHA-256
+                  `5d37e9e4b2a1fbe769093053a5d5d31480321d8635b34658dda332bf4bb005ca`)
 ```
 
 ## Signing and installation

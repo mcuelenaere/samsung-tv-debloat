@@ -3,14 +3,29 @@ use crate::identity::{is_valid_package_label, package_from_label};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version written into every response and `ui.*` message. Requests may still
+/// use version 1 for the methods that existed in v1.
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const MIN_REQUEST_VERSION: u32 = 1;
+pub const MAX_REQUEST_VERSION: u32 = PROTOCOL_VERSION;
+/// `pkg.*` methods require this version; v1 clients cannot reach them.
+pub const PACKAGE_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_INSTALL_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_INSTALL_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 pub const MAX_PROMPT_COMMAND_BYTES: usize = 4096;
 pub const MAX_NOTICE_COMMAND_BYTES: usize = 256;
+pub const MAX_PACKAGE_PATH_BYTES: usize = 4096;
+pub const MAX_PKGID_BYTES: usize = 127;
+pub const MAX_PKG_NAME_BYTES: usize = 128;
+pub const MAX_PKG_VERSION_BYTES: usize = 64;
+pub const MAX_PRIVILEGE_BYTES: usize = 256;
+pub const MAX_PRIVILEGES: usize = 128;
+pub const MAX_INSTALL_LOG_TAIL_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +84,82 @@ pub struct GrantsNotifyRequest {
     pub notify: NotifyMode,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+    pub pkg_type: PackageType,
+    pub path: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageType {
+    Wgt,
+    Tpk,
+}
+
+impl PackageType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wgt => "wgt",
+            Self::Tpk => "tpk",
+        }
+    }
+}
+
+/// Which kind of approval a prompt is asking for. `exec` keeps the v1
+/// once/always semantics; package operations are always one-shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptKind {
+    Exec,
+    Install,
+    Uninstall,
+}
+
+impl PromptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+        }
+    }
+
+    /// Only root exec has persistent grants (§5.4 of the install plan).
+    pub fn allows_always(self) -> bool {
+        matches!(self, Self::Exec)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureStatus {
+    UnsignedWillResign,
+    ForeignWillResign,
+    UserCa,
+    Samsung,
+}
+
+/// Metadata shown on a package approval prompt. Every string field is
+/// sanitized and length-limited before it reaches this struct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstallMeta {
+    pub pkgid: String,
+    pub name: String,
+    pub pkg_version: String,
+    pub pkg_type: PackageType,
+    pub size_bytes: u64,
+    pub privileges: Vec<String>,
+    pub signature: SignatureStatus,
+    pub is_upgrade: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
@@ -85,6 +176,7 @@ pub enum Request {
     GrantsList(GrantsListRequest),
     GrantsRevoke(GrantsRevokeRequest),
     GrantsNotify(GrantsNotifyRequest),
+    PkgInstall(InstallRequest),
 }
 
 impl Request {
@@ -96,6 +188,7 @@ impl Request {
             Self::GrantsList(request) => &request.id,
             Self::GrantsRevoke(request) => &request.id,
             Self::GrantsNotify(request) => &request.id,
+            Self::PkgInstall(request) => &request.id,
         }
     }
 }
@@ -125,7 +218,7 @@ struct MethodPeek {
 
 pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
     let peek: MethodPeek = serde_json::from_slice(bytes).map_err(|_| ParseError::Malformed)?;
-    if peek.version != PROTOCOL_VERSION {
+    if peek.version < MIN_REQUEST_VERSION || peek.version > MAX_REQUEST_VERSION {
         return Err(ParseError::UnsupportedVersion);
     }
     let request = match peek.method.as_str() {
@@ -143,6 +236,12 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
         "grants.notify" => {
             serde_json::from_slice::<GrantsNotifyRequest>(bytes).map(Request::GrantsNotify)
         }
+        "pkg.install" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<InstallRequest>(bytes).map(Request::PkgInstall)
+        }
+        // A v1 client asking for a v2-only method is a version problem, not an
+        // unknown method: the client should learn that it must upgrade.
+        "pkg.install" => return Err(ParseError::UnsupportedVersion),
         _ => return Err(ParseError::UnsupportedMethod),
     };
     request.map_err(|_| ParseError::Malformed)
@@ -162,6 +261,22 @@ pub fn validate_exec(request: &ExecRequest) -> Result<u64, &'static str> {
     }
     let timeout = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     if timeout == 0 || timeout > MAX_TIMEOUT_MS {
+        return Err("invalid_timeout");
+    }
+    Ok(timeout)
+}
+
+pub fn validate_install(request: &InstallRequest) -> Result<u64, &'static str> {
+    let path = request.path.as_str();
+    if path.is_empty()
+        || path.len() > MAX_PACKAGE_PATH_BYTES
+        || path.as_bytes().contains(&0)
+        || !std::path::Path::new(path).is_absolute()
+    {
+        return Err("invalid_path");
+    }
+    let timeout = request.timeout_ms.unwrap_or(DEFAULT_INSTALL_TIMEOUT_MS);
+    if timeout == 0 || timeout > MAX_INSTALL_TIMEOUT_MS {
         return Err("invalid_timeout");
     }
     Ok(timeout)
@@ -209,6 +324,17 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkgid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkg_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub re_signed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_tail_b64: Option<String>,
+    /// Human-readable policy detail (for example the rejected privileges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// `ui.hello` only: `"notice"` when the daemon launched the UI just to
     /// show execution notices, so it should stay out of the way.
@@ -229,6 +355,11 @@ impl Response {
             truncated: None,
             grants: None,
             revoked: None,
+            pkgid: None,
+            pkg_version: None,
+            re_signed: None,
+            log_tail_b64: None,
+            detail: None,
             error: None,
             launch: None,
         }
@@ -252,9 +383,42 @@ impl Response {
             truncated: Some(outcome.truncated),
             grants: None,
             revoked: None,
+            pkgid: None,
+            pkg_version: None,
+            re_signed: None,
+            log_tail_b64: None,
+            detail: None,
             error: None,
             launch: None,
         }
+    }
+
+    pub fn install_ok(
+        id: &str,
+        pkgid: &str,
+        pkg_version: &str,
+        re_signed: bool,
+        log_tail: &[u8],
+    ) -> Self {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut response = Self::base(id, "ok");
+        response.pkgid = Some(pkgid.to_owned());
+        response.pkg_version = Some(pkg_version.to_owned());
+        response.re_signed = Some(re_signed);
+        response.log_tail_b64 = Some(engine.encode(log_tail));
+        response
+    }
+
+    pub fn error_with_detail(
+        id: &str,
+        status: &'static str,
+        error: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        let mut response = Self::error(id, status, error);
+        response.detail = detail;
+        response
     }
 
     pub fn error(id: &str, status: &'static str, error: impl Into<String>) -> Self {
@@ -340,6 +504,11 @@ pub struct PromptMessage {
     pub request_id: String,
     pub label: String,
     pub package: String,
+    /// `exec`, `install`, or `uninstall`.
+    pub kind: &'static str,
+    /// Present for `kind = "install"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallMeta>,
     pub command: String,
     pub command_bytes: usize,
     pub command_truncated: bool,
@@ -347,30 +516,45 @@ pub struct PromptMessage {
 }
 
 impl PromptMessage {
-    pub fn new(
-        prompt_id: String,
-        nonce: String,
-        request_id: &str,
-        label: &str,
-        command: &str,
-        timeout_ms: u64,
-    ) -> Self {
-        let safe = display_safe(command);
+    pub fn new(prompt_id: String, nonce: String, input: PromptInput<'_>) -> Self {
+        let safe = display_safe(input.command);
         let (display, truncated) = truncate_text(&safe, MAX_PROMPT_COMMAND_BYTES);
         Self {
             version: PROTOCOL_VERSION,
             message_type: "ui.prompt",
             prompt_id,
             nonce,
-            request_id: request_id.to_owned(),
-            label: label.to_owned(),
-            package: package_from_label(label).unwrap_or(label).to_owned(),
+            request_id: input.request_id.to_owned(),
+            label: input.label.to_owned(),
+            package: package_from_label(input.label)
+                .unwrap_or(input.label)
+                .to_owned(),
+            kind: input.kind.as_str(),
+            install: input.install,
             command: display,
-            command_bytes: command.len(),
+            command_bytes: input.command.len(),
             command_truncated: truncated,
-            timeout_ms,
+            timeout_ms: input.timeout_ms,
         }
     }
+}
+
+/// The request-derived part of a prompt. Kept as a struct so the prompt
+/// constructor stays readable.
+pub struct PromptInput<'a> {
+    pub request_id: &'a str,
+    pub label: &'a str,
+    pub kind: PromptKind,
+    pub install: Option<InstallMeta>,
+    pub command: &'a str,
+    pub timeout_ms: u64,
+}
+
+/// Sanitize a package-controlled string for display in a prompt and cut it to
+/// `maximum` bytes (on a character boundary).
+pub fn prompt_text(value: &str, maximum: usize) -> String {
+    let safe = display_safe(value);
+    truncate_text(&safe, maximum).0
 }
 
 /// Replace characters that could make the displayed command differ from the
@@ -590,13 +774,79 @@ mod tests {
             ParseError::UnsupportedMethod
         );
         assert_eq!(
-            parse_request(br#"{"version":2,"id":"a","method":"exec"}"#).unwrap_err(),
+            parse_request(br#"{"version":3,"id":"a","method":"exec"}"#).unwrap_err(),
+            ParseError::UnsupportedVersion
+        );
+        assert_eq!(
+            parse_request(br#"{"version":0,"id":"a","method":"exec"}"#).unwrap_err(),
             ParseError::UnsupportedVersion
         );
         assert_eq!(
             parse_request(b"{not-json}").unwrap_err(),
             ParseError::Malformed
         );
+    }
+
+    #[test]
+    fn accepts_v1_and_v2_exec_requests() {
+        assert!(matches!(
+            parse_request(br#"{"version":1,"id":"a","method":"exec","command":"id"}"#).unwrap(),
+            Request::Exec(_)
+        ));
+        assert!(matches!(
+            parse_request(br#"{"version":2,"id":"a","method":"exec","command":"id"}"#).unwrap(),
+            Request::Exec(_)
+        ));
+    }
+
+    #[test]
+    fn package_installs_require_protocol_v2() {
+        let v1 = br#"{"version":1,"id":"a","method":"pkg.install","pkg_type":"wgt","path":"/tmp/a.wgt"}"#;
+        assert_eq!(
+            parse_request(v1).unwrap_err(),
+            ParseError::UnsupportedVersion
+        );
+        let v2 = br#"{"version":2,"id":"a","method":"pkg.install","pkg_type":"wgt","path":"/tmp/a.wgt"}"#;
+        match parse_request(v2).unwrap() {
+            Request::PkgInstall(request) => {
+                assert_eq!(request.pkg_type, PackageType::Wgt);
+                assert_eq!(request.path, "/tmp/a.wgt");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        assert_eq!(
+            parse_request(
+                br#"{"version":2,"id":"a","method":"pkg.install","pkg_type":"rpm","path":"/tmp/a"}"#
+            )
+            .unwrap_err(),
+            ParseError::Malformed
+        );
+    }
+
+    #[test]
+    fn validates_install_paths_and_timeouts() {
+        let mut request = InstallRequest {
+            version: 2,
+            id: "inst".into(),
+            method: "pkg.install".into(),
+            pkg_type: PackageType::Wgt,
+            path: "/tmp/a.wgt".into(),
+            timeout_ms: None,
+        };
+        assert_eq!(validate_install(&request), Ok(DEFAULT_INSTALL_TIMEOUT_MS));
+
+        request.path = "relative/a.wgt".into();
+        assert_eq!(validate_install(&request), Err("invalid_path"));
+        request.path = "/tmp/a\0.wgt".into();
+        assert_eq!(validate_install(&request), Err("invalid_path"));
+        request.path = format!("/{}", "a".repeat(MAX_PACKAGE_PATH_BYTES));
+        assert_eq!(validate_install(&request), Err("invalid_path"));
+
+        request.path = "/tmp/a.wgt".into();
+        request.timeout_ms = Some(0);
+        assert_eq!(validate_install(&request), Err("invalid_timeout"));
+        request.timeout_ms = Some(MAX_INSTALL_TIMEOUT_MS + 1);
+        assert_eq!(validate_install(&request), Err("invalid_timeout"));
     }
 
     #[test]
@@ -649,14 +899,52 @@ mod tests {
         let prompt = PromptMessage::new(
             "p".into(),
             "n".into(),
-            "r",
-            "User::Pkg::org.example.app",
-            &"x".repeat(MAX_PROMPT_COMMAND_BYTES + 10),
-            1000,
+            PromptInput {
+                request_id: "r",
+                label: "User::Pkg::org.example.app",
+                kind: PromptKind::Exec,
+                install: None,
+                command: &"x".repeat(MAX_PROMPT_COMMAND_BYTES + 10),
+                timeout_ms: 1000,
+            },
         );
         assert!(prompt.command_truncated);
         assert_eq!(prompt.command.len(), MAX_PROMPT_COMMAND_BYTES);
         assert_eq!(prompt.package, "org.example.app");
+        assert_eq!(prompt.kind, "exec");
+        assert!(prompt.install.is_none());
+    }
+
+    #[test]
+    fn install_prompt_carries_package_metadata() {
+        let meta = InstallMeta {
+            pkgid: "org.example.app".into(),
+            name: "Example".into(),
+            pkg_version: "1.0.0".into(),
+            pkg_type: PackageType::Wgt,
+            size_bytes: 1234,
+            privileges: vec!["http://tizen.org/privilege/internet".into()],
+            signature: SignatureStatus::UnsignedWillResign,
+            is_upgrade: false,
+        };
+        let prompt = PromptMessage::new(
+            "p".into(),
+            "n".into(),
+            PromptInput {
+                request_id: "r",
+                label: "User::Pkg::org.example.app",
+                kind: PromptKind::Install,
+                install: Some(meta),
+                command: "install wgt /tmp/app.wgt",
+                timeout_ms: 1000,
+            },
+        );
+        assert_eq!(prompt.kind, "install");
+        let value = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(value["install"]["pkgid"], "org.example.app");
+        assert_eq!(value["install"]["signature"], "unsigned_will_resign");
+        assert!(!PromptKind::Install.allows_always());
+        assert!(PromptKind::Exec.allows_always());
     }
 
     #[test]
@@ -664,10 +952,14 @@ mod tests {
         let prompt = PromptMessage::new(
             "p".into(),
             "n".into(),
-            "r",
-            "User::Pkg::org.example.app",
-            "one\u{0}two\u{202e}three\nfour",
-            1000,
+            PromptInput {
+                request_id: "r",
+                label: "User::Pkg::org.example.app",
+                kind: PromptKind::Exec,
+                install: None,
+                command: "one\u{0}two\u{202e}three\nfour",
+                timeout_ms: 1000,
+            },
         );
         assert_eq!(prompt.command, "one\u{FFFD}two\u{FFFD}three\nfour");
         assert!(!prompt.command_truncated);

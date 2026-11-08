@@ -1,7 +1,8 @@
 use crate::grants::{GrantError, GrantStore};
 use crate::logger::Logger;
 use crate::protocol::{
-    write_json, write_response, Decision, NoticeEntry, NoticeMessage, PromptMessage, Response,
+    write_json, write_response, Decision, InstallMeta, NoticeEntry, NoticeMessage, PromptInput,
+    PromptKind, PromptMessage, Response,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -67,6 +68,9 @@ pub struct ApprovalRequest {
     pub ticket: u64,
     pub request_id: String,
     pub label: String,
+    pub kind: PromptKind,
+    /// Package metadata for `kind = "install"`.
+    pub install: Option<InstallMeta>,
     pub command: String,
     pub reply: Sender<ApprovalResult>,
 }
@@ -348,9 +352,10 @@ impl Manager {
             return;
         }
         self.log(&format!(
-            "approval_queued label={} request={} command_bytes={}",
+            "approval_queued label={} request={} kind={} command_bytes={}",
             request.label,
             request.request_id,
+            request.kind.as_str(),
             request.command.len()
         ));
         self.queue.push_back(PendingRequest {
@@ -558,6 +563,19 @@ impl Manager {
             .active
             .take()
             .expect("validated active prompt must exist");
+
+        // Package operations have no persistent grant: the UI may only send
+        // deny/once for them. Reject "always" without consuming the prompt so
+        // the user can still decide.
+        if decision == Decision::Always && !active.request.kind.allows_always() {
+            self.active = Some(active);
+            self.log(&format!(
+                "prompt_decision_rejected token={token} request={id} reason=always_not_allowed"
+            ));
+            self.send_to_ui(token, &Response::error(id, "error", "invalid_decision"));
+            return;
+        }
+
         let mut ui_error = None;
         let result = match decision {
             Decision::Deny => ApprovalResult::Denied("denied", "user_denied"),
@@ -598,8 +616,11 @@ impl Manager {
             }
         }
         self.log(&format!(
-            "prompt_decision label={} request={} decision={:?}",
-            active.request.label, active.request.request_id, decision
+            "prompt_decision label={} request={} kind={} decision={:?}",
+            active.request.label,
+            active.request.request_id,
+            active.request.kind.as_str(),
+            decision
         ));
         self.reply(active.request, result);
         self.ensure_prompt();
@@ -671,10 +692,14 @@ impl Manager {
         let message = PromptMessage::new(
             prompt_id.clone(),
             nonce.clone(),
-            &pending.request.request_id,
-            &pending.request.label,
-            &pending.request.command,
-            timeout_ms,
+            PromptInput {
+                request_id: &pending.request.request_id,
+                label: &pending.request.label,
+                kind: pending.request.kind,
+                install: pending.request.install.clone(),
+                command: &pending.request.command,
+                timeout_ms,
+            },
         );
         let write_result = {
             let mut writer = ui.writer.lock().unwrap_or_else(|error| error.into_inner());
@@ -934,7 +959,34 @@ mod tests {
                 ticket: 0,
                 request_id: "request-1".into(),
                 label: label.into(),
+                kind: PromptKind::Exec,
+                install: None,
                 command: "id".into(),
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    fn install_request(label: &str) -> (ApprovalRequest, mpsc::Receiver<ApprovalResult>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            ApprovalRequest {
+                ticket: 0,
+                request_id: "install-1".into(),
+                label: label.into(),
+                kind: PromptKind::Install,
+                install: Some(InstallMeta {
+                    pkgid: "org.example.app".into(),
+                    name: "Example".into(),
+                    pkg_version: "1.0.0".into(),
+                    pkg_type: crate::protocol::PackageType::Wgt,
+                    size_bytes: 42,
+                    privileges: vec!["http://tizen.org/privilege/internet".into()],
+                    signature: crate::protocol::SignatureStatus::UnsignedWillResign,
+                    is_upgrade: false,
+                }),
+                command: "install wgt /tmp/org.example.app.wgt".into(),
                 reply: tx,
             },
             rx,
@@ -1072,6 +1124,55 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(2)),
             Ok(ApprovalResult::Denied("denied", "user_denied"))
         );
+    }
+
+    #[test]
+    fn install_prompts_reject_always_and_stay_active() {
+        let fixture = fixture(test_config());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        let (ask, reply) = install_request("User::Pkg::org.example.app");
+        fixture.manager.handle().request(ask).unwrap();
+        let prompt = read_json(&mut ui);
+        assert_eq!(prompt["kind"], "install");
+        assert_eq!(prompt["install"]["pkgid"], "org.example.app");
+
+        fixture
+            .manager
+            .handle()
+            .decide(
+                1,
+                "decision-1".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Always,
+            )
+            .unwrap();
+        assert_eq!(read_json(&mut ui)["error"], "invalid_decision");
+        assert!(reply.try_recv().is_err(), "prompt must stay pending");
+
+        // The same prompt can still be approved once.
+        fixture
+            .manager
+            .handle()
+            .decide(
+                1,
+                "decision-2".into(),
+                prompt["prompt_id"].as_str().unwrap().to_owned(),
+                prompt["nonce"].as_str().unwrap().to_owned(),
+                Decision::Once,
+            )
+            .unwrap();
+        assert_eq!(read_json(&mut ui)["status"], "ok");
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(2)),
+            Ok(ApprovalResult::AllowOnce)
+        );
+        assert!(!fixture
+            .grants
+            .lock()
+            .unwrap()
+            .check("User::Pkg::org.example.app")
+            .is_allowed());
     }
 
     #[test]
