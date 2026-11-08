@@ -142,9 +142,8 @@ milestone.
 | `rust/src/model.rs` | protocol v2 prompt/notice/grant types |
 | `rust/src/log.rs` | bounded `/tmp/tvauth-ui.log` writer |
 | `rust/tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |
+| `rust/icon.png` | package icon |
 | `build-ui.sh` | ARMv7 soft-float cross-build and unsigned TPK assembly |
-| `dotnet/` | legacy managed implementation, kept for reference |
-| `build-ui-dotnet.sh` | legacy managed build |
 
 ## Build
 
@@ -191,29 +190,24 @@ Install with the root-role client:
 ```
 
 The package is `org.tvauth.ui`; after install the daemon re-runs the `/run`
-alias setup. The old managed UI is Partner-signed, so switching to the on-device
-CA requires a one-time uninstall/reinstall (Tizen refuses cross-author
+alias setup. The pre-migration managed UI was Partner-signed, so a switch from
+it requires a one-time uninstall/reinstall (Tizen refuses cross-author
 upgrades).
 
-Order matters during the migration:
+Order matters when deploying to a system that still has the managed UI:
 
 1. deploy a `tv-authd` build containing `ui_alias.rs` and the root-only UI
-   package guard (the current live daemon predates both), and restart it;
+   package guard, and restart it;
 2. `/run/tvauth-cli uninstall org.tvauth.ui` (root role);
 3. `/run/tvauth-cli install tpk /tmp/org.tvauth.ui-0.1.0.tpk`;
 4. confirm the daemon log contains `ui_alias=mounted` and the UI launches with
    `/proc/<pid>/maps` pointing at `/run/tv-auth/ui-bin/tv-auth-ui`.
 
-For rollback, signing `out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet.tpk`
-with the `tvauth-partner` profile and installing it restores the managed UI
-(uninstall the Rust build first because the author differs).
-
-The legacy managed build can still be produced with `./build-ui-dotnet.sh` and
-signed with the `tvauth-partner` profile for rollback:
-
-```sh
-tizen package -t tpk -s tvauth-partner -- org.tvauth.ui-0.1.0.dotnet.tpk
-```
+The managed `.NET` implementation was removed from the tree after the native UI
+passed acceptance. It remains in git history at commit `7b39883`; a
+Partner-signed rollback TPK produced before removal was kept locally under
+`out/` (build products are not committed). To rebuild the old UI from source,
+check out that commit and use its `ui/build-ui-dotnet.sh`.
 
 ## Validation status
 
@@ -258,6 +252,7 @@ tizen package -t tpk -s tvauth-partner -- org.tvauth.ui-0.1.0.dotnet.tpk
   `/run` mount and symlink, kept the `org.tvauth.ui` Home row, loaded the Vetro
   grant, and Vetro resumed executing without a prompt. The UI launched and
   rendered the manager post-boot.
-- **Rollback:** `out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet-signed.tpk`
-  (Partner profile) restores the managed UI; the previous daemon is at
-  `/opt/tv-auth/tv-authd.m4-20261108`.
+- **Rollback:** the managed UI source remains at git commit `7b39883`, and the
+  previous daemon is at `/opt/tv-auth/tv-authd.m4-20261108`. A Partner-signed
+  managed TPK produced before removal was kept locally under `out/` (not
+  committed).

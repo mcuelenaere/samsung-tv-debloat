@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn encodes_reference_uris_like_tizen() {
         assert_eq!(encode_reference("bin%2F"), "bin%252F");
-        assert_eq!(encode_reference("bin/TvAuthUi.dll"), "bin%2FTvAuthUi.dll");
+        assert_eq!(encode_reference("bin/tv-auth-ui"), "bin%2Ftv-auth-ui");
         assert_eq!(
             encode_reference("shared/res/org.example.png"),
             "shared%2Fres%2Forg.example.png"

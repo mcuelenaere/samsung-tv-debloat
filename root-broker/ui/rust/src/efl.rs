@@ -1,7 +1,7 @@
 //! Raw Tizen/EFL FFI for the native approval UI.
 //!
-//! The declarations mirror the TV's legacy EFL 1.25 C ABI and the managed
-//! implementation in `../../dotnet/Interop.cs`.  Every pointer, C string and
+//! The declarations mirror the TV's legacy EFL 1.25 C ABI and the pre-migration
+//! managed UI, which remains in git history. Every pointer, C string and
 //! callback stays inside this module or the UI state machine in `main.rs`.
 
 #![allow(clippy::missing_safety_doc)]

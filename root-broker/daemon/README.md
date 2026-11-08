@@ -233,8 +233,9 @@ The native UI was deployed live on 2026-11-08 (daemon `86a7bcee…`, UI TPK
 `0b71a21f…`). A cold boot recreated the `/run` alias (`ui_alias=mounted`), kept
 the Home row and Vetro grant, and the UI rendered the manager with the expected
 SMACK label and a `/run/tv-auth/ui-bin/tv-auth-ui` mapping. The previous M4
-daemon is at `/opt/tv-auth/tv-authd.m4-20261108`; the managed UI rollback TPK is
-`ui/out/tv-auth-ui-dotnet/org.tvauth.ui-0.1.0.dotnet-signed.tpk`.
+daemon is at `/opt/tv-auth/tv-authd.m4-20261108`. The managed UI source remains
+at git commit `7b39883`; a Partner-signed rollback TPK produced before removal
+was kept locally under `ui/out/` (not committed).
 
 The launcher inherits the daemon's systemd environment. On this TV that includes
 `XDG_RUNTIME_DIR=/run`, which AUL's launcher path uses. Do not clear it.

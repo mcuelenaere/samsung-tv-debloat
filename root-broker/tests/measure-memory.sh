@@ -32,7 +32,7 @@ show() {
     else
         echo 'tv-authd: not running'
     fi
-    uipid=$(pgrep -f '/opt/usr/apps/org.tvauth.ui/bin/TvAuthUi.dll' | head -1 || true)
+    uipid=$(pgrep -f '/opt/usr/apps/org.tvauth.ui/bin/tv-auth-ui' | head -1 || true)
     if [ -n "$uipid" ] && [ -r "/proc/$uipid/status" ]; then
         printf 'ui pid=%s ' "$uipid"
         grep -E '^(VmRSS|VmHWM|Threads):' "/proc/$uipid/status" | tr '\n' ' '

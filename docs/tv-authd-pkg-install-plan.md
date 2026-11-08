@@ -420,12 +420,15 @@ written back over the staged file.
   tail; trust enrollment failure ⇒ `enroll_failed` and nothing is installed;
   UI crash/hangup ⇒ same semantics as exec (cancel, never install).
 
-## 9. UI work items (`ui/dotnet`)
+## 9. UI work items (`ui/rust`, originally `ui/dotnet`)
 
-- `BrokerClient.cs`: parse `kind` + `install` metadata; new events
-  `InstallPromptReceived` (or reuse `PromptReceived` with extended
-  `PromptInfo`); decision API unchanged.
-- `Program.cs`: install prompt layout —
+The approval UI was ported from `ui/dotnet` to the native `ui/rust` crate after
+the `/run` alias was validated; the managed implementation remains in git
+history at commit `7b39883`.
+
+- `ui/rust/src/client.rs`: parse `kind` + `install` metadata; extend
+  `PromptInfo`; decision API unchanged.
+- `ui/rust/src/main.rs`: install prompt layout —
   - Title: "Install package?" / "Remove package?"
   - Source app (label-derived), package name + id + version, size;
   - privilege list (scrollable; raw URIs mapped to friendly names for the
@@ -496,7 +499,7 @@ Code (all under `root-broker/`):
   `always` rejection, per-install global lock, CLI flags
   (`--staging-dir`, `--max-package-bytes`, `--pkgcmd`, `--trust-root`,
   `--no-trust`, `--no-package-support`, `--enroll-trust`).
-- `ui/dotnet/BrokerClient.cs`, `Program.cs` — parses `kind`/`install` and renders
+- `ui/rust/src/client.rs`, `main.rs` — parses `kind`/`install` and renders
   the package prompt with Deny/Install and no Always option.
 - `daemon/PROTOCOL.md`, `daemon/README.md`, `ui/README.md` — wire contract,
   limits, errors, and UI behavior.
@@ -504,7 +507,7 @@ Code (all under `root-broker/`):
 Host validation (rebased on the M4 + review-fixes branches): `cargo test` (120 tests on Linux/Docker, 116 on macOS where
 installer-spawning tests are skipped),
 `cargo clippy --all-targets -D warnings`, ARMv7 musl cross-build (native
-`rust-lld`, `--help` under QEMU), and the managed UI build via
+`rust-lld`, `--help` under QEMU), and the native UI build via
 `ui/build-ui.sh`.
 
 Deviations from the proposal, and why:
@@ -690,7 +693,7 @@ Code:
 - `daemon/test-clients/rootcli/` — dependency-free static ARMv7 client for the
   root role (`list`, `install <type> <path>`, `uninstall <pkgid>`). It must run
   from `/run`: the VDFS in `/opt` rejects unsigned ELFs.
-- `ui/dotnet` — parses `uninstall` and notice `kind`; renders the remove prompt
+- `ui/rust` — parses `uninstall` and notice `kind`; renders the remove prompt
   from the daemon's metadata and the package-change toast.
 
 Deployed: daemon 787,372 bytes, SHA-256
@@ -754,7 +757,7 @@ Code:
 - `daemon/src/executor.rs` — `execute_argv_in` for `xmlsec1` (relative file
   references resolve against the work directory).
 - `daemon/src/main.rs` — `--xmlsec1` (default `/usr/bin/xmlsec1`).
-- `ui/dotnet/Program.cs` — unsigned/foreign badges now promise re-signing.
+- `ui/rust/src/main.rs` — unsigned/foreign badges now promise re-signing.
 
 Deployed: daemon 855,716 bytes, SHA-256
 `ab637c0287f439221a4b545e5a63a1440acaaf45f007ae95176e9f946d0bdcec`; UI signed

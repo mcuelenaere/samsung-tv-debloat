@@ -53,7 +53,7 @@ docker run --rm --platform linux/amd64 \
         arm-linux-gnueabi-strip /src/out/tv-auth-ui/pkgroot/bin/tv-auth-ui
         cp /src/rust/tizen-manifest.xml \
             /src/out/tv-auth-ui/pkgroot/tizen-manifest.xml
-        cp /src/dotnet/icon.png \
+        cp /src/rust/icon.png \
             /src/out/tv-auth-ui/pkgroot/shared/res/org.tvauth.ui.png
 
         echo "== artifact =="

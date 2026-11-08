@@ -97,7 +97,7 @@ Source: [polkit architecture](https://www.freedesktop.org/software/polkit/docs/0
                        │ fixed AUL launch
                        ▼
               ┌──────────────────┐
-              │  tv-auth-ui      │  UID 5001, managed .NET/EFL, not root
+              │  tv-auth-ui      │  UID 5001, native Rust/EFL, not root
               │  approval prompt │
               │  grant manager   │
               └────────┬─────────┘
@@ -282,20 +282,16 @@ The 2026-11-08 spike (`org.tvauth.spike.popup`) confirmed the mechanism on the T
 
 ### Previous managed path (rollback)
 
-A managed .NET assembly has no custom native ELF. Tizen's signed `dotnet-launcher` loads it while UEP remains enforced. On the target, the managed UI package:
+### Pre-migration managed path (removed)
 
-- installed as a normal signed TPK;
-- launched through `app_launcher`;
-- ran as `User::Pkg::org.tvauth.spike.popupdotnet`, UID 5001;
-- loaded Elementary, EFL extension, and `capi-ui-efl-util`;
-- set the Wayland surface type to notification;
-- reported `notification level TOP accepted`;
-- displayed above YouTube;
-- dismissed cleanly with OK/RETURN.
+Before the `/run` alias was validated, the UI was a `netcoreapp3.1` managed TPK.
+Tizen's signed `dotnet-launcher` loaded it without a custom native ELF; it
+installed as a normal signed package, launched through AUL, ran as
+`User::Pkg::org.tvauth.ui` UID 5001, set notification TOP, displayed above
+YouTube, and dismissed with OK/RETURN. It was removed from the tree after the
+native UI passed acceptance and remains in git history at commit `7b39883`.
 
-The C# layer uses direct P/Invoke for the Tizen app lifecycle, Elm/Evas widgets, `efl_util_set_notification_window_level`, and Eext key grabbing. This is a small platform binding, not a dependency on a large UI framework.
-
-The implemented M2 UI lives in `root-broker/ui/` and:
+The production approval UI lives in `root-broker/ui/rust/` and:
 
 1. is launched by the daemon through a fixed AUL/`app_launcher -s org.tvauth.ui` command;
 2. creates a notification-type EFL/Wayland window at the highest usable notification level;
@@ -311,14 +307,10 @@ disconnect, launcher failure, stale nonce, or malformed decision as a denial. Do
 not modify `/opt/dbspace/.syspopup.db` or depend on Samsung's alert-syspopup
 package.
 
-Managed UI status (rollback path): implemented, signed, installed, and
-TV-validated. It renders grants after roughly two seconds because of CoreCLR
-startup, and uses ~50 MB RSS. The native Rust UI replaces it: the cross-build is
-`476,888` bytes (soft-float ARMv7), the unsigned TPK is ~`258 KB`, and it
-links only the EFL/application libraries. A smoke build packaged as
-`org.tvauth.spike.ui` installed through the daemon's `rootcli` (`backend=was`,
-re-signed), launched from a `/run` alias, rendered the manager at 1920x1080 with
-TOP notification level, and used 16–30 MB RSS.
+Native UI status: implemented, installed, and TV-validated. The cross-build is
+`476,888` bytes (soft-float ARMv7), the unsigned TPK is ~`258 KB`, and it links
+only the EFL/application libraries. The UI renders in well under the managed
+UI's ~2 s CoreCLR startup and uses 25–31 MB RSS instead of ~50 MB.
 
 On 2026-11-08 the live `org.tvauth.ui` package was replaced with this native
 build (daemon `86a7bcee…`, installed TPK `0b71a21f…`, binary `a1f996fa…`). The
@@ -443,15 +435,15 @@ debug = 0
 
 Only the root executable must be copied into RAM-backed `/run`, so that artifact gets the strictest size scrutiny. Track stripped binary size and runtime RSS in validation notes.
 
-### Managed UI
+### Native UI
 
-The UI is a `netcoreapp3.1` managed assembly packaged as a Tizen `dotnet` application. It requires no custom ARM ELF and therefore bypasses the UEP wall while still running as UID 5001 with a package-specific SMACK label. Keep native calls in one small interop class and keep UI/protocol logic managed. Measure the DLL and signed TPK size, process RSS, and launch time.
+The UI is a native Rust/EFL Tizen `type="capp"` application in `root-broker/ui/rust`. It runs as UID 5001 with the package SMACK label and connects directly to the broker socket. The daemon stages its ELF through the `/run` alias described in §7; no UEP bypass or partner signing is involved. Keep the raw EFL surface in `efl.rs` and the protocol/state machine in the small native modules. Track the stripped binary size, signed TPK size, process RSS, and launch latency.
 
 ### Validated M0 evidence
 
 - static ARMv7 Rust hello: runs directly and under a transient systemd unit from `/run`;
 - .NET peer probes: two package processes expose distinct `User::Pkg::*` labels over `SO_PEERSEC`;
-- managed .NET UI: installs, launches from AUL, sets notification TOP, appears over YouTube, and dismisses with OK/RETURN.
+- native Rust/EFL UI: installs as a normal `capp`, maps through the `/run` alias, launches from AUL, sets notification TOP, and displays the prompt/manager.
 
 ## 11. Vetro integration
 
@@ -499,7 +491,7 @@ Freeze the small wire protocol and package/label names before parallel implement
 |---|---|---|
 | A. Platform spikes | `root-broker/spikes/` and small test programs | Rust ARMv7 execution, `SO_PEERSEC`, EFL popup evidence |
 | B. Daemon | `root-broker/daemon/` | Rust broker, protocol, grants, execution, unit tests |
-| C. Approval UI | `root-broker/ui/` | Managed .NET prompt/grant manager with isolated EFL P/Invoke |
+| C. Approval UI | `root-broker/ui/rust/` | Native Rust/EFL prompt/grant manager with isolated FFI |
 | D. Vetro adapter | Separate Vetro worktree only | Same-process, dependency-free Unix-socket implementation behind `platform.execute()` |
 | E. Persistence/build | `root-broker/systemd/`, `root-broker/build/`, minimal `persistence/` edits | Reproducible ARMv7 build and boot integration |
 | F. End-to-end tests | `root-broker/tests/` | Multi-app, failure, reboot, and Vetro acceptance tests |
@@ -512,9 +504,7 @@ Avoid having multiple agents edit the protocol definition or the same persistenc
 
 1. **Passed:** a static Rust ARMv7 hello ran directly and under a transient systemd unit from `/run`; stripped size 323,652 bytes.
 2. **Passed:** two separately packaged managed apps connected from UID 5001 and the server observed `User::Pkg::org.tvauth.spike.peerone` and `User::Pkg::org.tvauth.spike.peertwo` over `SO_PEERSEC`.
-3. **Passed with managed .NET:** the native Rust/EFL UI cross-linked and installed but UEP prevented launchpad from executing its ELF. A managed `.NET`/EFL app installed, launched through AUL, set notification TOP, appeared over YouTube, and dismissed with OK/RETURN.
-
-The native-UI failure is why the design now uses managed .NET for the approval UI. Root daemon execution from `/run` remains native Rust.
+3. **Initially passed with managed .NET, later native:** the native Rust/EFL UI cross-linked and installed but UEP prevented launchpad from executing its ELF directly from `/opt`. A managed `.NET`/EFL app installed, launched through AUL, set notification TOP, appeared over YouTube, and dismissed with OK/RETURN. The 2026-11-08 `/run` alias then made the native Rust/EFL UI the production path.
 
 ### M1 — Headless broker (complete)
 
@@ -629,7 +619,7 @@ The native-UI failure is why the design now uses managed .NET for the approval U
 - No D-Bus service/policy integration.
 - No Tokio, SQLite, dynamic providers, or certificate-management subsystem in the MVP.
 - No root Wayland client and no root UI.
-- No custom native ELF for the approval UI; use a managed .NET TPK to stay compatible with UEP.
+- No root UI and no UEP bypass inside the UI package; the native approval UI is a normal UID-5001 `capp` staged through the daemon's `/run` alias.
 - No need to port Vetro feature modules; replace only its transport adapter.
 
 This should provide the requested safety—users know which app receives root and can revoke it—without turning the project into a general-purpose authorization framework.
@@ -646,9 +636,11 @@ Treat the spike results and integration measurements as inputs to this document,
 M0 was completed on 2026-11-04/05, M1 was deployed and cold-boot validated on
 2026-11-05, and M2 was implemented, deployed, and cold-boot validated on
 2026-11-05. The plan now reflects the observed soft-float EFL ABI, successful
-`SO_PEERSEC` package labels, native-ELF UEP rejection, the validated managed .NET
-notification popup, the live broker layout, the M2 approval protocol, and the
-interactive denial/once/always/revoke/timeout/crash/reboot results. Raw evidence
+`SO_PEERSEC` package labels, native-ELF UEP rejection, the validated `/run`
+alias and native Rust/EFL approval UI, the live broker layout, the M2 approval
+protocol, and the interactive denial/once/always/revoke/timeout/crash/reboot
+results. The pre-migration managed `.NET` UI remains in git history at commit
+`7b39883`. Raw evidence
 and build commands live in:
 
 - `root-broker/spikes/armv7-hello/`
