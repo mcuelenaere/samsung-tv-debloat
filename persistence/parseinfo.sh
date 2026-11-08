@@ -37,6 +37,7 @@ BEGIN {
     # ── (1) PRESERVE THE STOCK BEHAVIOUR EXACTLY ─────────────────────────────
     repo = ""; model = ""
     while ((getline line < "/etc/prd_info.ini") > 0) {
+        sub(/\r$/, "", line)
         if (line ~ /^Build=/) {
             sub(/^Build=/, "", line); sub(/;.*/, "", line); repo = line
         } else if (line ~ /^Model=/) {
@@ -47,15 +48,16 @@ BEGIN {
 
     printf "__%s__%s\n", repo, model > "/proc/target_version"
     close("/proc/target_version")
-    system("echo '" ts " parseinfo: target_version=__" repo "__" model "' >> " LOG)
+    printf "%s parseinfo: target_version=__%s__%s\n", ts, repo, model >> LOG
+    close(LOG)
 
     # ── (2) STAGE AND START ALL ROOT-OWNED EXTRA UNITS ───────────────────────
     cmd = "rc=0; " \
           "for unit in " UNIT_DIR "/*.service; do " \
-          "  [ -f \"$unit\" ] || continue; " \
+          "  [ -f \"$unit\" ] && [ ! -L \"$unit\" ] || continue; " \
           "  name=${unit##*/}; " \
           "  case \"$name\" in *.service) ;; *) echo '" ts " invalid unit name: $name' >> " LOG "; rc=1; continue ;; esac; " \
-          "  if ! cp -f \"$unit\" \"/run/systemd/system/$name\"; then " \
+          "  if ! cp -f \"$unit\" \"/run/systemd/system/$name\" || ! chmod 0644 \"/run/systemd/system/$name\"; then " \
           "    echo '" ts " stage failed: $name' >> " LOG "; rc=1; continue; " \
           "  fi; " \
           "  if ! /usr/bin/systemctl start \"$name\"; then " \
@@ -68,5 +70,6 @@ BEGIN {
           "exit $rc"
 
     rc = system(cmd)
-    system("echo '" ts " parseinfo: start units rc=" rc "' >> " LOG)
+    printf "%s parseinfo: start units rc=%d\n", ts, rc >> LOG
+    close(LOG)
 }

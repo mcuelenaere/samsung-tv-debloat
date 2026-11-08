@@ -28,8 +28,8 @@ role is fixed for the whole connection:
 - **ordinary package**: exact `User::Pkg::<pkgid>` label, any accepted UID; may
   send `exec` only;
 - **approval UI**: exact `User::Pkg::org.tvauth.ui` label and UID 5001 by
-  default; may send `ui.hello`, `ui.decision`, `grants.list`, and
-  `grants.revoke`, and may not send `exec`.
+  default; may send `ui.hello`, `ui.decision`, `grants.list`,
+  `grants.notify`, and `grants.revoke`, and may not send `exec`.
 
 The UI package and UID are daemon settings (`--ui-package`, `--ui-uid`). Missing,
 unexpected, or non-package labels fail closed.

@@ -176,7 +176,6 @@ namespace TvAuthUi
                     {
                         dispatch.Enqueue(() => ConnectionChanged?.Invoke(true));
                         SendHello();
-                        RequestGrants();
 
                         string line;
                         while (!stopped && (line = reader.ReadLine()) != null)

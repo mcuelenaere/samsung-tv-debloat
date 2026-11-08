@@ -213,13 +213,19 @@ namespace TvAuthUi
 
         private static void ShowMain()
         {
+            HideToast();
+            exitWhenIdle = false;
+            lingerUntil = null;
             if (mainShown || window == IntPtr.Zero)
                 return;
             mainShown = true;
-            // A prompt may have granted or revoked an app since the last list;
-            // never render the manager from a stale cache.
-            Log("manager grants refresh");
-            broker?.RequestGrants();
+            if (currentPrompt == null)
+            {
+                // A prompt may have granted or revoked an app since the last list;
+                // never render the manager from a stale cache.
+                Log("manager grants refresh");
+                broker?.RequestGrants();
+            }
             backGrabbed = Interop.eext_win_keygrab_set(window, BackKey) == 1;
             if (!backGrabbed)
                 Log("XF86Back keygrab failed");
@@ -227,6 +233,15 @@ namespace TvAuthUi
             Interop.elm_win_raise(window);
             Interop.elm_win_activate(window);
             Log("window shown/raised/activated");
+        }
+
+        private static void HideToast()
+        {
+            toastHideAt = null;
+            toastEntries.Clear();
+            toastRows = 0;
+            if (toastWindow != IntPtr.Zero)
+                Interop.evas_object_hide(toastWindow);
         }
 
         private static void HideMain()
@@ -325,16 +340,18 @@ namespace TvAuthUi
             {
                 exitAt = null;
                 HideMain();
+                lingerUntil = null;
                 exitWhenIdle = true;
             }
 
             if (toastHideAt.HasValue && DateTime.UtcNow >= toastHideAt.Value)
             {
-                toastHideAt = null;
-                toastEntries.Clear();
-                Interop.evas_object_hide(toastWindow);
-                exitWhenIdle = true;
-                lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+                HideToast();
+                if (!mainShown)
+                {
+                    exitWhenIdle = true;
+                    lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+                }
             }
 
             if (exitWhenIdle
@@ -419,23 +436,34 @@ namespace TvAuthUi
         {
             // Only the first registration decides; a reconnect after a broker
             // restart must not pop the manager over whatever the user watches.
-            if (helloSeen)
-                return;
-            helloSeen = true;
-            if (launch == "notice")
+            if (!helloSeen)
             {
-                Log("notice-only launch");
-                exitWhenIdle = true;
-                lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+                helloSeen = true;
+                if (launch == "notice" && !mainShown && appControlCount <= 1)
+                {
+                    Log("notice-only launch");
+                    exitWhenIdle = true;
+                    lingerUntil = DateTime.UtcNow.AddSeconds(IdleLingerSeconds);
+                    return;
+                }
+                ShowMain();
                 return;
             }
-            ShowMain();
+
+            if (mainShown && currentPrompt == null)
+            {
+                Log("manager grants refresh");
+                broker?.RequestGrants();
+            }
         }
 
         private static void OnNotice(List<NoticeInfo> notices)
         {
             foreach (var notice in notices)
             {
+                Log("notice package=" + notice.Package + " count=" + notice.Count);
+                if (mainShown)
+                    continue;
                 var entry = toastEntries.FirstOrDefault(e => e.Label == notice.Label);
                 if (entry == null)
                 {
@@ -447,9 +475,8 @@ namespace TvAuthUi
                     entry.Command = notice.Command;
                     entry.CommandTruncated = notice.CommandTruncated;
                 }
-                Log("notice package=" + notice.Package + " count=" + notice.Count);
             }
-            if (toastEntries.Count == 0)
+            if (mainShown || toastEntries.Count == 0)
                 return;
             ShowToast();
         }
@@ -541,10 +568,19 @@ namespace TvAuthUi
                 text = text.Substring(0, newline).TrimEnd('\r');
             if (text.Length > max)
             {
-                text = text.Substring(0, max - 1);
+                text = text.Substring(0, SafePrefixLength(text, max - 1));
                 cut = true;
             }
             return cut ? text + "\u2026" : text;
+        }
+
+        private static int SafePrefixLength(string text, int maxChars)
+        {
+            if (string.IsNullOrEmpty(text) || maxChars >= text.Length)
+                return text?.Length ?? 0;
+            if (maxChars <= 0)
+                return 0;
+            return char.IsHighSurrogate(text[maxChars - 1]) ? maxChars - 1 : maxChars;
         }
 
         private static void OnGrants(List<GrantInfo> list)
@@ -964,8 +1000,11 @@ namespace TvAuthUi
                 var line = rawLine;
                 while (line.Length > 72)
                 {
-                    lines.Add(line.Substring(0, 72));
-                    line = line.Substring(72);
+                    var len = SafePrefixLength(line, 72);
+                    if (len == 0)
+                        len = line.Length;
+                    lines.Add(line.Substring(0, len));
+                    line = line.Substring(len);
                 }
                 lines.Add(line);
                 if (lines.Count > 12)
@@ -1035,8 +1074,13 @@ namespace TvAuthUi
                 lock (LogLock)
                 {
                     var info = new FileInfo(LogPath);
-                    if (info.Exists && info.Length > 64 * 1024)
-                        File.Delete(LogPath);
+                    if (info.Exists)
+                    {
+                        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                            return;
+                        if (info.Length > 64 * 1024)
+                            File.Delete(LogPath);
+                    }
                     File.AppendAllText(
                         LogPath,
                         DateTime.UtcNow.ToString("O") + " " + message + Environment.NewLine);

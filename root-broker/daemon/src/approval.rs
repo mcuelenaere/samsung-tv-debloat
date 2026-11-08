@@ -256,6 +256,7 @@ struct Manager {
     launch: LaunchState,
     notices: Vec<NoticeEntry>,
     notice_next_at: Instant,
+    notice_retries: u8,
     /// Last granted exec per package, for `first`-mode grants.
     // ponytail: never pruned; bounded by the number of labels ever granted.
     last_exec: HashMap<String, Instant>,
@@ -277,6 +278,7 @@ impl Manager {
             launch: LaunchState::default(),
             notices: Vec::new(),
             notice_next_at: Instant::now(),
+            notice_retries: 0,
             last_exec: HashMap::new(),
         }
     }
@@ -447,17 +449,40 @@ impl Manager {
             .map(|entry| format!("{}x{}", entry.label, entry.count))
             .collect::<Vec<_>>()
             .join(",");
+        let message = NoticeMessage::new(notices.clone());
         let written = {
             let mut writer = ui.writer.lock().unwrap_or_else(|error| error.into_inner());
-            write_json(&mut *writer, &NoticeMessage::new(notices))
+            write_json(&mut *writer, &message)
         };
         match written {
-            Ok(()) => self.log(&format!("notice_sent {summary}")),
-            Err(error) => self.log(&format!(
-                "notice_write_failed error={error} dropped={summary}"
-            )),
+            Ok(()) => {
+                self.notice_retries = 0;
+                self.notice_next_at = now + self.config.notice_interval;
+                self.log(&format!("notice_sent {summary}"));
+            }
+            Err(error) => {
+                if let Some(dead) = self.ui.take() {
+                    let _ = dead.control.shutdown(std::net::Shutdown::Both);
+                }
+                self.launch = LaunchState {
+                    last_attempt: Some(now),
+                    ..LaunchState::default()
+                };
+                if self.notice_retries < 1 {
+                    self.notice_retries += 1;
+                    self.notices = notices;
+                    self.log(&format!(
+                        "notice_write_failed error={error} requeued={summary}"
+                    ));
+                } else {
+                    self.notice_retries = 0;
+                    self.notice_next_at = now + NOTICE_RETRY_AFTER_FAILURE;
+                    self.log(&format!(
+                        "notice_write_failed error={error} dropped={summary}"
+                    ));
+                }
+            }
         }
-        self.notice_next_at = now + self.config.notice_interval;
     }
 
     fn handle_detach(&mut self, token: u64) {
@@ -676,8 +701,24 @@ impl Manager {
                     "prompt_write_failed ui_token={} error={error}",
                     ui.token
                 ));
-                self.queue.push_front(pending);
                 let _ = ui.control.shutdown(std::net::Shutdown::Both);
+                self.launch = LaunchState {
+                    last_attempt: Some(Instant::now()),
+                    ..LaunchState::default()
+                };
+                if pending.ui_retries < MAX_PROMPT_UI_RETRIES {
+                    self.queue.push_front(PendingRequest {
+                        request: pending.request,
+                        ui_retries: pending.ui_retries + 1,
+                    });
+                    self.log("prompt_requeued_after_ui_write_error");
+                } else {
+                    self.reply(
+                        pending.request,
+                        ApprovalResult::Denied("ui_unavailable", "ui_disconnected"),
+                    );
+                    self.log("prompt_cancelled=ui_disconnected");
+                }
             }
         }
     }
@@ -1312,5 +1353,46 @@ mod tests {
         let notices = next["notices"].as_array().unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0]["package"], "org.example.loud");
+    }
+
+    #[test]
+    fn prompt_write_failure_counts_toward_retry_limit() {
+        let fixture = fixture(no_relaunch_config());
+        let handle = fixture.manager.handle();
+        let dead_ui = attach_ui(&fixture.manager, 1);
+        drop(dead_ui.into_inner());
+
+        // First attempt hits prompt_write_failed on dead_ui (ui_retries: 0 -> 1).
+        let (ask, reply) = request("User::Pkg::org.example.app");
+        handle.request(ask).unwrap();
+
+        // Only MAX_PROMPT_UI_RETRIES further disconnects are needed to exhaust retries.
+        for token in 2..=u64::from(MAX_PROMPT_UI_RETRIES) + 1 {
+            let mut ui = attach_ui(&fixture.manager, token);
+            let _ = read_json(&mut ui);
+            assert!(reply.try_recv().is_err());
+            handle.detach_ui(token).unwrap();
+        }
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(2)),
+            Ok(ApprovalResult::Denied("ui_unavailable", "ui_disconnected"))
+        );
+    }
+
+    #[test]
+    fn notice_write_failure_requeues_for_next_ui() {
+        let fixture = fixture(no_relaunch_config());
+        let handle = fixture.manager.handle();
+        let dead_ui = attach_ui(&fixture.manager, 1);
+        drop(dead_ui.into_inner());
+
+        handle
+            .notice("User::Pkg::org.example.app".into(), "id".into(), false)
+            .unwrap();
+
+        let mut next_ui = attach_ui(&fixture.manager, 2);
+        let notice = read_json(&mut next_ui);
+        assert_eq!(notice["type"], "ui.notice");
+        assert_eq!(notice["notices"][0]["package"], "org.example.app");
     }
 }

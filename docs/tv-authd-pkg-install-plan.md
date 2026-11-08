@@ -87,7 +87,9 @@ extension data, so this satisfies it without Samsung.
 
 Version stays JSON-lines over `/run/tv-auth/broker.sock`. Unknown-field
 rejection means this must be a coordinated daemon+UI change; bump
-`"version": 2` and keep v1 `exec` semantics untouched.
+`"version": 2` for the new `pkg.*` methods and UI messages while keeping
+`parse_request` accepting `"version": 1` for existing `exec` clients (such as
+Vetro) untouched.
 
 ### 5.1 `pkg.install` (ordinary packages)
 
@@ -188,7 +190,7 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
 | `server.rs` | route `pkg.install`/`pkg.uninstall`/`pkg.list` for ordinary packages; new **root role**: uid 0 clients (e.g. SSH/dropbear, label `System::Privileged`) may call `pkg.*` prompt-free — exec remains package-only; forbid all `pkg.*` for the UI role; per-label pending tracking |
 | `trust.rs` (new) | §4 |
-| `main.rs` | `--enroll-trust` one-shot mode for the boot unit |
+| `main.rs` | `--enroll-trust` one-shot mode for the boot unit; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label` |
 
 Staging lifecycle: copied at request time (before the prompt) so the file the
 user approves is the file that gets installed (no TOCTOU on the source path).

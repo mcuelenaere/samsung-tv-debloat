@@ -4,10 +4,11 @@ Tested on the TV at `192.0.2.10`: Tizen 6.5.0, Linux 5.4.77, `armv7l`.
 The server is **dropbear 2026.94**, built as a statically linked ARMv7
 multi-call binary. Root login uses public-key authentication only.
 
-This document covers only the SSH server, its build, launcher, configuration,
-and runtime layout. Acquiring root or arranging for a command to run after a TV
-boot is intentionally out of scope; the launcher must be run from an existing
-root shell after every power cycle.
+This document covers the standalone SSH server build and manual SDB/root-shell
+launcher used during initial bring-up. For the current boot-persistent
+deployment (`/opt/tv-units/dropbear.service` running from the root-only
+`/opt/tv-sshd/bin/dropbear` via `BindReadOnlyPaths=`), see
+[`../persistence/README.md`](../persistence/README.md).
 
 ## Repository contents
 

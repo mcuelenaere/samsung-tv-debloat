@@ -51,7 +51,7 @@ pub fn package_fingerprint(label: &str, roots: &[PathBuf]) -> io::Result<String>
             ));
         }
         for relative in SIGNATURE_PATHS {
-            match read_signature(&directory.join(relative)) {
+            match read_signature(&directory, relative) {
                 Ok(bytes) => return Ok(digest(&bytes)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -69,7 +69,28 @@ pub fn package_fingerprint(label: &str, roots: &[PathBuf]) -> io::Result<String>
     ))
 }
 
-fn read_signature(path: &Path) -> io::Result<Vec<u8>> {
+fn read_signature(package_dir: &Path, relative: &str) -> io::Result<Vec<u8>> {
+    let relative_path = Path::new(relative);
+    if let Some(parent) = relative_path.parent() {
+        let mut current = package_dir.to_path_buf();
+        for component in parent.components() {
+            current.push(component);
+            let metadata = fs::symlink_metadata(&current)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "package signature parent is not a real directory",
+                ));
+            }
+            if metadata.mode() & 0o022 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "package signature parent is group- or world-writable",
+                ));
+            }
+        }
+    }
+    let path = package_dir.join(relative_path);
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -136,9 +157,16 @@ mod tests {
         assert_eq!(first.len(), 7 + 64);
 
         // WGT layout.
-        let wgt = root.join("org.example.wgt/res/wgt");
+        let wgt_pkg = root.join("org.example.wgt");
+        let wgt_res = wgt_pkg.join("res");
+        let wgt = wgt_res.join("wgt");
         fs::create_dir_all(&wgt).unwrap();
-        fs::write(wgt.join("author-signature.xml"), b"signed wgt").unwrap();
+        for dir in [&wgt_pkg, &wgt_res, &wgt] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wgt_sig = wgt.join("author-signature.xml");
+        fs::write(&wgt_sig, b"signed wgt").unwrap();
+        fs::set_permissions(&wgt_sig, fs::Permissions::from_mode(0o644)).unwrap();
         let wgt_fp =
             package_fingerprint("User::Pkg::org.example.wgt", std::slice::from_ref(&root)).unwrap();
         assert_ne!(first, wgt_fp);
@@ -196,6 +224,40 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_or_symlinked_wgt_intermediate_directories() {
+        let (_directory, root, _signature) = fixture();
+        let wgt_pkg = root.join("org.example.wgt");
+        let wgt_res = wgt_pkg.join("res");
+        let wgt = wgt_res.join("wgt");
+        fs::create_dir_all(&wgt).unwrap();
+        for dir in [&wgt_pkg, &wgt_res, &wgt] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wgt_sig = wgt.join("author-signature.xml");
+        fs::write(&wgt_sig, b"signed wgt").unwrap();
+        fs::set_permissions(&wgt_sig, fs::Permissions::from_mode(0o644)).unwrap();
+
+        fs::set_permissions(&wgt_res, fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(
+            package_fingerprint("User::Pkg::org.example.wgt", std::slice::from_ref(&root))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(&wgt_res, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outside = root.join("outside-wgt");
+        fs::rename(&wgt, &outside).unwrap();
+        symlink(&outside, &wgt).unwrap();
+        assert_eq!(
+            package_fingerprint("User::Pkg::org.example.wgt", &[root])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }
