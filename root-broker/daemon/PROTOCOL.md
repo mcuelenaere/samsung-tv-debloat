@@ -189,17 +189,20 @@ commands. After `ui.hello`, the daemon may send:
 ```
 
 Each entry coalesces one package's executions since the previous notice;
-`command` is a display copy (sanitized like `ui.prompt`, at most 256 bytes) of
-the most recent one. Throttling keeps the screen quiet:
+`count` is a delta, so the UI adds it to what it is showing. `command` is a
+display copy (sanitized like `ui.prompt`, at most 256 bytes) of the most recent
+one. Delivery is near real-time:
 
-- the first granted exec after a quiet period is sent at once;
-- later execs are held and sent as one message when the gap (10 s) elapses;
-- while execs keep coming, the gap doubles up to 5 min; one full quiet gap
-  resets it;
+- a granted exec is sent at once;
+- execs within the next 250 ms are coalesced per package into one message,
+  which only caps the message rate during bursts;
 - notices are held while a prompt is active or queued;
 - if no UI is connected the daemon launches it (same launcher and attempt
-  limits as prompts); if that fails the notices are dropped. Notices never
-  delay or block execution.
+  limits as prompts); if that fails the notices are dropped and no launch is
+  retried for notices for 60 s. Notices never delay or block execution.
+
+Keeping the screen quiet is the UI's job: it shows one toast and updates it in
+place.
 
 Execs that were just approved by a prompt do not produce a notice.
 

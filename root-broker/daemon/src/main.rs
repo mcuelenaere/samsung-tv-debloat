@@ -258,7 +258,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         launch_cooldown: Duration::from_millis(launch_cooldown_ms),
         prompt_queue_max,
         max_launch_attempts,
-        notice_interval: Duration::from_secs(10),
+        notice_interval: Duration::from_millis(250),
     };
     let server = ServerConfig {
         max_connections,

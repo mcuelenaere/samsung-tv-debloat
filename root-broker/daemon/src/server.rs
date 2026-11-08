@@ -611,7 +611,7 @@ mod tests {
             launch_cooldown: Duration::from_millis(10),
             prompt_queue_max: 4,
             max_launch_attempts: 1,
-            notice_interval: Duration::from_secs(10),
+            notice_interval: Duration::from_millis(250),
         };
         let manager = ApprovalManager::start(approval_config, Arc::clone(&grants), None).unwrap();
         let broker = Arc::new(Broker::new(grants, manager.handle(), None));

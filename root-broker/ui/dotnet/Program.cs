@@ -44,12 +44,13 @@ namespace TvAuthUi
         private const int ToastWidth = 640;
         private const int ToastPadding = 28;
         private const int ToastMargin = 48;
-        private const int ToastShownSeconds = 8;
+        private const int ToastShownSeconds = 6;
         private const int ToastMaxApps = 3;
         private const int ToastCommandChars = 52;
         // Stay connected (invisible) this long after a toast so the next notice
-        // does not pay for another app launch.
-        private const int IdleLingerSeconds = 30;
+        // shows instantly instead of paying ~1 s for an app launch. Must stay
+        // below the daemon's 600 s idle timeout for the UI connection.
+        private const int IdleLingerSeconds = 300;
 
         private static IntPtr window;
         private static IntPtr accentBar;
@@ -81,6 +82,7 @@ namespace TvAuthUi
         private static IntPtr toastWindow;
         private static IntPtr toastLabel;
         private static DateTime? toastHideAt;
+        private static int toastRows;
         private static readonly List<NoticeInfo> toastEntries = new List<NoticeInfo>();
 
         private static int Main(string[] args)
@@ -445,11 +447,18 @@ namespace TvAuthUi
             if (toastWindow == IntPtr.Zero && !CreateToastWindow())
                 return;
             SetText(toastLabel, ToastMarkup());
-            // Elementary grows the window to the content's minimum height.
-            Interop.evas_object_resize(toastWindow, ToastWidth + 2 * ToastPadding, 1);
-            Interop.evas_object_move(toastWindow,
-                screenW - ToastWidth - 2 * ToastPadding - ToastMargin, ToastMargin);
-            Interop.evas_object_show(toastWindow);
+            // Live updates only change the text; re-layout the window when it
+            // appears or gains a row, so counters tick without flicker.
+            var rows = Math.Min(toastEntries.Count, ToastMaxApps + 1);
+            if (!toastHideAt.HasValue || rows != toastRows)
+            {
+                toastRows = rows;
+                // Elementary grows the window to the content's minimum height.
+                Interop.evas_object_resize(toastWindow, ToastWidth + 2 * ToastPadding, 1);
+                Interop.evas_object_move(toastWindow,
+                    screenW - ToastWidth - 2 * ToastPadding - ToastMargin, ToastMargin);
+                Interop.evas_object_show(toastWindow);
+            }
             toastHideAt = DateTime.UtcNow.AddSeconds(ToastShownSeconds);
         }
 

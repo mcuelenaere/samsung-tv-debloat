@@ -44,16 +44,17 @@ focus handling and must be re-verified on the TV for the three-button layout.
 
 ### Execution toast
 
-When a granted app executes, the daemon sends a coalesced `ui.notice` (see
-`daemon/PROTOCOL.md` for the throttling), launching the UI if needed with
-`"launch": "notice"` in the hello response. In that case the full-screen window
-is never shown and BACK is not grabbed. Instead a separate notification window
-in the top-right corner (focus-skip, `wm.policy.win.user.geometry`) shows up to
-three apps, e.g. "**org.example.app** ran 3 commands as root" plus the last
-command's first line. Further notices merge into the visible toast and restart
-its 8 s timer. Afterwards the UI stays connected but invisible for 30 s so the
-next notice does not need another launch, then exits. Opening the app icon while
-it lingers shows the manager.
+When a granted app executes, the daemon sends a `ui.notice` within 250 ms (see
+`daemon/PROTOCOL.md`), launching the UI if needed with `"launch": "notice"` in
+the hello response. In that case the full-screen window is never shown and BACK
+is not grabbed. Instead a separate notification window in the top-right corner
+(focus-skip, `wm.policy.win.user.geometry`) shows up to three apps, e.g.
+"**org.example.app** ran 3 commands as root" plus the last command's first line.
+There is only ever one toast: new notices update its counters and command in
+place and keep it up until 6 s after the last command. Afterwards the UI stays
+connected but invisible for 5 min so the next toast appears instantly instead of
+waiting about 1 s for an app launch, then exits. Opening the app icon while it
+lingers shows the manager.
 
 ### Grant manager
 

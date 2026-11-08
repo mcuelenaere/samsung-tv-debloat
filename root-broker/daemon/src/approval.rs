@@ -21,9 +21,9 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 /// next queued prompt).
 const MAX_PROMPT_UI_RETRIES: u8 = 2;
 
-/// While granted apps keep executing, the gap between notices doubles up to
-/// this multiple of `notice_interval`; one quiet interval resets it.
-const NOTICE_BACKOFF_MAX: u32 = 30;
+/// After the UI could not be launched for notices, wait this long before
+/// launching it again, so a broken UI is not respawned for every granted exec.
+const NOTICE_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 /// Distinct packages coalesced into one notice.
 // ponytail: further packages are dropped until the next flush; only
@@ -247,7 +247,6 @@ struct Manager {
     launch: LaunchState,
     notices: Vec<NoticeEntry>,
     notice_next_at: Instant,
-    notice_gap: Duration,
 }
 
 impl Manager {
@@ -256,7 +255,6 @@ impl Manager {
         grants: Arc<Mutex<GrantStore>>,
         logger: Option<Arc<Logger>>,
     ) -> Self {
-        let notice_gap = config.notice_interval;
         Self {
             config,
             grants,
@@ -267,7 +265,6 @@ impl Manager {
             launch: LaunchState::default(),
             notices: Vec::new(),
             notice_next_at: Instant::now(),
-            notice_gap,
         }
     }
 
@@ -405,16 +402,13 @@ impl Manager {
         self.flush_notices();
     }
 
-    /// Leading-edge throttle: the first granted exec after a quiet period is
-    /// shown at once; executions during the following gap are coalesced per
-    /// package into one update. The gap doubles while activity continues.
+    /// Near real-time: the first granted exec is sent at once; execs within
+    /// the next `notice_interval` are coalesced per package into one update,
+    /// which only caps the message rate during bursts. The UI keeps a single
+    /// toast and updates it in place.
     fn flush_notices(&mut self) {
         let now = Instant::now();
-        if now < self.notice_next_at {
-            return;
-        }
-        if self.notices.is_empty() {
-            self.notice_gap = self.config.notice_interval;
+        if now < self.notice_next_at || self.notices.is_empty() {
             return;
         }
         // A prompt owns the screen; hold notices until it is decided.
@@ -441,9 +435,7 @@ impl Manager {
                 "notice_write_failed error={error} dropped={summary}"
             )),
         }
-        self.notice_next_at = now + self.notice_gap;
-        self.notice_gap =
-            (self.notice_gap * 2).min(self.config.notice_interval * NOTICE_BACKOFF_MAX);
+        self.notice_next_at = now + self.config.notice_interval;
     }
 
     fn handle_detach(&mut self, token: u64) {
@@ -744,7 +736,7 @@ impl Manager {
         if !self.notices.is_empty() {
             // Best effort: never retry a broken UI for every granted exec.
             self.notices.clear();
-            self.notice_next_at = Instant::now() + self.notice_gap;
+            self.notice_next_at = Instant::now() + NOTICE_RETRY_AFTER_FAILURE;
             self.log(&format!("notices_dropped={error}"));
         }
         self.launch = LaunchState::default();
