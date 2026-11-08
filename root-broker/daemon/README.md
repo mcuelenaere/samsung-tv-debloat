@@ -6,9 +6,12 @@ exact package-level grant. M1 validated the headless broker. M2 added the
 interactive approval flow, persistent **Always allow** grants, and the managed
 .NET grant manager under `root-broker/ui/`. The live branch also has per-app
 execution toasts; M4 binds grants to the installed package signature and adds
-failure-path/probe coverage. Protocol v2 adds `pkg.install` with staging,
-manifest inspection, trust enrollment, and a package-aware prompt (M1 of
-`../../docs/tv-authd-pkg-install-plan.md`; host-validated, not yet TV-validated).
+failure-path/probe coverage. Protocol v2 adds package management (see
+`../../docs/tv-authd-pkg-install-plan.md`): `pkg.install` with staging, manifest
+inspection, trust enrollment, and a package-aware prompt (M1), plus
+`pkg.uninstall`, `pkg.list`, and the prompt-free uid-0 root role (M2). Both are
+TV-validated for the `pkgcmd` TPK path; WGT installs and Samsung Home
+registration remain M4, and on-device re-signing remains M3.
 
 The wire contract is in [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -32,8 +35,9 @@ ordinary package --exec--> tv-authd
 ```
 
 The approval UI is `User::Pkg::org.tvauth.ui` (configurable), UID 5001. It may
-only use UI methods; ordinary packages may only use `exec`. A missing, unexpected,
-or non-package label is rejected.
+only use UI methods. Ordinary packages may use `exec` and prompted `pkg.*`;
+uid 0 with the `System::Privileged` label may use `pkg.*` without a prompt
+(never `exec`). A missing, unexpected, or non-package label is rejected.
 
 Only one prompt is visible globally, and only one request per package label may
 be pending. Prompt decisions are bound to a fresh 128-bit nonce, the prompt ID,
@@ -56,8 +60,11 @@ persistence/revocation, execution, process-group timeouts, output truncation in
 both streams, EINTR handling, package staging (allowlist, symlinks, size caps,
 cleanup), zip hygiene and manifest parsing, identity/privilege policy,
 signature labelling, trust material and mount parsing, `pkgcmd` output
-handling, and the full install prompt/approve/deny/failure flows. The
-integrated suite is 106 Linux tests. Linux integration tests run in Docker:
+handling, the full install prompt/approve/deny/failure flows, uninstall
+prompting and policy (`protected_package`, `unknown_package`), `pkg.list`
+database parsing, and the root role (prompt-free install/removal with a notice,
+`exec` refused). The integrated suite is 120 Linux tests. Linux integration
+tests run in Docker:
 
 ```sh
 docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src rust:1-bookworm \
@@ -74,9 +81,12 @@ This cross-compiles a static stripped ARMv7 musl binary into `out/tv-authd`
 from a native (amd64/arm64) Rust 1.85 container, linking with `rust-lld`, then
 checks its `--help` output under ARM emulation. A full build takes about 8 s
 (the previous fully emulated build took about 100 s). With package-install M1
-on top of M4 and the review-fixes hardening the binary is 762,228 bytes,
-SHA-256 `4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62` (TV-validated
-for the TPK install flow; see the package-install plan). The validated M4 build was 584,452 bytes, SHA-256
+and M2 on top of M4 and the review-fixes hardening the binary is 787,372 bytes,
+SHA-256 `50e246fa4275dbd2bf6cedf05dc4b0a080a354d4bf9ef1d2f092ec8f0c37e915`
+(TV-validated for install, uninstall, list, and the root role; see the
+package-install plan). The validated M1 build was 762,228 bytes, SHA-256
+`4b2a51e4d73f498fd0688206bd6b93f55e272029d85e638c847196343efafd62`; the
+validated M4 build was 584,452 bytes, SHA-256
 `7903c0bac20e27ba3fb1de6b8def5424507e9d9f5c8ab77034c9f5cf5000f464`.
 
 ## CLI defaults
@@ -99,6 +109,8 @@ for the TPK install flow; see the package-install plan). The validated M4 build 
 | `--staging-dir` | `/opt/tv-auth/staging` | package staging (`0711`, wiped at start) |
 | `--max-package-bytes` | `134217728` (128 MiB) | staged package cap (max 256 MiB) |
 | `--pkgcmd` | `/usr/bin/pkgcmd` | stock installer |
+| `--sqlite3` | `/usr/bin/sqlite3` | read-only package database access |
+| `--pkgdb` | `/opt/dbspace/.pkgmgr_parser.db` | pkgmgr package database |
 | `--trust-root` | `/opt/tv-auth/trust` | CA material and fingerprint list |
 | `--no-trust` | off | skip trust enrollment (development only) |
 | `--no-package-support` | off | serve `exec` only |
@@ -111,10 +123,30 @@ files `0644`; wiped at startup), parses its manifest, and prompts with
 `kind: "install"`. Only after
 the user approves does it enroll trust and run `pkgcmd -i -t <type> -p <staged>`.
 The source allowlist is `/opt/usr/home/owner/**`, `/opt/media/**`, and `/tmp/**`;
-packages are capped at 128 MiB by
-default (`--max-package-bytes`, up to 256 MiB), because staging is on the
-`/run` tmpfs. Package operations never use the grant store and
-are always interactive; see `PROTOCOL.md`.
+packages are capped at 128 MiB by default (`--max-package-bytes`, up to
+256 MiB). Package operations never use the grant store and are always
+interactive for app clients; see `PROTOCOL.md`.
+
+`pkg.uninstall` reads the installed package's metadata from
+`/opt/dbspace/.pkgmgr_parser.db` through `sqlite3 -readonly` (the
+`package_info` table joined with the "No Locale" label row). Reading the
+database directly matters: `pkginfo --listpkg` enumerates every app over D-Bus
+and takes about 16 s on this firmware, while the same rows are a ~10 ms query.
+Only non-system, non-preload, removable `wgt`/`tpk` packages can be removed, and
+platform-reserved package ids are refused first. `pkgcmd -u` takes the *package
+id* via `-n` (`-p` is a package path and fails with `realpath fail`). Installs
+and removals share one global lock.
+
+`pkg.list` is the same read-only query and returns `pkgid`, `name`,
+`pkg_version`, `pkg_type`, and `main_app_id` for every installed user package,
+so an app store (for example Vetro) can tell what is installed or upgradable.
+
+The root role (UID 0 with the exact `System::Privileged` label) may call
+`pkg.install`/`pkg.uninstall`/`pkg.list` without a prompt, with the same
+staging, policy, trust, and audit pipeline. Successful prompt-free operations
+queue a `ui.notice` (`kind: "install"`/`"uninstall"`) so the user sees a toast;
+`exec` remains package-only. `test-clients/rootcli` is a static ARMv7 client for
+this role (run it from `/run`: the VDFS in `/opt` rejects unsigned ELFs).
 
 Trust enrollment needs `/opt/tv-auth/trust/` containing `user-root-ca.pem`,
 `fingerprint_list.xml`, and `tizen-ca/`. The daemon verifies the material and
@@ -208,7 +240,9 @@ traverse it to connect to the known socket path but cannot list runtime entries.
 The socket is mode `0660`, owner `root:users` (gid 100 on this TV), so UID-5001
 apps in the `users` group can connect; package identity is still enforced by the
 daemon. The daemon log is mode `0600` (and repaired from older `0644` files on
-startup).
+startup). The VDFS in `/opt` rejects unsigned ELFs, so the daemon (and any
+`tvauth-cli` test client) executes from a copy under `/run`, not from
+`/opt/tv-auth` directly.
 
 ## Approval UI
 
@@ -236,7 +270,19 @@ broker `exec` request and save the response under `/tmp/tvauth-<probe>.response`
 
 They were used for M1 with a pre-seeded grant. In M2 they are useful as
 untrusted requesters: the daemon should launch the UI instead of returning
-`not_granted`. Their hard-coded response handling is unchanged.
+`not_granted`. Their hard-coded response handling is unchanged, and the request
+file can carry any method, so the same probe drove `pkg.uninstall` and
+`pkg.list` for M2 validation.
+
+`test-clients/rootcli` is a dependency-free Rust client for the uid-0 role:
+
+```sh
+./test-clients/rootcli/build-armv7.sh
+# on the TV: copy out/tvauth-cli to /run and run
+/run/tvauth-cli list
+/run/tvauth-cli install tpk /tmp/org.example.app-0.1.0.tpk
+/run/tvauth-cli uninstall org.example.app
+```
 
 `./test-clients/build-upgrade-client.sh` builds a 0.1.1 `brokerone` with changed
 content for the M4 package-upgrade test (same package ID/signer, different
@@ -272,6 +318,24 @@ Validated on the target:
 - `input_keyevent` verified RETURN, Right/Left focus movement, and BACK. The
   manager list renders about two seconds after launch, so scripts must wait for
   the grants response before injecting keys.
+
+The package-install M2 work (uninstall, `pkg.list`, root role) was deployed and
+TV-validated on 2026-11-08:
+
+- root `pkg.list` and app `pkg.list` returned 126/127 installed user packages
+  in milliseconds;
+- root `pkg.install` and `pkg.uninstall` ran without a prompt and produced
+  `PACKAGE CHANGE` toasts ("root installed a package", "root removed a
+  package");
+- an app-role uninstall prompt showed requester, name, id, version, and type;
+  Deny returned `user_denied` with the package intact and Remove returned
+  `status: ok`;
+- `pkgcmd -u -n <pkgid>` is the working uninstall form; `-p` is a package path.
+
+Uninstalling a package that was installed through `sdb` leaves its Samsung Home
+`widgetinfo` row behind, because `pkgcmd` does not contact `webappservice`; M4
+owns that cleanup. The stale row from the probe was removed manually after
+validation.
 
 Cold boot on 2026-11-05 used boot ID
 `7687b045-4e4b-4a7e-9416-68ecc3fc6efc`; AT-HUB logged `start units rc=0`, both

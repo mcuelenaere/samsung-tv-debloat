@@ -96,6 +96,25 @@ pub struct InstallRequest {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UninstallRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+    pub pkgid: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListPackagesRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageType {
@@ -160,6 +179,28 @@ pub struct InstallMeta {
     pub is_upgrade: bool,
 }
 
+/// Metadata shown on a `kind = "uninstall"` prompt. The daemon reads it from
+/// the installed package database before asking, so the user sees exactly what
+/// will be removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UninstallMeta {
+    pub pkgid: String,
+    pub name: String,
+    pub pkg_version: String,
+    pub pkg_type: PackageType,
+}
+
+/// One entry of `pkg.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageView {
+    pub pkgid: String,
+    pub name: String,
+    pub pkg_version: String,
+    pub pkg_type: PackageType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_app_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
@@ -177,6 +218,8 @@ pub enum Request {
     GrantsRevoke(GrantsRevokeRequest),
     GrantsNotify(GrantsNotifyRequest),
     PkgInstall(InstallRequest),
+    PkgUninstall(UninstallRequest),
+    PkgList(ListPackagesRequest),
 }
 
 impl Request {
@@ -189,6 +232,8 @@ impl Request {
             Self::GrantsRevoke(request) => &request.id,
             Self::GrantsNotify(request) => &request.id,
             Self::PkgInstall(request) => &request.id,
+            Self::PkgUninstall(request) => &request.id,
+            Self::PkgList(request) => &request.id,
         }
     }
 }
@@ -239,9 +284,15 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
         "pkg.install" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
             serde_json::from_slice::<InstallRequest>(bytes).map(Request::PkgInstall)
         }
+        "pkg.uninstall" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<UninstallRequest>(bytes).map(Request::PkgUninstall)
+        }
+        "pkg.list" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<ListPackagesRequest>(bytes).map(Request::PkgList)
+        }
         // A v1 client asking for a v2-only method is a version problem, not an
         // unknown method: the client should learn that it must upgrade.
-        "pkg.install" => return Err(ParseError::UnsupportedVersion),
+        "pkg.install" | "pkg.uninstall" | "pkg.list" => return Err(ParseError::UnsupportedVersion),
         _ => return Err(ParseError::UnsupportedMethod),
     };
     request.map_err(|_| ParseError::Malformed)
@@ -274,6 +325,17 @@ pub fn validate_install(request: &InstallRequest) -> Result<u64, &'static str> {
         || !std::path::Path::new(path).is_absolute()
     {
         return Err("invalid_path");
+    }
+    let timeout = request.timeout_ms.unwrap_or(DEFAULT_INSTALL_TIMEOUT_MS);
+    if timeout == 0 || timeout > MAX_INSTALL_TIMEOUT_MS {
+        return Err("invalid_timeout");
+    }
+    Ok(timeout)
+}
+
+pub fn validate_uninstall(request: &UninstallRequest) -> Result<u64, &'static str> {
+    if !crate::identity::is_valid_package_id(&request.pkgid) {
+        return Err("invalid_pkgid");
     }
     let timeout = request.timeout_ms.unwrap_or(DEFAULT_INSTALL_TIMEOUT_MS);
     if timeout == 0 || timeout > MAX_INSTALL_TIMEOUT_MS {
@@ -331,6 +393,9 @@ pub struct Response {
     pub re_signed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_tail_b64: Option<String>,
+    /// `pkg.list` result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<PackageView>>,
     /// Human-readable policy detail (for example the rejected privileges).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -359,6 +424,7 @@ impl Response {
             pkg_version: None,
             re_signed: None,
             log_tail_b64: None,
+            packages: None,
             detail: None,
             error: None,
             launch: None,
@@ -387,6 +453,7 @@ impl Response {
             pkg_version: None,
             re_signed: None,
             log_tail_b64: None,
+            packages: None,
             detail: None,
             error: None,
             launch: None,
@@ -407,6 +474,21 @@ impl Response {
         response.pkg_version = Some(pkg_version.to_owned());
         response.re_signed = Some(re_signed);
         response.log_tail_b64 = Some(engine.encode(log_tail));
+        response
+    }
+
+    pub fn uninstall_ok(id: &str, pkgid: &str, log_tail: &[u8]) -> Self {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut response = Self::base(id, "ok");
+        response.pkgid = Some(pkgid.to_owned());
+        response.log_tail_b64 = Some(engine.encode(log_tail));
+        response
+    }
+
+    pub fn packages(id: &str, packages: Vec<PackageView>) -> Self {
+        let mut response = Self::base(id, "ok");
+        response.packages = Some(packages);
         response
     }
 
@@ -446,7 +528,18 @@ impl Response {
     }
 }
 
-/// One package's granted executions since the last `ui.notice`.
+/// Which kind of notification a `ui.notice` entry describes. `exec` matches
+/// the v1 behaviour ("ran a command as root"); package entries are queued by
+/// prompt-free uid-0 operations so the user still sees what changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoticeKind {
+    Exec,
+    Install,
+    Uninstall,
+}
+
+/// One package's notified actions since the last `ui.notice`.
 #[derive(Debug, Clone, Serialize)]
 pub struct NoticeEntry {
     pub label: String,
@@ -455,6 +548,7 @@ pub struct NoticeEntry {
     /// Display copy of the most recent command.
     pub command: String,
     pub command_truncated: bool,
+    pub kind: NoticeKind,
 }
 
 impl NoticeEntry {
@@ -465,6 +559,23 @@ impl NoticeEntry {
             count: 1,
             command: String::new(),
             command_truncated: false,
+            kind: NoticeKind::Exec,
+        };
+        entry.set_command(command);
+        entry
+    }
+
+    /// A prompt-free package operation performed by a root client. `package`
+    /// is the actor shown in the toast (currently `"root"`), not the package
+    /// that was changed; the changed package is in `command`.
+    pub fn package(label: &str, package: &str, command: &str, kind: NoticeKind) -> Self {
+        let mut entry = Self {
+            label: label.to_owned(),
+            package: display_safe(package),
+            count: 1,
+            command: String::new(),
+            command_truncated: false,
+            kind,
         };
         entry.set_command(command);
         entry
@@ -509,6 +620,9 @@ pub struct PromptMessage {
     /// Present for `kind = "install"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallMeta>,
+    /// Present for `kind = "uninstall"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uninstall: Option<UninstallMeta>,
     pub command: String,
     pub command_bytes: usize,
     pub command_truncated: bool,
@@ -531,6 +645,7 @@ impl PromptMessage {
                 .to_owned(),
             kind: input.kind.as_str(),
             install: input.install,
+            uninstall: input.uninstall,
             command: display,
             command_bytes: input.command.len(),
             command_truncated: truncated,
@@ -546,6 +661,7 @@ pub struct PromptInput<'a> {
     pub label: &'a str,
     pub kind: PromptKind,
     pub install: Option<InstallMeta>,
+    pub uninstall: Option<UninstallMeta>,
     pub command: &'a str,
     pub timeout_ms: u64,
 }
@@ -850,6 +966,55 @@ mod tests {
     }
 
     #[test]
+    fn package_uninstall_and_list_require_protocol_v2() {
+        for body in [
+            br#"{"version":1,"id":"a","method":"pkg.uninstall","pkgid":"org.example.app"}"#
+                .as_slice(),
+            br#"{"version":1,"id":"a","method":"pkg.list"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                parse_request(body).unwrap_err(),
+                ParseError::UnsupportedVersion
+            );
+        }
+        match parse_request(
+            br#"{"version":2,"id":"a","method":"pkg.uninstall","pkgid":"org.example.app"}"#,
+        )
+        .unwrap()
+        {
+            Request::PkgUninstall(request) => assert_eq!(request.pkgid, "org.example.app"),
+            other => panic!("unexpected request: {other:?}"),
+        }
+        assert!(matches!(
+            parse_request(br#"{"version":2,"id":"a","method":"pkg.list"}"#).unwrap(),
+            Request::PkgList(_)
+        ));
+        assert_eq!(
+            parse_request(br#"{"version":2,"id":"a","method":"pkg.uninstall"}"#).unwrap_err(),
+            ParseError::Malformed
+        );
+    }
+
+    #[test]
+    fn validates_uninstall_package_ids() {
+        let mut request = UninstallRequest {
+            version: 2,
+            id: "uninst".into(),
+            method: "pkg.uninstall".into(),
+            pkgid: "org.example.app".into(),
+            timeout_ms: None,
+        };
+        assert_eq!(validate_uninstall(&request), Ok(DEFAULT_INSTALL_TIMEOUT_MS));
+        for bad in ["", "../etc", "bad id", "a/b"] {
+            request.pkgid = bad.into();
+            assert_eq!(validate_uninstall(&request), Err("invalid_pkgid"), "{bad}");
+        }
+        request.pkgid = "org.example.app".into();
+        request.timeout_ms = Some(MAX_INSTALL_TIMEOUT_MS + 1);
+        assert_eq!(validate_uninstall(&request), Err("invalid_timeout"));
+    }
+
+    #[test]
     fn validates_decision_and_revoke_tokens() {
         let mut decision = UiDecisionRequest {
             version: 1,
@@ -904,6 +1069,7 @@ mod tests {
                 label: "User::Pkg::org.example.app",
                 kind: PromptKind::Exec,
                 install: None,
+                uninstall: None,
                 command: &"x".repeat(MAX_PROMPT_COMMAND_BYTES + 10),
                 timeout_ms: 1000,
             },
@@ -935,6 +1101,7 @@ mod tests {
                 label: "User::Pkg::org.example.app",
                 kind: PromptKind::Install,
                 install: Some(meta),
+                uninstall: None,
                 command: "install wgt /tmp/app.wgt",
                 timeout_ms: 1000,
             },
@@ -957,6 +1124,7 @@ mod tests {
                 label: "User::Pkg::org.example.app",
                 kind: PromptKind::Exec,
                 install: None,
+                uninstall: None,
                 command: "one\u{0}two\u{202e}three\nfour",
                 timeout_ms: 1000,
             },

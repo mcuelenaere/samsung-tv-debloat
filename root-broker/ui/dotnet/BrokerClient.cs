@@ -18,6 +18,7 @@ namespace TvAuthUi
         public string Package;
         public string Kind = "exec";
         public InstallInfo Install;
+        public UninstallInfo Uninstall;
         public string Command;
         public int CommandBytes;
         public bool CommandTruncated;
@@ -38,6 +39,14 @@ namespace TvAuthUi
         public bool IsUpgrade;
     }
 
+    internal sealed class UninstallInfo
+    {
+        public string PkgId;
+        public string Name;
+        public string PkgVersion;
+        public string PkgType;
+    }
+
     internal sealed class NoticeInfo
     {
         public string Label;
@@ -45,6 +54,8 @@ namespace TvAuthUi
         public int Count;
         public string Command;
         public bool CommandTruncated;
+        /// <summary>"exec", "install" or "uninstall".</summary>
+        public string Kind = "exec";
     }
 
     internal sealed class GrantInfo
@@ -296,6 +307,7 @@ namespace TvAuthUi
                         Package = GetString(root, "package"),
                         Kind = GetKind(root),
                         Install = GetInstall(root),
+                        Uninstall = GetUninstall(root),
                         Command = GetString(root, "command"),
                         CommandBytes = GetInt(root, "command_bytes"),
                         CommandTruncated = GetBool(root, "command_truncated"),
@@ -320,7 +332,8 @@ namespace TvAuthUi
                             Package = GetString(item, "package"),
                             Count = Math.Max(1, GetInt(item, "count")),
                             Command = GetString(item, "command"),
-                            CommandTruncated = GetBool(item, "command_truncated")
+                            CommandTruncated = GetBool(item, "command_truncated"),
+                            Kind = GetNoticeKind(item)
                         });
                     }
                     dispatch.Enqueue(() => NoticeReceived?.Invoke(list));
@@ -438,6 +451,26 @@ namespace TvAuthUi
                 }
             }
             return info;
+        }
+
+        private static UninstallInfo GetUninstall(JsonElement root)
+        {
+            if (!root.TryGetProperty("uninstall", out var element)
+                || element.ValueKind != JsonValueKind.Object)
+                return null;
+            return new UninstallInfo
+            {
+                PkgId = GetString(element, "pkgid"),
+                Name = GetString(element, "name"),
+                PkgVersion = GetString(element, "pkg_version"),
+                PkgType = GetString(element, "pkg_type")
+            };
+        }
+
+        private static string GetNoticeKind(JsonElement element)
+        {
+            var kind = GetString(element, "kind");
+            return kind == "install" || kind == "uninstall" ? kind : "exec";
         }
 
         private static int GetInt(JsonElement element, string name)

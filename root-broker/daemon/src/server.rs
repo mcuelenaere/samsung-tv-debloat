@@ -1,15 +1,18 @@
 use crate::approval::{ApprovalHandle, ApprovalRequest, ApprovalResult};
 use crate::executor;
 use crate::grants::{GrantCheck, GrantStore, NotifyMode};
-use crate::identity::{package_from_label, PeerIdentity};
+use crate::identity::{is_root_identity, package_from_label, PeerIdentity};
 use crate::logger::Logger;
 use crate::pkginstall::{self, InstallError};
+use crate::pkglist;
 use crate::pkgmeta::{self, MetaError, SignatureContext};
 use crate::pkgstage::{self, StageConfig, StageError};
 use crate::protocol::{
-    is_valid_request_id, parse_request, read_message, validate_decision, validate_exec,
-    validate_install, validate_label, write_response, ExecRequest, GrantView, InstallRequest,
-    ParseError, PromptKind, Request, Response, MAX_REQUEST_BYTES,
+    is_valid_request_id, parse_request, prompt_text, read_message, validate_decision,
+    validate_exec, validate_install, validate_label, validate_uninstall, write_response,
+    ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind, PackageView,
+    ParseError, PromptKind, Request, Response, UninstallMeta, UninstallRequest, MAX_PKGID_BYTES,
+    MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES, MAX_REQUEST_BYTES,
 };
 use crate::trust::{self, TrustPaths};
 use rustix::io::Errno;
@@ -33,6 +36,8 @@ pub struct PackageConfig {
     pub staging: StageConfig,
     /// Stock installer, normally `/usr/bin/pkgcmd`.
     pub pkgcmd: PathBuf,
+    /// Stock package database, read through `sqlite3 -readonly`.
+    pub db: pkglist::PackageDb,
     /// `None` disables trust enrollment (host tests and dry runs only).
     pub trust: Option<TrustPaths>,
     /// Directories that indicate an already installed package.
@@ -44,6 +49,7 @@ impl PackageConfig {
         Self {
             staging: StageConfig::default(),
             pkgcmd: PathBuf::from("/usr/bin/pkgcmd"),
+            db: pkglist::PackageDb::new(),
             trust: Some(TrustPaths::new(trust::DEFAULT_TRUST_ROOT)),
             installed_roots: DEFAULT_INSTALLED_ROOTS.iter().map(PathBuf::from).collect(),
         }
@@ -125,6 +131,27 @@ impl ServerConfig {
     }
 }
 
+/// What a connection is allowed to do, fixed for its lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientRole {
+    /// The approval UI package: `ui.*` and `grants.*`.
+    Ui,
+    /// uid 0 with the system label: `pkg.*` without prompts, never `exec`.
+    Root,
+    /// An ordinary app package: `exec` and prompted `pkg.*`.
+    Package,
+}
+
+fn client_role(config: &ServerConfig, identity: &PeerIdentity) -> ClientRole {
+    if config.is_ui(identity) {
+        ClientRole::Ui
+    } else if is_root_identity(identity) {
+        ClientRole::Root
+    } else {
+        ClientRole::Package
+    }
+}
+
 /// Reader that enforces an absolute deadline across all underlying reads, so
 /// a peer trickling bytes cannot extend a message's idle timeout forever.
 struct DeadlineReader {
@@ -174,6 +201,12 @@ pub fn handle_connection(
     config: &ServerConfig,
 ) -> io::Result<()> {
     let is_ui = config.is_ui(&identity);
+    let is_root = is_root_identity(&identity);
+    if !is_ui && !is_root && !crate::identity::is_valid_package_label(&identity.label) {
+        // The accept loop already filters these; fail closed if a caller
+        // bypasses it.
+        return Ok(());
+    }
     let idle_timeout = if is_ui {
         Duration::from_secs(600)
     } else {
@@ -250,17 +283,18 @@ pub fn handle_connection(
         }
         request_ids.insert(response_id.clone());
 
-        let result = if is_ui {
-            handle_ui_request(
+        let result = match client_role(config, &identity) {
+            ClientRole::Ui => handle_ui_request(
                 &writer,
                 &identity,
                 &broker,
                 request,
                 &mut ui_token,
                 &control,
-            )
-        } else {
-            handle_app_request(&writer, &identity, &broker, config, request)
+            ),
+            ClientRole::Root | ClientRole::Package => {
+                handle_app_request(&writer, &identity, &broker, config, request)
+            }
         };
         if let Err(error) = result {
             break Err(error);
@@ -460,6 +494,26 @@ fn handle_ui_request(
             );
             send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
         }
+        Request::PkgUninstall(request) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} uid={} pid={} request={} denied=ui_role_method=pkg.uninstall",
+                    identity.label, identity.uid, identity.pid, request.id
+                ),
+            );
+            send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
+        }
+        Request::PkgList(request) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} uid={} pid={} request={} denied=ui_role_method=pkg.list",
+                    identity.label, identity.uid, identity.pid, request.id
+                ),
+            );
+            send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
+        }
     }
     Ok(())
 }
@@ -471,9 +525,28 @@ fn handle_app_request(
     config: &ServerConfig,
     request: Request,
 ) -> io::Result<()> {
+    let root = is_root_identity(identity);
     match request {
+        // The uid-0 escape hatch covers package management only; arbitrary
+        // command execution stays restricted to installed packages.
+        Request::Exec(request) if root => {
+            log(
+                broker,
+                &format!(
+                    "requester={} uid={} pid={} request={} denied=root_role_method=exec",
+                    identity.label, identity.uid, identity.pid, request.id
+                ),
+            );
+            send(writer, &Response::error(&request.id, "denied", "root_role"))
+        }
         Request::Exec(request) => handle_exec(writer, identity, broker, config, request),
-        Request::PkgInstall(request) => handle_install(writer, identity, broker, config, request),
+        Request::PkgInstall(request) => {
+            handle_install(writer, identity, broker, config, request, !root)
+        }
+        Request::PkgUninstall(request) => {
+            handle_uninstall(writer, identity, broker, config, request, !root)
+        }
+        Request::PkgList(request) => handle_list(writer, identity, broker, config, request),
         other => send(writer, &Response::error(other.id(), "error", "not_ui")),
     }
 }
@@ -556,6 +629,7 @@ fn handle_exec(
             label: identity.label.clone(),
             kind: PromptKind::Exec,
             install: None,
+            uninstall: None,
             command: request.command.clone(),
             reply,
         };
@@ -711,13 +785,15 @@ fn await_decision(
 
 /// Stage, inspect, prompt for, and install one package. The global install
 /// lock is held for the whole operation, so only one install (including its
-/// prompt) exists at a time.
+/// prompt) exists at a time. `prompt` is false for the uid-0 root role, which
+/// installs without asking and gets a toast instead.
 fn handle_install(
     writer: &Arc<Mutex<UnixStream>>,
     identity: &PeerIdentity,
     broker: &Arc<Broker>,
     config: &ServerConfig,
     request: InstallRequest,
+    prompt: bool,
 ) -> io::Result<()> {
     let timeout_ms = match validate_install(&request) {
         Ok(timeout) => timeout,
@@ -822,7 +898,7 @@ fn handle_install(
     log(
         broker,
         &format!(
-            "requester={} request={} method=pkg.install staged=true sha256={} pkgid={} version={} size={} signature={:?} upgrade={} approval_required",
+            "requester={} request={} method=pkg.install staged=true sha256={} pkgid={} version={} size={} signature={:?} upgrade={} {}",
             identity.label,
             request.id,
             staged.sha256(),
@@ -830,57 +906,73 @@ fn handle_install(
             install_meta.pkg_version,
             staged.size_bytes(),
             install_meta.signature,
-            is_upgrade
+            is_upgrade,
+            if prompt {
+                "approval_required"
+            } else {
+                "approval=root"
+            }
         ),
     );
 
-    let command = format!(
-        "install {} {}",
-        request.pkg_type.as_str(),
-        staged.display_path()
-    );
-    let (reply, decisions) = mpsc::channel();
-    let approval = ApprovalRequest {
-        ticket: 0,
-        request_id: request.id.clone(),
-        label: identity.label.clone(),
-        kind: PromptKind::Install,
-        install: Some(install_meta.clone()),
-        command,
-        reply,
-    };
-    let ticket = match broker.approvals.request(approval) {
-        Ok(ticket) => ticket,
-        Err(_) => {
-            send(
-                writer,
-                &Response::error(&request.id, "ui_unavailable", "approval_unavailable"),
-            )?;
-            return Ok(());
+    if prompt {
+        let command = format!(
+            "install {} {}",
+            request.pkg_type.as_str(),
+            staged.display_path()
+        );
+        let (reply, decisions) = mpsc::channel();
+        let approval = ApprovalRequest {
+            ticket: 0,
+            request_id: request.id.clone(),
+            label: identity.label.clone(),
+            kind: PromptKind::Install,
+            install: Some(install_meta.clone()),
+            uninstall: None,
+            command,
+            reply,
+        };
+        let ticket = match broker.approvals.request(approval) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                send(
+                    writer,
+                    &Response::error(&request.id, "ui_unavailable", "approval_unavailable"),
+                )?;
+                return Ok(());
+            }
+        };
+        match await_decision(writer, identity, broker, config, ticket, decisions)? {
+            ApprovalOutcome::Allowed => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} approval=allowed",
+                        identity.label, request.id, install_meta.pkgid
+                    ),
+                );
+            }
+            ApprovalOutcome::Denied(status, error) => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} approval=denied error={}",
+                        identity.label, request.id, install_meta.pkgid, error
+                    ),
+                );
+                send(writer, &Response::error(&request.id, status, error))?;
+                return Ok(());
+            }
+            ApprovalOutcome::ClientGone => return Ok(()),
         }
-    };
-    match await_decision(writer, identity, broker, config, ticket, decisions)? {
-        ApprovalOutcome::Allowed => {
-            log(
-                broker,
-                &format!(
-                    "requester={} request={} pkgid={} approval=allowed",
-                    identity.label, request.id, install_meta.pkgid
-                ),
-            );
-        }
-        ApprovalOutcome::Denied(status, error) => {
-            log(
-                broker,
-                &format!(
-                    "requester={} request={} pkgid={} approval=denied error={}",
-                    identity.label, request.id, install_meta.pkgid, error
-                ),
-            );
-            send(writer, &Response::error(&request.id, status, error))?;
-            return Ok(());
-        }
-        ApprovalOutcome::ClientGone => return Ok(()),
+    } else {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} pkgid={} approval=root",
+                identity.label, request.id, install_meta.pkgid
+            ),
+        );
     }
 
     if let Some(paths) = &packages.trust {
@@ -932,6 +1024,17 @@ fn handle_install(
                     staged.sha256()
                 ),
             );
+            if !prompt {
+                notify_package_operation(
+                    broker,
+                    identity,
+                    NoticeKind::Install,
+                    format!(
+                        "install {}-{}",
+                        install_meta.pkgid, install_meta.pkg_version
+                    ),
+                );
+            }
             send(
                 writer,
                 &Response::install_ok(
@@ -971,6 +1074,388 @@ fn handle_install(
         }
     }
     Ok(())
+}
+
+/// Remove one installed package, after a prompt for app clients (the uid-0
+/// root role removes without asking and gets a toast instead). It shares the
+/// install lock so installs and removals never overlap.
+fn handle_uninstall(
+    writer: &Arc<Mutex<UnixStream>>,
+    identity: &PeerIdentity,
+    broker: &Arc<Broker>,
+    config: &ServerConfig,
+    request: UninstallRequest,
+    prompt: bool,
+) -> io::Result<()> {
+    let timeout_ms = match validate_uninstall(&request) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            send(writer, &Response::error(&request.id, "error", error))?;
+            return Ok(());
+        }
+    };
+    let Some(packages) = config.packages.as_ref() else {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.uninstall disabled",
+                identity.label, request.id
+            ),
+        );
+        send(
+            writer,
+            &Response::error(&request.id, "error", "package_support_disabled"),
+        )?;
+        return Ok(());
+    };
+    if pkgmeta::is_reserved_pkgid(&request.pkgid) {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.uninstall pkgid={} denied=reserved",
+                identity.label, request.id, request.pkgid
+            ),
+        );
+        send(
+            writer,
+            &Response::error_with_detail(
+                &request.id,
+                "denied",
+                "manifest_forbidden",
+                Some("package id uses a platform-reserved prefix".into()),
+            ),
+        )?;
+        return Ok(());
+    }
+    let _install = match broker.install_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} method=pkg.uninstall result=busy",
+                    identity.label, request.id
+                ),
+            );
+            send(
+                writer,
+                &Response::error(&request.id, "busy", "install_busy"),
+            )?;
+            return Ok(());
+        }
+    };
+
+    log(
+        broker,
+        &format!(
+            "requester={} uid={} pid={} request={} method=pkg.uninstall pkgid={} attempt",
+            identity.label, identity.uid, identity.pid, request.id, request.pkgid
+        ),
+    );
+
+    let entry = match pkglist::get(&packages.db, &request.pkgid, pkglist::QUERY_TIMEOUT_MS) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} method=pkg.uninstall pkgid={} error=unknown_package",
+                    identity.label, request.id, request.pkgid
+                ),
+            );
+            send(
+                writer,
+                &Response::error(&request.id, "error", "unknown_package"),
+            )?;
+            return Ok(());
+        }
+        Err(error) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} method=pkg.uninstall error=package_list_failed detail={error}",
+                    identity.label, request.id
+                ),
+            );
+            send(
+                writer,
+                &Response::error_with_detail(
+                    &request.id,
+                    "error",
+                    "package_list_failed",
+                    Some(error.to_string()),
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let Some(pkg_type) = entry.package_type() else {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.uninstall pkgid={} denied=unsupported_type type={}",
+                identity.label, request.id, request.pkgid, entry.type_label
+            ),
+        );
+        send(
+            writer,
+            &Response::error_with_detail(
+                &request.id,
+                "denied",
+                "unsupported_package_type",
+                Some(format!("package type {}", entry.type_label)),
+            ),
+        )?;
+        return Ok(());
+    };
+    if !entry.is_user_package() {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.uninstall pkgid={} denied=protected_package system={} preload={} removable={}",
+                identity.label,
+                request.id,
+                request.pkgid,
+                entry.system,
+                entry.preload,
+                entry.removable
+            ),
+        );
+        send(
+            writer,
+            &Response::error_with_detail(
+                &request.id,
+                "denied",
+                "protected_package",
+                Some("only user-installed packages can be removed".into()),
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let uninstall_meta = UninstallMeta {
+        pkgid: entry.pkgid.clone(),
+        name: if entry.name.is_empty() {
+            entry.pkgid.clone()
+        } else {
+            prompt_text(&entry.name, MAX_PKG_NAME_BYTES)
+        },
+        pkg_version: prompt_text(&entry.pkg_version, MAX_PKG_VERSION_BYTES),
+        pkg_type,
+    };
+    log(
+        broker,
+        &format!(
+            "requester={} request={} method=pkg.uninstall pkgid={} version={} type={} removable=true {}",
+            identity.label,
+            request.id,
+            uninstall_meta.pkgid,
+            uninstall_meta.pkg_version,
+            pkg_type.as_str(),
+            if prompt {
+                "approval_required"
+            } else {
+                "approval=root"
+            }
+        ),
+    );
+
+    if prompt {
+        let (reply, decisions) = mpsc::channel();
+        let approval = ApprovalRequest {
+            ticket: 0,
+            request_id: request.id.clone(),
+            label: identity.label.clone(),
+            kind: PromptKind::Uninstall,
+            install: None,
+            uninstall: Some(uninstall_meta.clone()),
+            command: format!("remove {}", uninstall_meta.pkgid),
+            reply,
+        };
+        let ticket = match broker.approvals.request(approval) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                send(
+                    writer,
+                    &Response::error(&request.id, "ui_unavailable", "approval_unavailable"),
+                )?;
+                return Ok(());
+            }
+        };
+        match await_decision(writer, identity, broker, config, ticket, decisions)? {
+            ApprovalOutcome::Allowed => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} approval=allowed",
+                        identity.label, request.id, uninstall_meta.pkgid
+                    ),
+                );
+            }
+            ApprovalOutcome::Denied(status, error) => {
+                log(
+                    broker,
+                    &format!(
+                        "requester={} request={} pkgid={} approval=denied error={}",
+                        identity.label, request.id, uninstall_meta.pkgid, error
+                    ),
+                );
+                send(writer, &Response::error(&request.id, status, error))?;
+                return Ok(());
+            }
+            ApprovalOutcome::ClientGone => return Ok(()),
+        }
+    }
+
+    match pkginstall::uninstall(
+        &packages.pkgcmd,
+        pkg_type,
+        &uninstall_meta.pkgid,
+        timeout_ms,
+    ) {
+        Ok(outcome) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} pkgid={} version={} result=uninstalled",
+                    identity.label, request.id, uninstall_meta.pkgid, uninstall_meta.pkg_version
+                ),
+            );
+            if !prompt {
+                notify_package_operation(
+                    broker,
+                    identity,
+                    NoticeKind::Uninstall,
+                    format!("remove {}", uninstall_meta.pkgid),
+                );
+            }
+            send(
+                writer,
+                &Response::uninstall_ok(&request.id, &uninstall_meta.pkgid, &outcome.log_tail),
+            )?;
+        }
+        Err(error) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} pkgid={} result=uninstall_failed detail={error}",
+                    identity.label, request.id, uninstall_meta.pkgid
+                ),
+            );
+            let (detail, log_tail) = match error {
+                InstallError::Spawn(error) => (format!("cannot run pkgcmd: {error}"), Vec::new()),
+                InstallError::Failed { detail, log_tail } => (detail, log_tail),
+            };
+            let mut response =
+                Response::error_with_detail(&request.id, "error", "uninstall_failed", Some(detail));
+            response.pkgid = Some(uninstall_meta.pkgid.clone());
+            response.pkg_version = Some(uninstall_meta.pkg_version.clone());
+            if !log_tail.is_empty() {
+                use base64::Engine as _;
+                response.log_tail_b64 =
+                    Some(base64::engine::general_purpose::STANDARD.encode(log_tail));
+            }
+            send(writer, &response)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read-only listing of installed third-party packages.
+fn handle_list(
+    writer: &Arc<Mutex<UnixStream>>,
+    identity: &PeerIdentity,
+    broker: &Arc<Broker>,
+    config: &ServerConfig,
+    request: ListPackagesRequest,
+) -> io::Result<()> {
+    let Some(packages) = config.packages.as_ref() else {
+        log(
+            broker,
+            &format!(
+                "requester={} request={} method=pkg.list disabled",
+                identity.label, request.id
+            ),
+        );
+        send(
+            writer,
+            &Response::error(&request.id, "error", "package_support_disabled"),
+        )?;
+        return Ok(());
+    };
+    log(
+        broker,
+        &format!(
+            "requester={} uid={} pid={} request={} method=pkg.list",
+            identity.label, identity.uid, identity.pid, request.id
+        ),
+    );
+    match pkglist::list(&packages.db, pkglist::QUERY_TIMEOUT_MS) {
+        Ok(entries) => {
+            let views = entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let pkg_type = entry.package_type()?;
+                    let name = if entry.name.is_empty() {
+                        entry.pkgid.clone()
+                    } else {
+                        prompt_text(&entry.name, MAX_PKG_NAME_BYTES)
+                    };
+                    Some(PackageView {
+                        pkgid: prompt_text(&entry.pkgid, MAX_PKGID_BYTES),
+                        name,
+                        pkg_version: prompt_text(&entry.pkg_version, MAX_PKG_VERSION_BYTES),
+                        pkg_type,
+                        main_app_id: entry
+                            .main_app_id
+                            .map(|app_id| prompt_text(&app_id, MAX_PKGID_BYTES)),
+                    })
+                })
+                .collect::<Vec<_>>();
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} method=pkg.list packages={}",
+                    identity.label,
+                    request.id,
+                    views.len()
+                ),
+            );
+            send(writer, &Response::packages(&request.id, views))?;
+        }
+        Err(error) => {
+            log(
+                broker,
+                &format!(
+                    "requester={} request={} method=pkg.list error=package_list_failed detail={error}",
+                    identity.label, request.id
+                ),
+            );
+            send(
+                writer,
+                &Response::error_with_detail(
+                    &request.id,
+                    "error",
+                    "package_list_failed",
+                    Some(error.to_string()),
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Toast for a prompt-free root package operation. Failures to queue it are
+/// logged by the approval manager and must not fail the operation itself.
+fn notify_package_operation(
+    broker: &Broker,
+    identity: &PeerIdentity,
+    kind: NoticeKind,
+    command: String,
+) {
+    let _ = broker
+        .approvals
+        .package_notice(identity.label.clone(), "root".into(), command, kind);
 }
 
 fn send(writer: &Arc<Mutex<UnixStream>>, response: &Response) -> io::Result<()> {
@@ -1471,8 +1956,43 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    /// One `package_info` row in the format `pkglist` parses.
+    fn package_row(
+        pkgid: &str,
+        pkg_type: &str,
+        version: &str,
+        main_app_id: &str,
+        name: &str,
+        user: bool,
+    ) -> String {
+        let (preload, system, removable) = if user {
+            ("false", "false", "true")
+        } else {
+            ("true", "true", "false")
+        };
+        format!(
+            "{pkgid}\u{1f}{pkg_type}\u{1f}{version}\u{1f}{main_app_id}\u{1f}{name}\
+             \u{1f}{preload}\u{1f}{system}\u{1f}{removable}"
+        )
+    }
+
     /// Wire package support into a fixture and return the source package path.
     fn with_packages(fixture: &mut Fixture, pkgcmd_body: &str) -> PathBuf {
+        with_packages_and_db(
+            fixture,
+            pkgcmd_body,
+            &package_row(
+                "org.example.app",
+                "wgt",
+                "1.0.0",
+                "org.example.app.Ui",
+                "Example",
+                true,
+            ),
+        )
+    }
+
+    fn with_packages_and_db(fixture: &mut Fixture, pkgcmd_body: &str, rows: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = fixture._directory.path();
@@ -1485,6 +2005,18 @@ mod tests {
         std::fs::write(&pkgcmd, pkgcmd_body).unwrap();
         std::fs::set_permissions(&pkgcmd, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Fake sqlite3: the daemon re-filters rows by package id, so a plain
+        // dump of the fixture rows is enough for both list and get.
+        let rows_path = directory.join("pkg-rows");
+        std::fs::write(&rows_path, format!("{rows}\n")).unwrap();
+        let sqlite3 = directory.join("sqlite3");
+        std::fs::write(
+            &sqlite3,
+            format!("#!/bin/sh\ncat '{}'\n", rows_path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sqlite3, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         fixture.config.packages = Some(PackageConfig {
             staging: StageConfig {
                 root: directory.join("staging"),
@@ -1492,6 +2024,10 @@ mod tests {
                 max_bytes: 1024 * 1024,
             },
             pkgcmd,
+            db: pkglist::PackageDb {
+                sqlite3,
+                database: directory.join("pkgmgr.db"),
+            },
             trust: None,
             installed_roots: Vec::new(),
         });
@@ -1782,6 +2318,272 @@ mod tests {
         let response = client.read();
         assert_eq!(response["status"], "denied");
         assert_eq!(response["error"], "ui_role");
+        client.send(uninstall_request("uninst-1", "org.example.app"));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "ui_role");
+        client.send(json!({"version": 2, "id": "list-1", "method": "pkg.list"}));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "ui_role");
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    fn uninstall_request(id: &str, pkgid: &str) -> Value {
+        json!({
+            "version": 2,
+            "id": id,
+            "method": "pkg.uninstall",
+            "pkgid": pkgid,
+            "timeout_ms": 5000
+        })
+    }
+
+    /// Records the pkgcmd arguments and reports success.
+    fn recording_pkgcmd(marker: &std::path::Path) -> String {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'key[end] val[ok]\\n'\n",
+            marker.display()
+        )
+    }
+
+    #[test]
+    fn approved_uninstall_prompts_and_runs_pkgcmd() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let marker = fixture._directory.path().join("pkgcmd-args");
+        with_packages(&mut fixture, &recording_pkgcmd(&marker));
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(uninstall_request("uninst-1", "org.example.app"));
+
+        let prompt = ui.read();
+        assert_eq!(prompt["type"], "ui.prompt");
+        assert_eq!(prompt["kind"], "uninstall");
+        assert_eq!(prompt["uninstall"]["pkgid"], "org.example.app");
+        assert_eq!(prompt["uninstall"]["name"], "Example");
+        assert_eq!(prompt["uninstall"]["pkg_version"], "1.0.0");
+        assert_eq!(prompt["uninstall"]["pkg_type"], "wgt");
+        assert_eq!(prompt["command"], "remove org.example.app");
+
+        ui.send(json!({
+            "version": 2,
+            "id": "decision-1",
+            "method": "ui.decision",
+            "prompt_id": prompt["prompt_id"],
+            "nonce": prompt["nonce"],
+            "decision": "once"
+        }));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["pkgid"], "org.example.app");
+        let args = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(args, "-u\n-t\nwgt\n-n\norg.example.app\n");
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn denied_uninstall_never_runs_pkgcmd() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let marker = fixture._directory.path().join("pkgcmd-ran");
+        with_packages(
+            &mut fixture,
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'key[end] val[ok]\\n'\n",
+                marker.display()
+            ),
+        );
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(uninstall_request("uninst-1", "org.example.app"));
+        let prompt = ui.read();
+        assert_eq!(prompt["kind"], "uninstall");
+        ui.send(json!({
+            "version": 2,
+            "id": "decision-1",
+            "method": "ui.decision",
+            "prompt_id": prompt["prompt_id"],
+            "nonce": prompt["nonce"],
+            "decision": "deny"
+        }));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "user_denied");
+        assert!(!marker.exists());
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn uninstall_refuses_protected_and_unknown_packages_without_a_prompt() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let rows = format!(
+            "{}\n{}\n",
+            package_row(
+                "com.samsung.tv.example",
+                "tpk",
+                "1.0.0",
+                "com.samsung.tv.example",
+                "System example",
+                false
+            ),
+            package_row(
+                "adplatform",
+                "wgt",
+                "0.10.98",
+                "adplatform.ADPlayer",
+                "Ad player",
+                false
+            ),
+        );
+        with_packages_and_db(
+            &mut fixture,
+            "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n",
+            &rows,
+        );
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+
+        client.send(uninstall_request("uninst-1", "com.samsung.tv.example"));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "manifest_forbidden");
+
+        client.send(uninstall_request("uninst-2", "adplatform"));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "protected_package");
+
+        client.send(uninstall_request("uninst-3", "org.example.missing"));
+        let response = client.read();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "unknown_package");
+
+        client.send(uninstall_request("uninst-4", "bad/id"));
+        let response = client.read();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "invalid_pkgid");
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pkg_list_returns_third_party_packages() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.app", 5001);
+        client.send(json!({"version": 2, "id": "list-1", "method": "pkg.list"}));
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["packages"].as_array().unwrap().len(), 1);
+        assert_eq!(response["packages"][0]["pkgid"], "org.example.app");
+        assert_eq!(response["packages"][0]["name"], "Example");
+        assert_eq!(response["packages"][0]["pkg_version"], "1.0.0");
+        assert_eq!(response["packages"][0]["pkg_type"], "wgt");
+        assert_eq!(response["packages"][0]["main_app_id"], "org.example.app.Ui");
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn root_role_installs_without_a_prompt_and_notifies_the_ui() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        let source = with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "System::Privileged", 0);
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+
+        // No prompt: the next UI message is the package toast.
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["pkgid"], "org.example.app");
+        let notice = ui.read();
+        assert_eq!(notice["type"], "ui.notice");
+        assert_eq!(notice["notices"][0]["kind"], "install");
+        assert_eq!(notice["notices"][0]["package"], "root");
+        assert_eq!(
+            notice["notices"][0]["command"],
+            "install org.example.app-1.0.0"
+        );
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn root_role_uninstalls_without_a_prompt_and_notifies_the_ui() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let (mut ui, ui_handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        ui.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
+        assert_eq!(ui.read()["status"], "ok");
+
+        let (mut client, handle) = connect(&fixture, "System::Privileged", 0);
+        client.send(uninstall_request("uninst-1", "org.example.app"));
+
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["pkgid"], "org.example.app");
+        let notice = ui.read();
+        assert_eq!(notice["type"], "ui.notice");
+        assert_eq!(notice["notices"][0]["kind"], "uninstall");
+        assert_eq!(notice["notices"][0]["package"], "root");
+        assert_eq!(notice["notices"][0]["command"], "remove org.example.app");
+
+        drop(client);
+        handle.join().unwrap().unwrap();
+        drop(ui);
+        ui_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn root_role_cannot_execute_commands() {
+        let fixture = fixture();
+        let (mut client, handle) = connect(&fixture, "System::Privileged", 0);
+        client.send(exec_request("exec-1", "id"));
+        let response = client.read();
+        assert_eq!(response["status"], "denied");
+        assert_eq!(response["error"], "root_role");
         drop(client);
         handle.join().unwrap().unwrap();
     }

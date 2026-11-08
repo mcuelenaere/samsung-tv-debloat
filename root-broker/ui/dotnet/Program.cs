@@ -505,7 +505,8 @@ namespace TvAuthUi
                 Log("notice package=" + notice.Package + " count=" + notice.Count);
                 if (mainShown)
                     continue;
-                var entry = toastEntries.FirstOrDefault(e => e.Label == notice.Label);
+                var entry = toastEntries.FirstOrDefault(
+                    e => e.Label == notice.Label && e.Kind == notice.Kind);
                 if (entry == null)
                 {
                     toastEntries.Add(notice);
@@ -577,13 +578,31 @@ namespace TvAuthUi
 
         private static string ToastMarkup()
         {
-            var builder = new StringBuilder(
-                "<font_size=18><b><color=#e5484d>ROOT COMMAND</color></b></font_size>");
+            var packageChange = toastEntries.Any(e => e.Kind != "exec");
+            var builder = new StringBuilder(packageChange
+                ? "<font_size=18><b><color=#e5484d>PACKAGE CHANGE</color></b></font_size>"
+                : "<font_size=18><b><color=#e5484d>ROOT COMMAND</color></b></font_size>");
             foreach (var entry in toastEntries.Take(ToastMaxApps))
             {
-                var what = entry.Count == 1
-                    ? " ran a command as root"
-                    : " ran " + entry.Count + " commands as root";
+                string what;
+                if (entry.Kind == "install")
+                {
+                    what = entry.Count == 1
+                        ? " installed a package"
+                        : " installed " + entry.Count + " packages";
+                }
+                else if (entry.Kind == "uninstall")
+                {
+                    what = entry.Count == 1
+                        ? " removed a package"
+                        : " removed " + entry.Count + " packages";
+                }
+                else
+                {
+                    what = entry.Count == 1
+                        ? " ran a command as root"
+                        : " ran " + entry.Count + " commands as root";
+                }
                 builder.Append("<br/><font_size=26><b>")
                     .Append(Escape(Shorten(entry.Package, 36)))
                     .Append("</b>").Append(what).Append("</font_size><br/>")
@@ -847,12 +866,14 @@ namespace TvAuthUi
                 return;
             var removing = prompt.Kind == "uninstall";
             var info = prompt.Install;
+            var target = prompt.Uninstall;
             ClearContent();
-            if (info == null && !removing)
+            if ((!removing && info == null) || (removing && target == null))
             {
                 // Fail closed: never offer an approval button for a package
                 // request the daemon could not describe.
-                SetHeader("INSTALL PACKAGE", "Malformed package request", ColorDanger);
+                SetHeader(removing ? "REMOVE PACKAGE" : "INSTALL PACKAGE",
+                    "Malformed package request", ColorDanger);
                 SetStatus("tv-authd did not describe the package. This request cannot be "
                     + "approved.");
                 var rejectRow = CreateRow(contentBox);
@@ -888,9 +909,20 @@ namespace TvAuthUi
                 "<font_size=34><b>" + Escape(prompt.Package) + "</b></font_size>"));
             AddToBox(appBox, CreateLabel(appBox, Small(prompt.Label, "#8a8f99")));
 
-            var name = info != null && !string.IsNullOrEmpty(info.Name) ? info.Name : prompt.Package;
+            var name = removing
+                ? (!string.IsNullOrEmpty(target.Name) ? target.Name : target.PkgId)
+                : (info != null && !string.IsNullOrEmpty(info.Name) ? info.Name : prompt.Package);
             var details = new List<string>();
-            if (info != null)
+            if (removing)
+            {
+                if (!string.IsNullOrEmpty(target.PkgId))
+                    details.Add(target.PkgId);
+                if (!string.IsNullOrEmpty(target.PkgVersion))
+                    details.Add("version " + target.PkgVersion);
+                if (!string.IsNullOrEmpty(target.PkgType))
+                    details.Add(target.PkgType.ToUpperInvariant());
+            }
+            else if (info != null)
             {
                 if (!string.IsNullOrEmpty(info.PkgId))
                     details.Add(info.PkgId);

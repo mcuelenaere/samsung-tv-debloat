@@ -1,8 +1,8 @@
 use crate::grants::{GrantError, GrantStore};
 use crate::logger::Logger;
 use crate::protocol::{
-    write_json, write_response, Decision, InstallMeta, NoticeEntry, NoticeMessage, PromptInput,
-    PromptKind, PromptMessage, Response,
+    write_json, write_response, Decision, InstallMeta, NoticeEntry, NoticeKind, NoticeMessage,
+    PromptInput, PromptKind, PromptMessage, Response, UninstallMeta,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -71,12 +71,14 @@ pub struct ApprovalRequest {
     pub kind: PromptKind,
     /// Package metadata for `kind = "install"`.
     pub install: Option<InstallMeta>,
+    /// Package metadata for `kind = "uninstall"`.
+    pub uninstall: Option<UninstallMeta>,
     pub command: String,
     pub reply: Sender<ApprovalResult>,
 }
 
 enum ApprovalCommand {
-    Request(ApprovalRequest),
+    Request(Box<ApprovalRequest>),
     AttachUi {
         token: u64,
         hello_id: String,
@@ -92,6 +94,13 @@ enum ApprovalCommand {
         label: String,
         command: String,
         first_use_only: bool,
+    },
+    /// A prompt-free root package operation; the user still sees a toast.
+    PackageNotice {
+        label: String,
+        package: String,
+        command: String,
+        kind: NoticeKind,
     },
     /// The requester went away: drop its queued or active prompt.
     Cancel {
@@ -118,7 +127,7 @@ impl ApprovalHandle {
     pub fn request(&self, mut request: ApprovalRequest) -> io::Result<u64> {
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         request.ticket = ticket;
-        self.send(ApprovalCommand::Request(request))?;
+        self.send(ApprovalCommand::Request(Box::new(request)))?;
         Ok(ticket)
     }
 
@@ -151,6 +160,22 @@ impl ApprovalHandle {
             label,
             command,
             first_use_only,
+        })
+    }
+
+    /// Queue a toast for a prompt-free uid-0 package operation.
+    pub fn package_notice(
+        &self,
+        label: String,
+        package: String,
+        command: String,
+        kind: NoticeKind,
+    ) -> io::Result<()> {
+        self.send(ApprovalCommand::PackageNotice {
+            label,
+            package,
+            command,
+            kind,
         })
     }
 
@@ -310,7 +335,7 @@ impl Manager {
 
     fn handle(&mut self, command: ApprovalCommand) {
         match command {
-            ApprovalCommand::Request(request) => self.handle_request(request),
+            ApprovalCommand::Request(request) => self.handle_request(*request),
             ApprovalCommand::AttachUi {
                 token,
                 hello_id,
@@ -323,6 +348,12 @@ impl Manager {
                 command,
                 first_use_only,
             } => self.handle_notice(&label, &command, first_use_only),
+            ApprovalCommand::PackageNotice {
+                label,
+                package,
+                command,
+                kind,
+            } => self.handle_package_notice(&label, &package, &command, kind),
             ApprovalCommand::DetachUi { token } => self.handle_detach(token),
             ApprovalCommand::Cancel { ticket } => self.handle_cancel(ticket),
             ApprovalCommand::Decision {
@@ -427,6 +458,29 @@ impl Manager {
             entry.set_command(command);
         } else if self.notices.len() < MAX_NOTICE_PACKAGES {
             self.notices.push(NoticeEntry::new(label, command));
+        }
+        self.flush_notices();
+    }
+
+    /// Package notices are always immediate and are not subject to the
+    /// per-grant `first` mode: a root install must be visible.
+    fn handle_package_notice(
+        &mut self,
+        label: &str,
+        package: &str,
+        command: &str,
+        kind: NoticeKind,
+    ) {
+        if let Some(entry) = self
+            .notices
+            .iter_mut()
+            .find(|entry| entry.label == label && entry.kind == kind)
+        {
+            entry.count = entry.count.saturating_add(1);
+            entry.set_command(command);
+        } else if self.notices.len() < MAX_NOTICE_PACKAGES {
+            self.notices
+                .push(NoticeEntry::package(label, package, command, kind));
         }
         self.flush_notices();
     }
@@ -697,6 +751,7 @@ impl Manager {
                 label: &pending.request.label,
                 kind: pending.request.kind,
                 install: pending.request.install.clone(),
+                uninstall: pending.request.uninstall.clone(),
                 command: &pending.request.command,
                 timeout_ms,
             },
@@ -961,6 +1016,7 @@ mod tests {
                 label: label.into(),
                 kind: PromptKind::Exec,
                 install: None,
+                uninstall: None,
                 command: "id".into(),
                 reply: tx,
             },
@@ -986,6 +1042,7 @@ mod tests {
                     signature: crate::protocol::SignatureStatus::UnsignedWillResign,
                     is_upgrade: false,
                 }),
+                uninstall: None,
                 command: "install wgt /tmp/org.example.app.wgt".into(),
                 reply: tx,
             },

@@ -5,6 +5,7 @@ pub mod identity;
 pub mod logger;
 pub mod package_identity;
 pub mod pkginstall;
+pub mod pkglist;
 pub mod pkgmeta;
 pub mod pkgstage;
 pub mod protocol;

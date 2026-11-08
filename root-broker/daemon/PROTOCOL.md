@@ -32,13 +32,19 @@ The daemon reads `SO_PEERCRED` and `SO_PEERSEC` before accepting any frame. The
 role is fixed for the whole connection:
 
 - **ordinary package**: exact `User::Pkg::<pkgid>` label, any accepted UID; may
-  send `exec` and `pkg.install`;
+  send `exec`, `pkg.install`, `pkg.uninstall`, and `pkg.list`;
+- **root**: UID 0 with the exact `System::Privileged` label (local
+  administrator: root shell, init, system services); may send
+  `pkg.install`, `pkg.uninstall`, and `pkg.list` **without a prompt**, and may
+  not send `exec` or any `ui.*` method. Every prompt-free package operation
+  queues a `ui.notice`;
 - **approval UI**: exact `User::Pkg::org.tvauth.ui` label and UID 5001 by
   default; may send `ui.hello`, `ui.decision`, `grants.list`,
   `grants.notify`, and `grants.revoke`, and may not send `exec` or `pkg.*`.
 
 The UI package and UID are daemon settings (`--ui-package`, `--ui-uid`). Missing,
-unexpected, or non-package labels fail closed.
+unexpected, or non-package labels fail closed; UID 0 with any other label is
+also refused.
 
 ## `exec`
 
@@ -193,7 +199,94 @@ is useful.
 If the requesting app closes its socket while the prompt is pending, the prompt
 is cancelled and no package is installed.
 
-`pkg.install` is refused for the UI role (`denied`, `ui_role`).
+`pkg.install` is refused for the UI role (`denied`, `ui_role`). For the root
+role it runs the same validation, staging, policy, and trust pipeline with no
+prompt, and queues a `kind: "install"` notice.
+
+## `pkg.uninstall`
+
+Ask tv-authd to remove an installed package. Requires protocol version 2.
+
+```json
+{
+  "version": 2,
+  "id": "uninst-1",
+  "method": "pkg.uninstall",
+  "pkgid": "org.example.app",
+  "timeout_ms": 120000
+}
+```
+
+The daemon validates the id, rejects platform-reserved prefixes, and reads the
+installed package's type, version, name, and origin from the package manager
+database (`sqlite3 -readonly /opt/dbspace/.pkgmgr_parser.db`, `package_info`
+joined with the "No Locale" `package_localized_info` row). Only packages that
+are not `system`, not `preload`, `removable`, and of type `wgt`/`tpk` can be
+removed. Ordinary packages are always prompted with `kind: "uninstall"`; the
+root role removes without a prompt and queues a `kind: "uninstall"` notice.
+Installs and removals share one global lock.
+
+Success:
+
+```json
+{
+  "version": 2,
+  "id": "uninst-1",
+  "status": "ok",
+  "pkgid": "org.example.app",
+  "log_tail_b64": "..."
+}
+```
+
+`log_tail_b64` is the last 8 KiB of `pkgcmd -u -t <type> -n <pkgid>` output.
+
+| Error | Status | Meaning |
+|---|---|---|
+| `invalid_pkgid` | `error` | empty, oversized, or not a valid package id |
+| `invalid_timeout` | `error` | timeout is zero or above the maximum |
+| `manifest_forbidden` | `denied` | package id uses a platform-reserved prefix |
+| `unknown_package` | `error` | not installed (or not described by the database) |
+| `unsupported_package_type` | `denied` | not a `wgt` or `tpk` package |
+| `protected_package` | `denied` | system, preload, or non-removable package |
+| `package_list_failed` | `error` | the package database query failed |
+| `user_denied`, `prompt_timeout`, `ui_unavailable`, `approval_wait_timeout` | as for `exec` | the prompt could not be completed |
+| `uninstall_failed` | `error` | `pkgcmd` failed or timed out; `detail` and `log_tail_b64` are included |
+| `install_busy` | `busy` | an install or removal is in progress |
+| `package_support_disabled` | `error` | the daemon was started with `--no-package-support` |
+
+`pkg.uninstall` is refused for the UI role (`denied`, `ui_role`).
+
+## `pkg.list`
+
+Read-only listing of installed third-party packages. Requires protocol version 2
+and has no prompt; any accepted role except the UI may call it.
+
+```json
+{"version": 2, "id": "list-1", "method": "pkg.list"}
+```
+
+```json
+{
+  "version": 2,
+  "id": "list-1",
+  "status": "ok",
+  "packages": [
+    {
+      "pkgid": "org.example.app",
+      "name": "Example",
+      "pkg_version": "1.0.0",
+      "pkg_type": "wgt",
+      "main_app_id": "org.example.app.Ui"
+    }
+  ]
+}
+```
+
+The same database filter as `pkg.uninstall` applies, so an app store can tell
+which packages are installed and upgradable. At most 256 entries are returned,
+sorted by package id; `main_app_id` is omitted when the database has none.
+Failures return `package_list_failed`; a daemon without package support returns
+`package_support_disabled`.
 
 ## `ui.hello`
 
@@ -258,7 +351,20 @@ bidirectional formatting characters are replaced with U+FFFD, and long commands
 are truncated with `command_truncated: true`.
 
 `kind` is `exec`, `install`, or `uninstall`; a v1 prompt without the field means
-`exec`. Only `kind: "install"` carries the `install` object. Within it:
+`exec`. Only `kind: "install"` carries the `install` object; only
+`kind: "uninstall"` carries `uninstall`:
+
+```json
+"uninstall": {
+  "pkgid": "org.example.app",
+  "name": "Example",
+  "pkg_version": "1.0.0",
+  "pkg_type": "wgt"
+}
+```
+
+Both objects' strings are sanitized and length-limited like the command. Within
+`install`:
 
 - `signature` is `unsigned_will_resign`, `foreign_will_resign`, `user_ca`, or
   `samsung` —
@@ -287,11 +393,18 @@ commands. After `ui.hello`, the daemon may send:
       "package": "org.example.app",
       "count": 3,
       "command": "id",
-      "command_truncated": false
+      "command_truncated": false,
+      "kind": "exec"
     }
   ]
 }
 ```
+
+`kind` is `exec`, `install`, or `uninstall`. `exec` entries are granted package
+executions; `install`/`uninstall` entries come from prompt-free root package
+operations and carry `package: "root"` with `command` reading
+`install <pkgid>-<version>` or `remove <pkgid>`. Entries coalesce per label and
+kind.
 
 Each entry coalesces one package's executions since the previous notice;
 `count` is a delta, so the UI adds it to what it is showing. `command` is a
@@ -430,17 +543,27 @@ Response:
 - Source paths: `/opt/usr/home/owner/**`, `/opt/media/**`, `/tmp/**`; regular
   file, no symlink at the final component, ≤ 128 MiB by default
   (`--max-package-bytes`, maximum 256 MiB).
-- Zip: ≤ 4096 entries, ≤ 1 GiB uncompressed, no absolute names and no `..`.
+- Zip: ≤ 4096 entries, ≤ 512 MiB uncompressed, no absolute names and no `..`.
 - Package ids starting with `com.samsung.`, `org.tizen.`, or `samsung.` are
   refused, as are platform-only privileges (the installer's
   own privilege check remains authoritative).
 - Trust material lives in `/opt/tv-auth/trust/` (`user-root-ca.pem`,
   `fingerprint_list.xml`, `tizen-ca/`). Enrollment bind-mounts the fingerprint
-  list and CA overlay over the stock paths inside the daemon's mount namespace;
-  `pkgcmd` inherits that namespace. Enrollment is re-verified before every
-  approved install.
+  list and CA overlay over the stock paths in **PID 1's mount namespace** (`nsenter
+  -t 1 -m`), because `pkgcmd` only talks to `pkgmgr-server`
+  (`package-manager.service`, `PrivateMounts=no`), which validates signatures
+  there. Enrollment is re-verified before every approved install.
+- Uninstall/list read the same package manager database (`package_info` in
+  `/opt/dbspace/.pkgmgr_parser.db`, opened read-only through `sqlite3`). Only
+  non-system, non-preload, removable `wgt`/`tpk` packages can be removed;
+  reserved package-id prefixes are refused first.
+- One global package-operation lock covers installs and removals, including
+  their prompts.
+- The root role (UID 0, `System::Privileged`) uses the same staging, policy,
+  and audit pipeline without a prompt, and queues a `ui.notice` on success.
+  It never gets `exec`.
 - Every attempt is logged with the requesting label, UID/PID, package id,
-  version, SHA-256 of the staged copy, decision, and result.
+  version, SHA-256 of the staged copy (installs), decision, and result.
 
 ## Prompt and execution limits
 

@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker, GrantStore, Logger,
-    PackageConfig, ServerConfig,
+    identity, pkglist, pkgstage, trust, ApprovalConfig, ApprovalManager, Broker, GrantStore,
+    Logger, PackageConfig, ServerConfig,
 };
 
 struct Args {
@@ -85,9 +85,10 @@ fn run(args: Args) -> io::Result<()> {
     if let Some(packages) = &args.packages {
         pkgstage::prepare_staging_root(&packages.staging.root)?;
         logger.log(&format!(
-            "staging_ready root={} pkgcmd={}",
+            "staging_ready root={} pkgcmd={} pkgdb={}",
             packages.staging.root.display(),
-            packages.pkgcmd.display()
+            packages.pkgcmd.display(),
+            packages.db.database.display()
         ))?;
         if let Some(paths) = &packages.trust {
             match trust::ensure_enrolled(paths) {
@@ -145,7 +146,12 @@ fn run(args: Args) -> io::Result<()> {
                 continue;
             }
         };
-        if !identity::is_valid_package_label(&identity.label) {
+        // Installed packages connect with their SMACK package label; the local
+        // administrator (root shell, `System::Privileged`) gets the package
+        // management escape hatch. Everything else fails closed.
+        if !identity::is_valid_package_label(&identity.label)
+            && !identity::is_root_identity(&identity)
+        {
             let _ = logger.log(&format!(
                 "connection_rejected label={:?} uid={} pid={}",
                 identity.label, identity.uid, identity.pid
@@ -219,6 +225,8 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut staging_dir = PathBuf::from("/opt/tv-auth/staging");
     let mut max_package_bytes = pkgstage::DEFAULT_MAX_PACKAGE_BYTES;
     let mut pkgcmd = PathBuf::from("/usr/bin/pkgcmd");
+    let mut sqlite3 = PathBuf::from("/usr/bin/sqlite3");
+    let mut pkgdb = PathBuf::from("/opt/dbspace/.pkgmgr_parser.db");
     let mut trust_root = Some(PathBuf::from(trust::DEFAULT_TRUST_ROOT));
     let mut package_support = true;
     let mut enroll_trust = false;
@@ -253,6 +261,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                 max_package_bytes = value(&mut parser, "max-package-bytes")?
             }
             Long("pkgcmd") => pkgcmd = path(&mut parser)?,
+            Long("sqlite3") => sqlite3 = path(&mut parser)?,
+            Long("pkgdb") => pkgdb = path(&mut parser)?,
             Long("trust-root") => trust_root = Some(path(&mut parser)?),
             Long("no-trust") => trust_root = None,
             Long("no-package-support") => package_support = false,
@@ -280,6 +290,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --staging-dir PATH           package staging root (default /opt/tv-auth/staging)\n\
                      --max-package-bytes BYTES    staged package cap (default 134217728)\n\
                      --pkgcmd PATH                stock installer (default /usr/bin/pkgcmd)\n\
+                     --sqlite3 PATH               sqlite3 CLI (default /usr/bin/sqlite3)\n\
+                     --pkgdb PATH                 pkgmgr database (default /opt/dbspace/.pkgmgr_parser.db)\n\
                      --trust-root PATH            trust material (default /opt/tv-auth/trust)\n\
                      --no-trust                   skip trust enrollment (development only)\n\
                      --no-package-support         serve exec only\n\
@@ -338,6 +350,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             ..pkgstage::StageConfig::default()
         },
         pkgcmd,
+        db: pkglist::PackageDb {
+            sqlite3,
+            database: pkgdb,
+        },
         trust: trust_root.map(trust::TrustPaths::new),
         installed_roots: tv_authd::DEFAULT_INSTALLED_ROOTS
             .iter()

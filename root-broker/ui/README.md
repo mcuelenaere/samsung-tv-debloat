@@ -3,9 +3,11 @@
 This is the managed Tizen .NET UI for `tv-authd`. It has four jobs:
 
 1. show the daemon-generated approval prompt when an application requests root;
-2. show a package-aware prompt for `pkg.install` (`kind: "install"`);
+2. show a package-aware prompt for `pkg.install` (`kind: "install"`) and
+   `pkg.uninstall` (`kind: "uninstall"`);
 3. list and revoke persistent **Always allow** grants;
-4. show a small toast when an **Always allow** app runs a root command.
+4. show a small toast when an **Always allow** app runs a root command, and when
+   a uid-0 client installs or removes a package without a prompt.
 
 The UI is a normal UID-5001 package with the exact SMACK label
 `User::Pkg::org.tvauth.ui`. It never runs as root and has no network privilege.
@@ -72,6 +74,16 @@ The app-facing decision value is still `once`. The prompt covers exactly the
 staged package the daemon inspected; changing the source file after the request
 does not change what is installed.
 
+For `pkg.uninstall` the daemon sends `kind: "uninstall"` with an `uninstall`
+object (`pkgid`, `name`, `pkg_version`, `pkg_type`) and a `command` of
+`remove <pkgid>`. The same layout shows **REMOVE PACKAGE**, the requester, the
+package facts, **Deny** and **Remove**. A package request without the matching
+object renders "Malformed package request" with only **Deny** (fail closed).
+
+Removing a package through the daemon does not yet clean up its Samsung Home
+`widgetinfo` row; the daemon's installer backend is `pkgcmd`, which never
+contacts `webappservice`. That cleanup and WGT support are M4.
+
 ### Execution toast
 
 When a granted app executes, the daemon sends a `ui.notice` within 250 ms (see
@@ -85,6 +97,12 @@ place and keep it up until 6 s after the last command. Afterwards the UI stays
 connected but invisible for 5 min so the next toast appears instantly instead of
 waiting about 1 s for an app launch, then exits. Opening the app icon while it
 lingers shows the manager.
+
+Prompt-free root package operations also arrive as `ui.notice`, with
+`kind: "install"`/`"uninstall"` and `package: "root"`. The toast then reads
+**PACKAGE CHANGE** / "**root** installed a package" / "**root** removed a
+package" with `$ install <pkgid>-<version>` or `$ remove <pkgid>`, instead of the
+root-command wording.
 
 ### Grant manager
 
@@ -143,10 +161,12 @@ out/tv-auth-ui/pkgroot/bin/TvAuthUi.dll
 Observed local artifacts (after rebasing package-prompt work onto M4):
 
 ```text
-Managed assembly: 56,320 bytes
-Unsigned TPK:     28,630 bytes
-Signed TPK:       36,214 bytes (Partner profile `tvauth-partner`, SHA-256
-                  `5d37e9e4b2a1fbe769093053a5d5d31480321d8635b34658dda332bf4bb005ca`)
+Managed assembly: 57,856 bytes
+Unsigned TPK:     29,055 bytes
+Signed TPK:       36,640 bytes (Partner profile `tvauth-partner`, SHA-256
+                  `e6edecfc6f9507f83c1224488ac14adc09a8a7fc9f5c01134d3b0720c69c21e8`;
+                  installed TvAuthUi.dll SHA-256
+                  `38c036d59a2c9e30808c035a804c9cc85af97af7370d4d862d4568124e5210de`)
 ```
 
 ## Signing and installation
@@ -217,6 +237,17 @@ After the 2026-11-08 cold boot (boot ID
 `Toast: first use`.
 
 Pause/resume and repeat-key hardening remain hardening items.
+
+Package prompts and package toasts were validated on 2026-11-08 with the M2
+daemon:
+
+- the app-role uninstall prompt (from `org.tvauth.pkgprobe`) rendered
+  **REMOVE PACKAGE**, requester, "Package install test · org.tvauth.pkgtest ·
+  version 0.1.0 · TPK", **Deny**/ **Remove** and the countdown;
+- Deny returned `user_denied` with the package intact; Remove returned
+  `status: ok` and the package was gone;
+- root `pkg.install` and `pkg.uninstall` showed **PACKAGE CHANGE** toasts,
+  "root installed a package" / "root removed a package", with the command line.
 
 The execution toast was validated on the TV on 2026-11-08 with Vetro holding an
 Always-allow grant: Vetro bursts of ~20 execs/s were coalesced into single

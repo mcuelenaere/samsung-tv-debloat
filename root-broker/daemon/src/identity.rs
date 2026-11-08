@@ -9,6 +9,15 @@ pub struct PeerIdentity {
     pub label: String,
 }
 
+/// SMACK label of privileged system processes (root shells, init, services).
+pub const ROOT_LABEL: &str = "System::Privileged";
+
+/// The local administrator escape hatch: uid 0 with the system label. Such
+/// clients may use `pkg.*` without a prompt (never `exec`).
+pub fn is_root_identity(identity: &PeerIdentity) -> bool {
+    identity.uid == 0 && identity.label == ROOT_LABEL
+}
+
 pub fn package_from_label(label: &str) -> Option<&str> {
     label
         .strip_prefix("User::Pkg::")
@@ -85,7 +94,26 @@ pub fn from_fd(_socket: impl AsFd) -> io::Result<PeerIdentity> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_package_id, is_valid_package_label, package_from_label};
+    use super::{
+        is_root_identity, is_valid_package_id, is_valid_package_label, package_from_label,
+    };
+
+    fn identity(uid: u32, label: &str) -> super::PeerIdentity {
+        super::PeerIdentity {
+            pid: 1,
+            uid,
+            gid: 0,
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn only_uid_zero_with_the_system_label_is_root() {
+        assert!(is_root_identity(&identity(0, "System::Privileged")));
+        assert!(!is_root_identity(&identity(0, "User::Pkg::org.example")));
+        assert!(!is_root_identity(&identity(5001, "System::Privileged")));
+        assert!(!is_root_identity(&identity(0, "System")));
+    }
 
     #[test]
     fn accepts_package_labels() {

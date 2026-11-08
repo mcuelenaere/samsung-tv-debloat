@@ -47,7 +47,31 @@ pub fn install(
         OsStr::new("-p"),
         package.as_os_str(),
     ];
-    let outcome = executor::execute_argv(pkgcmd, &args, timeout_ms).map_err(InstallError::Spawn)?;
+    run(pkgcmd, &args, timeout_ms)
+}
+
+/// Uninstall `pkgid` with `pkgcmd -u -t <type> -n <pkgid>`.
+///
+/// `-p` is the *package path* for uninstall, which fails with `realpath fail`
+/// when given an id; `-n` takes the package name.
+pub fn uninstall(
+    pkgcmd: &Path,
+    pkg_type: PackageType,
+    pkgid: &str,
+    timeout_ms: u64,
+) -> Result<InstallOutcome, InstallError> {
+    let args: [&OsStr; 5] = [
+        OsStr::new("-u"),
+        OsStr::new("-t"),
+        OsStr::new(pkg_type.as_str()),
+        OsStr::new("-n"),
+        OsStr::new(pkgid),
+    ];
+    run(pkgcmd, &args, timeout_ms)
+}
+
+fn run(pkgcmd: &Path, args: &[&OsStr], timeout_ms: u64) -> Result<InstallOutcome, InstallError> {
+    let outcome = executor::execute_argv(pkgcmd, args, timeout_ms).map_err(InstallError::Spawn)?;
 
     let mut log = outcome.stdout;
     log.extend_from_slice(&outcome.stderr);

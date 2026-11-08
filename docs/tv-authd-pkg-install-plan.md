@@ -4,11 +4,13 @@ Status: proposal, self-contained milestone numbering (M1–M3 below). Builds on
 the completed tv-authd broker and the signature-validation analysis of
 T-PTMDEUC (Tizen 6.5, armv7).
 
-M1 is implemented and TV-validated for the TPK path (protocol v2, staging,
-manifest inspection, PID-1 trust enrollment, `pkg.install`, package prompt,
-deny/timeout/policy paths, cold-boot persistence). WGT installs and Samsung
-Home registration remain M4 (§6.1/§13), and M3 on-device signing is not
-started. The work is rebased onto `main` (M4 + `review-fixes`).
+M1 and M2 are implemented and TV-validated for the TPK path: M1 covers
+protocol v2, staging, manifest inspection, PID-1 trust enrollment,
+`pkg.install`, the package prompt, deny/timeout/policy paths, and cold-boot
+persistence; M2 adds `pkg.uninstall`, `pkg.list`, and the prompt-free uid-0
+root role with package toasts. WGT installs and Samsung Home registration
+remain M4 (§6.1/§13), and M3 on-device signing is not started. The work is
+rebased onto `main` (M4 + `review-fixes`).
 
 ## 1. Goal
 
@@ -151,11 +153,28 @@ install per app label (mirrors exec).
 
 ### 5.2 `pkg.uninstall` / `pkg.list` (M2)
 
-`pkg.uninstall{pkgid}` prompts with `kind:"uninstall"` — every time, like
-installs (§5.4). `pkg.list` is unauthenticated-read and returns installed
-user/third-party packages under `/opt/usr/apps` (`pkgid`, `pkg_version`,
-`pkg_type`, `name`) so an app store/manager (such as Vetro) can determine
-which packages are already installed or upgradable.
+```json
+{"version":2,"id":"uninst-1","method":"pkg.uninstall","pkgid":"org.example.app","timeout_ms":120000}
+```
+
+`pkg.uninstall{pkgid}` validates the id, rejects reserved prefixes, and reads
+the installed package's type, version, name, and origin from the package
+manager database before prompting with `kind:"uninstall"` — every time, like
+installs (§5.4). The prompt carries an `uninstall` object
+(`pkgid`, `name`, `pkg_version`, `pkg_type`) so the UI can show exactly what
+will be removed. Only non-system, non-preload, removable `wgt`/`tpk` packages
+can be removed (`unknown_package`, `protected_package`,
+`unsupported_package_type`). Installs and removals share one global lock.
+
+`pkg.list` is unauthenticated-read (any role except the UI) and returns
+installed user/third-party packages (`pkgid`, `name`, `pkg_version`,
+`pkg_type`, `main_app_id`) so an app store/manager (such as Vetro) can
+determine which packages are already installed or upgradable. Both methods use
+one read-only SQLite query against `/opt/dbspace/.pkgmgr_parser.db`
+(`package_info` joined with the `No Locale` `package_localized_info` row):
+`pkginfo --listpkg` enumerates every app over D-Bus and takes ~16 s on this
+firmware, while the query takes ~10 ms. `pkgcmd -u` needs the package id via
+`-n`; `-p` is a package path and fails with `realpath fail`.
 
 ### 5.3 Prompt message: new `kind`
 
@@ -184,7 +203,13 @@ UI ship together:
 ```
 
 `signature` ∈ `unsigned_will_resign | foreign_will_resign | user_ca | samsung`.
-`kind` ∈ `exec | install | uninstall` (absent ⇒ `exec`).
+`kind` ∈ `exec | install | uninstall` (absent ⇒ `exec`). `kind: "uninstall"`
+carries the same-shape object under `uninstall`:
+
+```json
+"uninstall": {"pkgid": "org.example.app", "name": "Example",
+              "pkg_version": "1.0.0", "pkg_type": "wgt"}
+```
 
 All metadata strings pass through the existing control/bidi sanitizer.
 
@@ -212,12 +237,13 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>.<wgt\|tpk>` (ensure both `/opt/tv-auth` and `/opt/tv-auth/staging` have `0711` traversal perms, `0644` staged file, and preserved `.wgt`/`.tpk` extension so `webappservice` running as `owner` UID 5001 can copy it and infer package type without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
 | `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, main `appid` (`tizen_id`), version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
 | `pkgsign.rs` (new, M3) | in-daemon on-device re-signing after user approval (§7.3) |
-| `pkginstall.rs` (new) | `trust::ensure_enrolled()`, invoke `webappservice` install/uninstall via `libwas_manager_api.so` (`was_install_webapp_with_translated_error_code` / `was_uninstall_webapp`) or `libsdbd_plugin_release.so` (`was_execution`) with UID 5001 session D-Bus env (see §6.1), timeout, parse result status, map failure codes (`-12/-14` etc.), tail log |
+| `pkginstall.rs` (new) | M1: `trust::ensure_enrolled()`, `pkgcmd -i`/`-u` invocation, timeout, `key[end]` parsing, tail log. M4 replaces the backend with `webappservice` install/uninstall via `libwas_manager_api.so` (`was_install_webapp_with_translated_error_code` / `was_uninstall_webapp`) or `libsdbd_plugin_release.so` (`was_execution`) with UID 5001 session D-Bus env (see §6.1) |
+| `pkglist.rs` (new, M2) | `pkg.list` / uninstall metadata from `/opt/dbspace/.pkgmgr_parser.db` via one `sqlite3 -readonly` query; row parsing, user-vs-system classification, `main_app_id` |
 | `grants.rs` | no change (exec-only by design, §5.4) |
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
-| `server.rs` | route `pkg.install`/`pkg.uninstall`/`pkg.list` for ordinary packages; new **root role**: uid 0 clients (e.g. SSH/dropbear, label `System::Privileged`) may call `pkg.*` prompt-free — exec remains package-only; forbid all `pkg.*` for the UI role; per-label pending tracking |
+| `server.rs` | route `pkg.install`/`pkg.uninstall`/`pkg.list` for ordinary packages; new **root role**: uid 0 clients (label `System::Privileged`) may call `pkg.*` prompt-free — exec remains package-only; forbid all `pkg.*` for the UI role; one global lock for installs and removals |
 | `trust.rs` (new) | §4 (`PID 1` mount-namespace enrollment) |
-| `main.rs` | call `trust::ensure_enrolled()` at startup; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label` |
+| `main.rs` | call `trust::ensure_enrolled()` at startup; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label`; `--sqlite3`/`--pkgdb` |
 
 Staging lifecycle: copied at request time (before the prompt) to
 `/opt/tv-auth/staging/<random>.<wgt|tpk>` (on persistent `/opt` flash rather than
@@ -355,12 +381,17 @@ or denied requests, while verifying the staged file's SHA-256 before signing):
 - **One active install globally** (serialize with the prompt queue);
   120 s hard timeout; staging dir `/opt/tv-auth/staging` is `0711 root` (with
   `0644` staged files) and is wiped at daemon start.
-- **Root role**: uid 0 clients may use `pkg.install`/`pkg.uninstall`/
-  `pkg.list` without a prompt (convenient over SSH). They run with the same
-  staging, policy, and audit pipeline; the pkgid shadowing ban applies to
-  them too. Non-root, non-package labels still fail closed. Every prompt-free
-  root operation queues a `ui.notice` so the user sees what was installed or
+- **Root role**: uid 0 clients with the exact `System::Privileged` label may
+  use `pkg.install`/`pkg.uninstall`/`pkg.list` without a prompt (convenient
+  over SSH) and never get `exec`. They run with the same staging, policy,
+  trust, and audit pipeline; the pkgid shadowing ban applies to them too.
+  Non-root, non-package labels still fail closed. Every prompt-free root
+  operation queues a `ui.notice` so the user sees what was installed or
   removed (§9).
+- **Uninstall policy**: only packages the package manager marks non-system,
+  non-preload, removable, and `wgt`/`tpk` can be removed, and reserved package
+  ids are refused before the database is queried. The database is opened
+  `sqlite3 -readonly`; the daemon never writes it.
 - **Audit**: every install attempt logged to `tv-authd.log` with source
   label, pkgid, version, sha256(staged), decision, result.
 - **Failure modes**: pkgcmd failure or timeout ⇒ `install_failed` with log
@@ -384,11 +415,17 @@ or denied requests, while verifying the staged file's SHA-256 before signing):
     no Always option for package operations (§5.4); existing timeout
     countdown, key grabs, backdrop.
   - Grant manager: unchanged (exec grants only).
+- `kind: "uninstall"`: same layout with **REMOVE PACKAGE**, the `uninstall`
+  object's name/id/version/type, and **Deny**/**Remove**. A package prompt
+  without its metadata object renders "Malformed package request" with only
+  **Deny**.
 - Toasts: prompt-free root (`uid 0`) installs/uninstalls must still surface
   in the UI (§8) — the daemon queues a `ui.notice` whose `command` reads
-  `install <pkgid>-<version>` / `remove <pkgid>`; the existing toast path
-  renders it with no UI change. Prompted operations show the prompt itself,
-  so they produce no notice.
+  `install <pkgid>-<version>` / `remove <pkgid>`. The notice now carries
+  `kind`, so the toast reads **PACKAGE CHANGE** / "root installed a package" /
+  "root removed a package" instead of the root-command wording (a small UI
+  change beyond the original "no UI change" assumption). Prompted operations
+  show the prompt itself, so they produce no notice.
 
 ## 10. Milestones and validation
 
@@ -398,7 +435,7 @@ with explicit authorization, on the user's TV.
 | Milestone | Content | Host validation | TV validation |
 |---|---|---|---|
 | M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
-| M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | uninstall/list protocol round-trips, root-role gating, notice queuing | uninstall prompt flow, root CLI install/uninstall without prompt + toast appears, UI deny path |
+| M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | **done (host):** 120 Linux tests, clippy/fmt clean, ARMv7 cross-build; uninstall/list protocol round-trips, root-role gating, notice kinds | **validated 2026-11-08:** app-role uninstall prompt, Deny and Remove, protected/unknown refusals, `pkg.list` from app and root roles, prompt-free root install/uninstall with `PACKAGE CHANGE` toasts |
 | M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | sign/verify round-trip on host with reference wgt; xmlsec1 template conformance vs §7.2 | unsigned / foreign-signed wgt → user approves → broker re-signs → installs → launches; signature survives reboot |
 | M4 | WAS install/registration helper so WGT works and installs appear in Samsung Home | helper API/ABI check, DB row comparison with an SDB install | WGT installs and appears in "My apps"; TPK installed via broker appears in "My apps"; launch from Home |
 
@@ -442,7 +479,7 @@ Code (all under `root-broker/`):
 - `daemon/PROTOCOL.md`, `daemon/README.md`, `ui/README.md` — wire contract,
   limits, errors, and UI behavior.
 
-Host validation (rebased on the M4 + review-fixes branches): `cargo test` (106 tests on Linux/Docker, 102 on macOS where
+Host validation (rebased on the M4 + review-fixes branches): `cargo test` (120 tests on Linux/Docker, 116 on macOS where
 installer-spawning tests are skipped),
 `cargo clippy --all-targets -D warnings`, ARMv7 musl cross-build (native
 `rust-lld`, `--help` under QEMU), and the managed UI build via
@@ -600,3 +637,74 @@ Home row survived the reboot.
 
 Still pending: WGT installs and Samsung Home registration (M4); approval and
 installation of user-CA-signed packages (needs the M3 signer).
+
+## 15. M2 implementation notes and TV validation (2026-11-08)
+
+Code:
+
+- `daemon/src/protocol.rs` — `UninstallRequest`, `ListPackagesRequest`,
+  `UninstallMeta`, `PackageView`, prompt `uninstall` object, `NoticeKind`,
+  validators (`invalid_pkgid`), response `packages`.
+- `daemon/src/pkglist.rs` (new) — one `sqlite3 -readonly -noheader -separator`
+  query per listing or lookup against `/opt/dbspace/.pkgmgr_parser.db`
+  (`package_info` plus the `No Locale` label row); row parsing and
+  user/system classification. Why not `pkginfo`: `--listpkg` took ~16 s on the
+  TV, `--pkg` ~30 ms per call, while the SQL query is ~10 ms.
+- `daemon/src/pkginstall.rs` — shared `run()` for `pkgcmd`; uninstall uses
+  `-u -t <type> -n <pkgid>` (`-p` is a package path and fails with
+  `realpath fail: 2`).
+- `daemon/src/server.rs` — `ClientRole` (UI/root/package), `handle_uninstall`
+  (validation, reserved-prefix check, database lookup, `protected_package`,
+  prompt, `pkgcmd`, audit), `handle_list`, prompt-free root paths,
+  `notify_package_operation`, and the shared install/removal lock.
+- `daemon/src/approval.rs` — `uninstall` metadata on prompts and
+  `ApprovalHandle::package_notice` (`PackageNotice` command, coalesced per
+  label+kind).
+- `daemon/src/identity.rs` — `ROOT_LABEL`/`is_root_identity` (uid 0 **and**
+  `System::Privileged`); `main.rs` admits that identity through the pre-slot
+  check and adds `--sqlite3`/`--pkgdb`.
+- `daemon/test-clients/rootcli/` — dependency-free static ARMv7 client for the
+  root role (`list`, `install <type> <path>`, `uninstall <pkgid>`). It must run
+  from `/run`: the VDFS in `/opt` rejects unsigned ELFs.
+- `ui/dotnet` — parses `uninstall` and notice `kind`; renders the remove prompt
+  from the daemon's metadata and the package-change toast.
+
+Deployed: daemon 787,372 bytes, SHA-256
+`50e246fa4275dbd2bf6cedf05dc4b0a080a354d4bf9ef1d2f092ec8f0c37e915`; UI signed
+with the Partner profile (36,640 bytes, SHA-256
+`e6edecfc6f9507f83c1224488ac14adc09a8a7fc9f5c01134d3b0720c69c21e8`).
+
+Validated on the target:
+
+- `pkg.list` from a uid-0 client returned 126 installed user packages in
+  milliseconds; from the probe package it returned 127 (including itself).
+  Results include `name`, `pkg_version`, `pkg_type`, and `main_app_id`.
+- root `pkg.install` of `/tmp/org.tvauth.pkgtest-0.1.0.tpk` ran without a
+  prompt (`approval=root`), returned `status: ok`, and produced a
+  **PACKAGE CHANGE** toast "root installed a package" /
+  `$ install org.tvauth.pkgtest-0.1.0`.
+- root `pkg.uninstall` returned `status: ok` and produced "root removed a
+  package" / `$ remove org.tvauth.pkgprobe`.
+- app-role `pkg.uninstall` (from `org.tvauth.pkgprobe`) rendered **REMOVE
+  PACKAGE** with requester, "Package install test · org.tvauth.pkgtest ·
+  version 0.1.0 · TPK", **Deny**/**Remove**, and the countdown. Deny returned
+  `denied/user_denied` with the package intact; Remove returned `status: ok`
+  and the package was gone.
+- `manifest_forbidden` for a reserved id, `protected_package` for a
+  non-reserved system package, `unknown_package` for a missing one, and
+  `invalid_pkgid` for a malformed id, all without a prompt.
+- The UI role is refused for all three `pkg.*` methods; root `exec` is refused
+  with `root_role`.
+
+Notes:
+
+- `pkginfo --listpkg` is unusably slow (~16 s) because it enumerates every app
+  over D-Bus, hence the direct database read. `sqlite3` is present on this
+  firmware and already used by M4 for `widgetinfo`.
+- `pkgcmd -u -p <pkgid>` fails; `-n <pkgid>` is correct.
+- Uninstalling a package that was installed through `sdb` leaves its Samsung
+  Home `widgetinfo` row behind (`pkgcmd` never contacts `webappservice`). M4
+  owns registration and that cleanup; the probe's stale row was removed
+  manually after validation.
+- The fingerprint list still has the user CA in `tizen-developer`,
+  `tizen-public`, and `tizen-partner`; no trust changes were needed for M2.
