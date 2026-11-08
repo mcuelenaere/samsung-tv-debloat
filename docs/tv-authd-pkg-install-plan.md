@@ -195,10 +195,10 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | Module | Change |
 |---|---|
 | `protocol.rs` | v2 structs: `InstallRequest`, `UninstallRequest`, `ListPackagesRequest`, prompt `kind` + `InstallMeta`, `invalid_decision` guard for `always` on non-`exec` kinds, validators, size/character limits; accept both v1 (`exec`) and v2 |
-| `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>` (`0711` dir, `0644` staged file so `pkgmgr-server`/backends running as `root` or `owner` can read it without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
-| `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
+| `pkgstage.rs` (new) | path allowlist check, `lstat` (no symlink), streamed copy to `/opt/tv-auth/staging/<random>.<wgt\|tpk>` (ensure both `/opt/tv-auth` and `/opt/tv-auth/staging` have `0711` traversal perms, `0644` staged file, and preserved `.wgt`/`.tpk` extension so `webappservice` running as `owner` UID 5001 can copy it and infer package type without exhausting `/run` tmpfs RAM), byte cap, sha256 of staged copy, cleanup guard |
+| `pkgmeta.rs` (new) | `zip` crate: entry count/uncompressed-size caps; read `tizen-manifest.xml` (tpk) or `config.xml` (wgt); extract pkgid, main `appid` (`tizen_id`), version, app name, `<privilege>` list, api-version; classify `author-signature.xml`/`signatureN.xml` (`user_ca`, `samsung`, `unsigned_will_resign`, `foreign_will_resign`) |
 | `pkgsign.rs` (new, M3) | in-daemon on-device re-signing after user approval (§7.3) |
-| `pkginstall.rs` (new) | `trust::ensure_enrolled()`, invoke installer (`/usr/bin/wascmd` or `/usr/bin/pkgcmd` + Samsung Home app-list registration — see note below) with timeout, parse result status, map failure codes (`-12/-14` etc.), tail log |
+| `pkginstall.rs` (new) | `trust::ensure_enrolled()`, invoke `webappservice` install/uninstall via `libwas_manager_api.so` (`was_install_webapp_with_translated_error_code` / `was_uninstall_webapp`) or `libsdbd_plugin_release.so` (`was_execution`) with UID 5001 session D-Bus env (see §6.1), timeout, parse result status, map failure codes (`-12/-14` etc.), tail log |
 | `grants.rs` | no change (exec-only by design, §5.4) |
 | `approval.rs` | `ApprovalRequest` gains `kind` + `InstallMeta`; prompt serialization; reject `always` for non-`exec` kinds; otherwise unchanged (queue, nonce, hangup-cancel, retry logic all reused) |
 | `server.rs` | route `pkg.install`/`pkg.uninstall`/`pkg.list` for ordinary packages; new **root role**: uid 0 clients (e.g. SSH/dropbear, label `System::Privileged`) may call `pkg.*` prompt-free — exec remains package-only; forbid all `pkg.*` for the UI role; per-label pending tracking |
@@ -206,21 +206,75 @@ New/changed modules (sync Rust, no async — per AGENTS.md):
 | `main.rs` | call `trust::ensure_enrolled()` at startup; allow `uid == 0` + `System::Privileged` through the pre-slot peer identity check alongside `is_valid_package_label` |
 
 Staging lifecycle: copied at request time (before the prompt) to
-`/opt/tv-auth/staging/<random>` (on persistent `/opt` flash rather than RAM-backed
-`/run` tmpfs, since the TV has ~437 MiB `MemAvailable` and ~922 MB free on `/opt`)
-so the file the user approves is the file that gets installed (no TOCTOU on the
-source path). On deny/timeout/failure the staged copy is removed and never
-reused; stale staging files are wiped at daemon startup.
+`/opt/tv-auth/staging/<random>.<wgt|tpk>` (on persistent `/opt` flash rather than
+RAM-backed `/run` tmpfs, since the TV has ~437 MiB `MemAvailable` and ~922 MB
+free on `/opt`) so the file the user approves is the file that gets installed
+(no TOCTOU on the source path). Because `webappservice` runs as `owner` (UID
+5001) and copies the local package file itself (`CAppInstaller::m_CopyLocalAppPkg`),
+`/opt/tv-auth` and `/opt/tv-auth/staging` must be `0711` (`o+x` traversal;
+`grants.json` stays `0600` and `trust/` stays `0700`) and the staged file must be
+`0644` with its `.wgt`/`.tpk` extension preserved. On deny/timeout/failure the
+staged copy is removed and never reused; stale staging files are wiped at daemon
+startup.
 
-Installer & Samsung Home registration: a plain `/usr/bin/pkgcmd -i` installs the
-package but does not register it under Samsung Home's "My apps" list (`sdb
-install` invokes `/usr/bin/wascmd`). Before implementing `pkginstall.rs`, RE
-`/usr/bin/wascmd` (and `/etc/package-manager/backend/*`) to use the exact
-invocation or post-install registration step that makes installed apps appear in
-Samsung Home.
+### 6.1 Installer & Samsung Home registration (verified by RE)
 
-The installer command is invoked via the existing `executor` (setsid, cleared
-env, timeout 120 s, 1 MiB log caps).
+Reverse-engineering of `/usr/bin/wascmd`, `/usr/sbin/sdbd`,
+`/usr/lib/libsdbd_plugin_release.so`, `/usr/lib/libwas_manager_api.so`,
+`/usr/lib/libwas_common.so`, and `/usr/apps/org.tizen.webappservice/bin/webappservice`
+on `T-PTMDEUC` established how Samsung Home ("My apps") registration works:
+
+1. **Why plain `pkgcmd -i` does not show apps in Samsung Home**:
+   - `/usr/bin/pkgcmd` calls `pkgmgr_client_usr_install` in `libpkgmgr-client.so.0`,
+     which installs the package into `/opt/usr/home/owner/apps_rw/<pkgid>/` and
+     updates `pkgmgr-info`, but **never** notifies `org.tizen.webappservice` or
+     inserts a row into `/opt/dbspace/.webappservice.db` (`table widgetinfo`).
+     Samsung Home (`com.samsung.tv.coba.newhome`) reads its "My apps" list from
+     `/opt/dbspace/.webappservice.db` (`app_featured = 1`, `app_type = 2`,
+     `install_type = 'user'`, `is_display = 1`, `install_state = 3`) and icons
+     from `/opt/share/webappservice/apps_icon/all/<appid>/`.
+2. **Why `/usr/bin/wascmd` cannot be exec'd directly on release firmware**:
+   - At the start of `main` (`0x000243f0`), `/usr/bin/wascmd` checks
+     `stat64("/etc/release", &st) == 0`. Because `/etc/release` is present on
+     release firmware, `/usr/bin/wascmd` prints `"wascmd cannot working in
+     released image"` and exits `0` immediately.
+3. **How `sdb install` bypasses `/etc/release` and registers in Samsung Home**:
+   - `/usr/sbin/sdbd` loads `/usr/lib/libsdbd_plugin_release.so`
+     (`src/plugin_wascmd.cpp`). On `vd_appinstall` (`0x2710`), the plugin
+     constructs `argv` for `wascmd -i <pkgid> -p <pkg_path> [-G]` and calls its
+     own exported `was_execution(int argc, char **argv, int out_fd)` **in-process**
+     (without executing `/usr/bin/wascmd`), which invokes
+     `was_install_webapp_with_translated_error_code` (or
+     `was_install_webapp_for_debug_mode` with `-G`) in
+     `/usr/lib/libwas_manager_api.so`.
+   - `libwas_manager_api.so` sends a D-Bus method call on UID 5001's session bus
+     (`DBUS_SESSION_BUS_ADDRESS=kernel:path=/sys/fs/kdbus/5001-user/bus;unix:path=/run/user/5001/dbus/user_bus_socket`)
+     to `org.tizen.tv.webappservice.server` (`webappservice`, running as `owner`
+     UID 5001).
+   - `webappservice` (`CTWebAppInstaller` in `libwas_common.so`):
+     1. Copies the staged `.wgt`/`.tpk` file as UID 5001 (`m_CopyLocalAppPkg`) into
+        `/opt/usr/home/owner/share/tmp/sdk_tools/tmp/<file>.<wgt|tpk>` and
+        derives the package type from the `.wgt`/`.tpk` extension.
+     2. Calls `pkgmgr_client_usr_install` (`IPkgMgr::Install`).
+     3. On completion (`CTWebAppInstaller::t_InstallPost` → `m_SaveAppInfo`),
+        queries `pkgmgr-info` for the installed package's `mainappid`
+        (`tizen_id`, e.g. `vetrotvapp.app` or `org.tvauth.ui`), copies the app
+        icon to `/opt/share/webappservice/apps_icon/all/<appid>/`, inserts/updates
+        the `widgetinfo` row in `/opt/dbspace/.webappservice.db`, and calls
+        `CWASUtil::NotifyHomeListChanged` (`vconf` key `memory/was/app_change = 1`)
+        so Samsung Home immediately lists the app.
+   - Similarly, `was_uninstall_webapp` (`wascmd -u <appid>`) runs
+     `pkgmgr_client_usr_uninstall`, removes the `widgetinfo` row from
+     `/opt/dbspace/.webappservice.db`, deletes the cached icon directory, and
+     notifies Samsung Home. Note that `was_uninstall_webapp` expects the
+     application's `appid` (`tizen_id` / `mainappid`, such as `vetrotvapp.app`),
+     whereas `libsdbd_plugin_release.so`'s `wascmd_uninstall` wrapper checks
+     `is_sdk_app()` first (`installed_source_type`), so `pkginstall.rs` should
+     call `was_install_webapp_with_translated_error_code` and
+     `was_uninstall_webapp` in `libwas_manager_api.so` (or `was_execution` for
+     install) in a forked helper process with `DBUS_SESSION_BUS_ADDRESS` set and
+     a `GMainLoop` driving the D-Bus completion callback, bounded by the 120 s
+     timeout.
 
 ## 7. Signing
 
