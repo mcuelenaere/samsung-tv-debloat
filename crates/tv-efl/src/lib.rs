@@ -20,8 +20,11 @@ pub const EVAS_HINT_FILL: c_double = -1.0;
 
 /// `Elm_Win_Type`: ELM_WIN_UNKNOWN is -1, basic is 0, notification is 11.
 pub const ELM_WIN_BASIC: c_int = 0;
+pub const ELM_SCROLLER_POLICY_OFF: c_int = 2;
+pub const ELM_ICON_NONE: c_int = 0;
 pub const ELM_WIN_NOTIFICATION: c_int = 11;
 pub const EEXT_CALLBACK_BACK: c_int = 0;
+pub const ECORE_WL2_WINDOW_TYPE_TOPLEVEL: c_int = 1;
 pub const ECORE_WL2_WINDOW_TYPE_NOTIFICATION: c_int = 5;
 pub const ELM_WRAP_WORD: c_int = 2;
 /// `efl_util_notification_level_e`. These go to e20 unchanged; anything else
@@ -107,8 +110,27 @@ extern "C" {
 
     pub fn elm_label_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_label_line_wrap_set(object: *mut c_void, wrap: c_int);
+    pub fn elm_label_wrap_width_set(object: *mut c_void, width: EvasCoord);
     pub fn elm_button_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_image_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_object_part_content_set(
+        object: *mut c_void,
+        part: *const c_char,
+        content: *mut c_void,
+    );
+    pub fn elm_scroller_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_scroller_policy_set(scroller: *mut c_void, horizontal: c_int, vertical: c_int);
+    pub fn elm_scroller_bounce_set(scroller: *mut c_void, horizontal: EinaBool, vertical: EinaBool);
+    pub fn elm_hoversel_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_hoversel_hover_parent_set(hoversel: *mut c_void, parent: *mut c_void);
+    pub fn elm_hoversel_item_add(
+        hoversel: *mut c_void,
+        label: *const c_char,
+        icon_file: *const c_char,
+        icon_type: c_int,
+        callback: EvasSmartCb,
+        data: *const c_void,
+    ) -> *mut c_void;
     pub fn elm_image_file_set(
         image: *mut c_void,
         file: *const c_char,

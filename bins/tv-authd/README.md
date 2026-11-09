@@ -234,6 +234,11 @@ daemon is at `/opt/tv-auth/tv-authd.m4-20261108`. The managed UI source remains
 at git commit `7b39883`; a Partner-signed rollback TPK produced before removal
 was kept locally under `ui/out/` (not committed).
 
+WAS registers WGTs under their application id (the `<tizen:application id>`,
+like Samsung's own installs) and TPKs under their package id; `wascmd -u` is
+given the same id back, so the `pkgcmd+home` fallback only runs for packages
+installed some other way.
+
 The daemon never launches a UI: prompts and toasts go to the persistent
 `tv-auth-popupd` (`../tv-auth-popupd`), which systemd keeps running.
 

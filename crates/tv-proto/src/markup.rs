@@ -151,6 +151,10 @@ pub fn shorten(text: &str, max_chars: usize, already_truncated: bool) -> String 
     text
 }
 
+/// Lines of a command shown on a prompt; more would push the buttons off a
+/// 1080p screen.
+pub const COMMAND_LINES: usize = 8;
+
 pub fn command_markup(command: &str, already_truncated: bool) -> String {
     let mut lines = Vec::new();
     let mut truncated = already_truncated;
@@ -165,12 +169,12 @@ pub fn command_markup(command: &str, already_truncated: bool) -> String {
             line = &line[length..];
         }
         lines.push(line.to_owned());
-        if lines.len() > 12 {
+        if lines.len() > COMMAND_LINES {
             break;
         }
     }
-    if lines.len() > 12 {
-        lines.truncate(12);
+    if lines.len() > COMMAND_LINES {
+        lines.truncate(COMMAND_LINES);
         truncated = true;
     }
     let mut builder = String::new();
@@ -207,7 +211,7 @@ mod tests {
     #[test]
     fn wraps_long_commands() {
         let markup = command_markup(&"x".repeat(1000), false);
-        assert_eq!(markup.matches("<br/>").count(), 12);
+        assert_eq!(markup.matches("<br/>").count(), COMMAND_LINES);
         assert!(markup.contains("Command truncated for display."));
     }
 

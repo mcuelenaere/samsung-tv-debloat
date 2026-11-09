@@ -358,3 +358,26 @@ Not done: progress percentages for downloads (a status line only), the
 `pkgid` renaming the Apps2Samsung TV-Store applies to colliding community
 package ids, user-added repositories, and human-friendly wording for audit
 lines.
+
+### Phase 3 follow-ups (2026-11-09)
+
+- **Store UI:** one scrolling list (rows appended in chunks of 16 as focus
+  approaches the end) instead of pages, and an `elm_hoversel` category
+  dropdown.
+- **Manager window:** a real app toplevel. `ELM_WIN_BASIC` on this firmware
+  sends Wayland window type NONE, which never gets an xdg toplevel; setting
+  `ECORE_WL2_WINDOW_TYPE_TOPLEVEL` explicitly maps it in
+  `E_LAYER_CLIENT_NORMAL`. That fixed the Home button (Samsung's Home bar sat
+  under the notification-layer manager) and pausing the app underneath.
+- **Prompt sizing:** privileges are one wrapped line (12 named, then "+N
+  more", with `elm_label_wrap_width_set` because nested word-wrapped labels
+  otherwise size to their full line), commands show at most 8 lines, and the
+  card's padding shrank; 20 privileges and a 1500-character command both fit.
+- **Home registration of store installs:** WAS registered WGTs under the
+  package id, while Samsung's own installs use the application id
+  (`vetrotvapp.app`). `wascmd -u <appid>` then failed, the `pkgcmd+home`
+  fallback deleted the `widgetinfo` row behind webappservice's back, and a
+  reinstall of the same package got no Home row. `tv-authd` now registers and
+  removes WGTs by application id (TPKs keep the package id) and the fallback
+  removes icon folders under both ids. Stale entries from before the fix were
+  cleared with `wascmd -u <pkgid>`.

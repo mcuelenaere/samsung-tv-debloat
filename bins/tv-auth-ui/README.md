@@ -62,8 +62,10 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   their TV-Store pins), and rejects a catalog older than 7 days or dated more
   than an hour ahead.
 - Lists one row per installable file (community catalog entries plus every
-  asset of each release provider's latest release), sorted by name, 6 per page,
-  with a category filter. Adult entries, non-HTTPS URLs, entries without a
+  asset of each release provider's latest release), sorted by name, in one
+  scrolling list: rows are appended 16 at a time as focus nears the end, and
+  the scroller follows focus. A category dropdown (`elm_hoversel`) filters
+  it. Adult entries, non-HTTPS URLs, entries without a
   SHA-256, and apps needing Tizen > 6.5 are left out; Partner-level apps are
   labelled.
 - Matches `package_id`/`package_version` against `pkg.list`: **Install**,
@@ -73,12 +75,15 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   `pkg.install`. `tv-authd` stages and re-signs it and asks the user on the
   popup's prompt. Remove sends `pkg.uninstall` (also prompted). Open launches
   the package's main app through `app_control`.
-- Icons are fetched for the visible page only, hash-checked, and cached in
-  `/tmp/tv-store/icons/`.
-- The manager is a notification window at the lowest level (`DEFAULT`,
-  layer 650), so the popup's TOP-level prompt (800) covers it. While a change
-  waits for approval it releases its BACK keygrab; the result then shows in
-  its status line.
+- Icons are fetched as rows are appended, hash-checked, cached in
+  `/tmp/tv-store/icons/`, and swapped into their row in place.
+- The window is an ordinary app toplevel (`E_LAYER_CLIENT_NORMAL`, layer 200).
+  On this firmware `ELM_WIN_BASIC` leaves the Wayland window type at NONE and
+  such a surface never gets an xdg toplevel, so the manager sets
+  `ECORE_WL2_WINDOW_TYPE_TOPLEVEL` itself. As a real app window it obscures
+  (and so pauses) the app underneath, Samsung's Home bar (layer 650) and the
+  popup's prompt (800) open above it, and BACK arrives by focus with no
+  keygrab.
 
 ### Permissions
 
@@ -178,8 +183,12 @@ check out that commit and use its `ui/build-ui-dotnet.sh`.
   installed it through WAS with a Home row, and the row switched to
   Open/Remove. Remove went through a prompt and `pkgcmd+home`. The
   Permissions tab showed the Vetro grant and the audit lines of both changes.
-  A plain `ELM_WIN_BASIC` window never reached the compositor, hence the
-  notification window.
+  (That build used a notification window; see the follow-up below.)
+- **TV (follow-ups, 2026-11-09):** continuous scrolling past the first chunk
+  and the category dropdown worked with injected keys. With the toplevel
+  window, YouTube received `visibility.notify(fully obscured)` and
+  `iconify_state_changed` when the manager opened, the Home button showed
+  Samsung's Home bar (confirmed on the TV), and BACK closed the manager.
 
 - **TV (manager-only split, 2026-11-09):** the rebuilt TPK installed through
   the root role (`re_signed=true`, `backend=was`); launched via

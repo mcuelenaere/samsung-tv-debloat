@@ -8,11 +8,10 @@
 //!   daemon's recent decisions (`grants.audit`).
 //!
 //! It never sends `ui.hello`, so it does not compete with the popup daemon.
-//! It is a full-screen notification window at the lowest notification level
-//! (a plain `ELM_WIN_BASIC` window never reached the compositor on this
-//! firmware), so the popup's TOP-level prompt always stacks above it. It holds
-//! the BACK keygrab, and releases it while a store change waits for the
-//! prompt. Network, hashing and broker calls run on worker threads
+//! It is an ordinary app window (`E_LAYER_CLIENT_NORMAL`), so opening it
+//! obscures and pauses the previous app, Samsung's Home bar
+//! (`NOTIFICATION_LOW`) and the popup's prompt (`NOTIFICATION_TOP`) open above
+//! it, and BACK arrives through focus without a keygrab. Network, hashing and broker calls run on worker threads
 //! that report through a channel drained by a 100 ms timer.
 //!
 //! The daemon stages the executable at `/run/tv-auth/ui-bin/tv-auth-ui` (see
@@ -44,7 +43,9 @@ use tv_proto::DEFAULT_SOCKET;
 
 const COLOR_BACKGROUND: i32 = 0x10_12_17;
 const COLOR_ROW: i32 = 0x1c_1f_26;
-const PAGE_ROWS: usize = 6;
+/// Rows are appended in chunks as focus approaches the end of the list.
+const CHUNK_ROWS: usize = 16;
+const LOOKAHEAD_ROWS: usize = 6;
 const ICON_SIZE: i32 = 96;
 const DESCRIPTION_CHARS: usize = 110;
 const AUDIT_SHOWN: usize = 8;
@@ -65,7 +66,7 @@ const CATEGORIES: &[(&str, &str)] = &[
 
 const APP_ID: &[u8] = b"org.tvauth.ui\0";
 const DELETE_REQUEST: &[u8] = b"delete,request\0";
-const BACK_KEY: &[u8] = b"XF86Back\0";
+const FOCUSED: &[u8] = b"focused\0";
 
 thread_local! {
     static UI_PTR: Cell<*mut Ui> = const { Cell::new(ptr::null_mut()) };
@@ -89,7 +90,8 @@ enum Tab {
 enum Job {
     Catalog(Result<Vec<App>, String>),
     Installed(Result<HashMap<String, Installed>, String>),
-    Icon,
+    /// An icon with this SHA-256 is now cached.
+    Icon(String),
     Status(String),
     Finished(Result<String, String>),
     Audit(Vec<String>),
@@ -107,7 +109,8 @@ struct Store {
     installed: HashMap<String, Installed>,
     loaded: bool,
     category: usize,
-    page: usize,
+    /// Row that last had focus, kept across re-renders.
+    focus_row: usize,
     busy: bool,
     icons_requested: HashSet<String>,
 }
@@ -118,19 +121,6 @@ impl Store {
         self.apps
             .iter()
             .filter(|app| category.is_empty() || app.category == category)
-            .collect()
-    }
-
-    fn pages(&self) -> usize {
-        self.visible().len().div_ceil(PAGE_ROWS).max(1)
-    }
-
-    fn page_apps(&self) -> Vec<App> {
-        self.visible()
-            .into_iter()
-            .skip(self.page * PAGE_ROWS)
-            .take(PAGE_ROWS)
-            .cloned()
             .collect()
     }
 
@@ -157,12 +147,16 @@ struct Ui {
     tab: Tab,
     status: String,
     store: Store,
-    /// The apps on screen, indexed by button data (row + 1).
+    /// The listed apps (current category), indexed by button data (row + 1).
     rows: Vec<App>,
+    list_box: *mut c_void,
+    rendered: usize,
+    primary_buttons: Vec<*mut c_void>,
+    /// Icon image objects by the SHA-256 they show.
+    row_images: Vec<(String, *mut c_void)>,
     grants: Vec<GrantInfo>,
     audit: Vec<String>,
     exiting: bool,
-    back_grabbed: bool,
     connected: bool,
     app_control_count: u32,
     focus_notify_label: Option<String>,
@@ -185,10 +179,13 @@ impl Ui {
             status: String::new(),
             store: Store::default(),
             rows: Vec::new(),
+            list_box: ptr::null_mut(),
+            rendered: 0,
+            primary_buttons: Vec::new(),
+            row_images: Vec::new(),
             grants: Vec::new(),
             audit: Vec::new(),
             exiting: false,
-            back_grabbed: false,
             connected: false,
             app_control_count: 0,
             focus_notify_label: None,
@@ -197,25 +194,19 @@ impl Ui {
 
     fn create_window(&mut self) -> bool {
         unsafe {
-            let window = elm_win_add(
-                ptr::null_mut(),
-                APP_ID.as_ptr().cast(),
-                ELM_WIN_NOTIFICATION,
-            );
+            let window = elm_win_add(ptr::null_mut(), APP_ID.as_ptr().cast(), ELM_WIN_BASIC);
             if window.is_null() {
                 log_line("elm_win_add failed");
                 return false;
             }
             self.window = window;
+            // ELM_WIN_BASIC leaves the Wayland type at NONE on this firmware,
+            // and such a surface never gets an xdg toplevel (never mapped).
             let wayland_window = elm_win_wl_window_get(window);
             if !wayland_window.is_null() {
-                ecore_wl2_window_type_set(wayland_window, ECORE_WL2_WINDOW_TYPE_NOTIFICATION);
+                ecore_wl2_window_type_set(wayland_window, ECORE_WL2_WINDOW_TYPE_TOPLEVEL);
             }
             set_window_title(window, "TV suite");
-            // The lowest notification level: above apps such as YouTube, but
-            // always below tv-auth-popupd's TOP-level consent prompt.
-            let level = efl_util_set_notification_window_level(window, NOTIFICATION_DEFAULT);
-            log_line(&format!("notification level DEFAULT result={level}"));
             evas_object_smart_callback_add(
                 window,
                 DELETE_REQUEST.as_ptr().cast(),
@@ -234,7 +225,7 @@ impl Ui {
             let (page, main) = panel(window, COLOR_BACKGROUND, 72, 40);
             evas_object_size_hint_weight_set(page, 1.0, 1.0);
             evas_object_size_hint_align_set(page, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            evas_object_size_hint_align_set(main, EVAS_HINT_FILL, 0.0);
+            evas_object_size_hint_align_set(main, EVAS_HINT_FILL, EVAS_HINT_FILL);
             elm_box_padding_set(main, 0, 20);
             elm_win_resize_object_add(window, page);
 
@@ -261,7 +252,7 @@ impl Ui {
 
             self.content_box = elm_box_add(main);
             evas_object_size_hint_weight_set(self.content_box, 1.0, 1.0);
-            evas_object_size_hint_align_set(self.content_box, EVAS_HINT_FILL, 0.0);
+            evas_object_size_hint_align_set(self.content_box, EVAS_HINT_FILL, EVAS_HINT_FILL);
             elm_box_padding_set(self.content_box, 0, 14);
             elm_box_pack_end(main, self.content_box);
             evas_object_show(self.content_box);
@@ -290,7 +281,6 @@ impl Ui {
     }
 
     fn show(&mut self) {
-        self.grab_back(true);
         unsafe {
             evas_object_show(self.window);
             elm_win_raise(self.window);
@@ -300,30 +290,10 @@ impl Ui {
 
     /// Hold BACK only while no store change waits on the popup's prompt,
     /// which needs the key (and focus) for itself.
-    fn grab_back(&mut self, grab: bool) {
-        if grab == self.back_grabbed || self.window.is_null() {
-            return;
-        }
-        unsafe {
-            if grab {
-                self.back_grabbed =
-                    eext_win_keygrab_set(self.window, BACK_KEY.as_ptr().cast()) == 1;
-                if !self.back_grabbed {
-                    log_line("XF86Back keygrab failed");
-                }
-                elm_win_activate(self.window);
-            } else {
-                eext_win_keygrab_unset(self.window, BACK_KEY.as_ptr().cast());
-                self.back_grabbed = false;
-            }
-        }
-    }
-
     fn terminate(&mut self) {
         if let Some(broker) = self.broker.take() {
             broker.stop();
         }
-        self.grab_back(false);
         if !self.window.is_null() {
             unsafe { evas_object_del(self.window) };
             self.window = ptr::null_mut();
@@ -387,13 +357,24 @@ impl Ui {
         }
     }
 
+    fn set_status(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        set_text(
+            self.status_label,
+            &format!(
+                "<font_size=24><color=#c9ccd3>{}</color></font_size>",
+                escape(&self.status)
+            ),
+        );
+    }
+
     fn on_job(&mut self, job: Job) -> bool {
         match job {
             Job::Catalog(Ok(apps)) => {
                 self.status = format!("{} apps in the Apps2Samsung catalog.", apps.len());
                 self.store.apps = apps;
                 self.store.loaded = true;
-                self.store.page = 0;
+                self.store.focus_row = 0;
                 self.list_installed();
             }
             Job::Catalog(Err(error)) => {
@@ -404,15 +385,22 @@ impl Ui {
             Job::Installed(Err(error)) => {
                 self.status = format!("Could not read installed packages: {error}");
             }
-            // A re-render picks up the cached file.
-            Job::Icon => return self.tab == Tab::Store,
-            Job::Status(message) => self.status = message,
+            Job::Icon(digest) => {
+                self.show_icon(&digest);
+                return false;
+            }
+            Job::Status(message) => {
+                self.set_status(message);
+                return false;
+            }
             Job::Finished(result) => {
                 self.store.busy = false;
                 self.show();
-                self.status = result.unwrap_or_else(|error| error);
+                self.set_status(result.unwrap_or_else(|error| error));
                 log_line(&self.status);
+                // The row's buttons change once the installed list is back.
                 self.list_installed();
+                return false;
             }
             Job::Audit(lines) => {
                 self.audit = lines;
@@ -451,9 +439,9 @@ impl Ui {
         });
     }
 
-    fn fetch_icons(&mut self) {
+    fn fetch_icons(&mut self, rows: std::ops::Range<usize>) {
         let mut wanted = Vec::new();
-        for (url, digest) in self.rows.iter().filter_map(|app| app.icon.clone()) {
+        for (url, digest) in self.rows[rows].iter().filter_map(|app| app.icon.clone()) {
             if self.store.icons_requested.insert(digest.clone()) && !icon_path(&digest).exists() {
                 wanted.push((url, digest));
             }
@@ -466,7 +454,7 @@ impl Ui {
             for (url, digest) in wanted {
                 match fetch_verified(&url, &digest, 1 << 20, &icon_path(&digest)) {
                     Ok(_) => {
-                        let _ = jobs.send(Job::Icon);
+                        let _ = jobs.send(Job::Icon(digest));
                     }
                     Err(error) => log_line(&format!("icon {url}: {error}")),
                 }
@@ -476,12 +464,10 @@ impl Ui {
 
     fn start_change(&mut self) -> bool {
         if self.store.busy {
-            self.status = "Another change is still in progress.".into();
-            self.render();
+            self.set_status("Another change is still in progress.");
             return false;
         }
         self.store.busy = true;
-        self.grab_back(false);
         true
     }
 
@@ -499,8 +485,7 @@ impl Ui {
         if !self.start_change() {
             return;
         }
-        self.status = format!("Removing {}: approve it on the prompt.", app.name);
-        self.render();
+        self.set_status(format!("Removing {}: approve it on the prompt.", app.name));
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             let request = json!({"version": 2, "id": "store-uninstall", "method": "pkg.uninstall",
@@ -516,11 +501,11 @@ impl Ui {
         let Some(installed) = self.store.installed.get(&app.package_id) else {
             return;
         };
-        self.status = match tv_tizen::app::launch(&installed.main_app_id) {
+        let status = match tv_tizen::app::launch(&installed.main_app_id) {
             Ok(()) => format!("Opening {}...", app.name),
             Err(error) => format!("Could not open {}: {error}", app.name),
         };
-        self.render();
+        self.set_status(status);
     }
 
     fn render(&mut self) {
@@ -532,13 +517,7 @@ impl Ui {
             Tab::Store => self.render_store(),
             Tab::Permissions => self.render_permissions(),
         };
-        set_text(
-            self.status_label,
-            &format!(
-                "<font_size=24><color=#c9ccd3>{}</color></font_size>",
-                escape(&self.status)
-            ),
-        );
+        self.set_status(self.status.clone());
         if !focus.is_null() {
             unsafe { elm_object_focus_set(focus, 1) };
         }
@@ -548,57 +527,93 @@ impl Ui {
     fn render_store(&mut self) -> *mut c_void {
         let toolbar = create_row(self.content_box);
         self.add_content(toolbar);
-        let pages = self.store.pages();
-        self.store.page = self.store.page.min(pages - 1);
+        self.rows = self.store.visible().into_iter().cloned().collect();
+        self.store.focus_row = self.store.focus_row.min(self.rows.len().saturating_sub(1));
         add_to_box(
             toolbar,
             create_label(
                 toolbar,
-                &small(
-                    &format!(
-                        "{} apps \u{00b7} page {} of {}",
-                        self.store.visible().len(),
-                        self.store.page + 1,
-                        pages
-                    ),
-                    "#8a8f99",
-                ),
+                &small(&format!("{} apps", self.rows.len()), "#8a8f99"),
             ),
         );
-        let category = create_button(
-            toolbar,
-            &format!("Category: {}", CATEGORIES[self.store.category].1),
-            on_category_clicked,
-            ptr::null_mut(),
-        );
-        unsafe { evas_object_size_hint_min_set(category, 340, 72) };
-        create_button(
-            toolbar,
-            "Previous",
-            on_page_clicked,
-            ptr::without_provenance_mut(1),
-        );
-        create_button(
-            toolbar,
-            "Next",
-            on_page_clicked,
-            ptr::without_provenance_mut(2),
-        );
+        let category = unsafe {
+            let hoversel = elm_hoversel_add(toolbar);
+            elm_hoversel_hover_parent_set(hoversel, self.window);
+            set_text(
+                hoversel,
+                &format!("Category: {}", CATEGORIES[self.store.category].1),
+            );
+            for (index, (_, label)) in CATEGORIES.iter().enumerate() {
+                let label = c_string(label);
+                elm_hoversel_item_add(
+                    hoversel,
+                    label.as_ptr(),
+                    ptr::null(),
+                    ELM_ICON_NONE,
+                    on_category_selected,
+                    ptr::without_provenance(index + 1),
+                );
+            }
+            evas_object_size_hint_min_set(hoversel, 340, 72);
+            elm_box_pack_end(toolbar, hoversel);
+            evas_object_show(hoversel);
+            hoversel
+        };
         create_button(toolbar, "Reload", on_reload_clicked, ptr::null_mut());
 
-        self.rows = self.store.page_apps();
+        unsafe {
+            let scroller = elm_scroller_add(self.content_box);
+            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
+            elm_scroller_bounce_set(scroller, 0, 0);
+            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
+            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
+            self.list_box = elm_box_add(scroller);
+            evas_object_size_hint_weight_set(self.list_box, 1.0, 0.0);
+            evas_object_size_hint_align_set(self.list_box, EVAS_HINT_FILL, 0.0);
+            elm_box_padding_set(self.list_box, 0, 14);
+            elm_object_part_content_set(scroller, ptr::null(), self.list_box);
+            evas_object_show(self.list_box);
+            evas_object_show(scroller);
+            self.add_content(scroller);
+        }
+        self.rendered = 0;
+        self.primary_buttons.clear();
+        self.row_images.clear();
+        self.append_rows(self.store.focus_row + CHUNK_ROWS);
+        if self.rows.is_empty() && self.store.loaded {
+            add_to_box(
+                self.list_box,
+                create_label(
+                    self.list_box,
+                    &small("No apps in this category.", "#8a8f99"),
+                ),
+            );
+        }
+        self.primary_buttons
+            .get(self.store.focus_row)
+            .copied()
+            .unwrap_or(category)
+    }
+
+    /// Append rows up to `upto` (exclusive) to the store list.
+    fn append_rows(&mut self, upto: usize) {
+        let start = self.rendered;
+        let end = upto.min(self.rows.len());
+        if start >= end {
+            return;
+        }
         let versions = self.store.versions();
-        let mut focus: *mut c_void = ptr::null_mut();
-        for (index, app) in self.rows.clone().iter().enumerate() {
-            let (row, row_box) = panel(self.content_box, COLOR_ROW, 24, 12);
-            self.add_content(row);
+        for index in start..end {
+            let app = self.rows[index].clone();
+            let (row, row_box) = panel(self.list_box, COLOR_ROW, 24, 12);
             unsafe {
+                elm_box_pack_end(self.list_box, row);
                 elm_box_horizontal_set(row_box, 1);
                 elm_box_padding_set(row_box, 24, 0);
             }
-            add_to_box(row_box, icon(row_box, app));
+            add_to_box(row_box, self.icon(row_box, &app));
 
-            let state = store::state(app, &versions);
+            let state = store::state(&app, &versions);
             let state_text = match &state {
                 State::NotInstalled => format!("v{}", app.version),
                 State::Installed => format!("v{} \u{00b7} installed", app.version),
@@ -634,7 +649,7 @@ impl Ui {
             );
 
             let data = ptr::without_provenance_mut(index + 1);
-            let primary = match state {
+            let mut buttons = vec![match state {
                 State::NotInstalled => create_button(row_box, "Install", on_install_clicked, data),
                 State::Upgradable { .. } => {
                     create_button(row_box, "Update", on_install_clicked, data)
@@ -642,25 +657,52 @@ impl Ui {
                 State::Installed | State::Newer { .. } => {
                     create_button(row_box, "Open", on_open_clicked, data)
                 }
-            };
+            }];
             if !matches!(state, State::NotInstalled) {
-                create_button(row_box, "Remove", on_remove_clicked, data);
+                buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
             }
-            if focus.is_null() {
-                focus = primary;
+            for button in &buttons {
+                unsafe {
+                    evas_object_smart_callback_add(
+                        *button,
+                        FOCUSED.as_ptr().cast(),
+                        on_row_focused,
+                        data,
+                    );
+                }
             }
+            self.primary_buttons.push(buttons[0]);
         }
-        if self.rows.is_empty() && self.store.loaded {
-            self.add_content(create_label(
-                self.content_box,
-                &small("No apps in this category.", "#8a8f99"),
-            ));
+        self.rendered = end;
+        self.fetch_icons(start..end);
+    }
+
+    /// Focus moved to a row: remember it, and extend the list before the
+    /// user reaches its end.
+    fn row_focused(&mut self, index: usize) {
+        self.store.focus_row = index;
+        if index + LOOKAHEAD_ROWS >= self.rendered {
+            self.append_rows(self.rendered + CHUNK_ROWS);
         }
-        self.fetch_icons();
-        if focus.is_null() {
-            category
-        } else {
-            focus
+    }
+
+    fn icon(&mut self, parent: *mut c_void, app: &App) -> *mut c_void {
+        unsafe {
+            let image = elm_image_add(parent);
+            evas_object_size_hint_min_set(image, ICON_SIZE, ICON_SIZE);
+            evas_object_show(image);
+            if let Some((_, digest)) = &app.icon {
+                set_image_file(image, &icon_path(digest));
+                self.row_images.push((digest.clone(), image));
+            }
+            image
+        }
+    }
+
+    fn show_icon(&mut self, digest: &str) {
+        let path = icon_path(digest);
+        for (_, image) in self.row_images.iter().filter(|(d, _)| d == digest) {
+            set_image_file(*image, &path);
         }
     }
 
@@ -827,28 +869,13 @@ fn audit_markup(line: &str, now: i64) -> String {
     )
 }
 
-fn icon(parent: *mut c_void, app: &App) -> *mut c_void {
-    let file = app
-        .icon
-        .as_ref()
-        .map(|(_, digest)| icon_path(digest))
-        .filter(|path| path.exists())
-        .and_then(|path| CString::new(path.into_os_string().into_encoded_bytes()).ok());
-    unsafe {
-        if let Some(file) = file {
-            let image = elm_image_add(parent);
-            if !image.is_null() && elm_image_file_set(image, file.as_ptr(), ptr::null()) == 1 {
-                evas_object_size_hint_min_set(image, ICON_SIZE, ICON_SIZE);
-                evas_object_show(image);
-                return image;
-            }
-            if !image.is_null() {
-                evas_object_del(image);
-            }
-        }
-        let placeholder = create_rect(parent, 0x2c_31_3c, 255);
-        evas_object_size_hint_min_set(placeholder, ICON_SIZE, ICON_SIZE);
-        placeholder
+/// Show a cached icon; a missing file leaves the image empty.
+fn set_image_file(image: *mut c_void, path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(file) = CString::new(path.as_os_str().as_encoded_bytes()) {
+        unsafe { elm_image_file_set(image, file.as_ptr(), ptr::null()) };
     }
 }
 
@@ -1055,26 +1082,21 @@ unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _in
     state.render();
 }
 
-unsafe extern "C" fn on_category_clicked(
-    _data: *mut c_void,
+unsafe extern "C" fn on_category_selected(
+    data: *mut c_void,
     _object: *mut c_void,
     _info: *mut c_void,
 ) {
     let state = ui();
-    state.store.category = (state.store.category + 1) % CATEGORIES.len();
-    state.store.page = 0;
+    state.store.category = (data as usize).saturating_sub(1).min(CATEGORIES.len() - 1);
+    state.store.focus_row = 0;
     state.render();
 }
 
-unsafe extern "C" fn on_page_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    let state = ui();
-    let pages = state.store.pages();
-    state.store.page = if data as usize == 1 {
-        (state.store.page + pages - 1) % pages
-    } else {
-        (state.store.page + 1) % pages
-    };
-    state.render();
+unsafe extern "C" fn on_row_focused(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    if let Some(index) = (data as usize).checked_sub(1) {
+        ui().row_focused(index);
+    }
 }
 
 unsafe extern "C" fn on_reload_clicked(
@@ -1085,7 +1107,7 @@ unsafe extern "C" fn on_reload_clicked(
     let state = ui();
     state.store.icons_requested.clear();
     state.load_catalog();
-    state.render();
+    state.set_status(state.status.clone());
 }
 
 fn row_app(data: *mut c_void) -> Option<App> {
@@ -1100,9 +1122,7 @@ unsafe extern "C" fn on_install_clicked(
 ) {
     if let Some(app) = row_app(data) {
         log_line(&format!("install clicked {}", app.package_id));
-        let state = ui();
-        state.install(app);
-        state.render();
+        ui().install(app);
     }
 }
 

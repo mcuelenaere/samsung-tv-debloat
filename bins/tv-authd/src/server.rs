@@ -969,6 +969,7 @@ fn handle_install(
         .ok()
         .flatten()
         .is_some();
+    let was_id = was_app_id(request.pkg_type, &meta.pkgid, &meta.app_id);
     let install_meta = meta.into_install_meta(staged.size_bytes(), is_upgrade);
     // M3: unsigned and foreign-signed packages are re-signed on-device after
     // approval. Tizen refuses cross-author upgrades (-12), so an upgrade of a
@@ -1223,7 +1224,7 @@ fn handle_install(
 
     let install_result = install_package(
         packages,
-        &install_meta.pkgid,
+        &was_id,
         request.pkg_type,
         staged.path(),
         timeout_ms,
@@ -1544,11 +1545,11 @@ fn handle_uninstall(
         }
     }
 
-    let appid = entry
-        .main_app_id
-        .clone()
-        .filter(|id| crate::identity::is_valid_package_id(id))
-        .unwrap_or_else(|| entry.pkgid.clone());
+    let appid = was_app_id(
+        pkg_type,
+        &entry.pkgid,
+        entry.main_app_id.as_deref().unwrap_or(""),
+    );
     match uninstall_package(
         packages,
         &uninstall_meta.pkgid,
@@ -1688,8 +1689,22 @@ fn handle_list(
     Ok(())
 }
 
+/// The id `webappservice` registers a package under (`widgetinfo.id`), which
+/// `wascmd -u` must be given back. Samsung's own installs key WGTs by the
+/// application id (`vetrotvapp.app`); TPKs keep the package id, the validated
+/// path where the two match. Registering a WGT under its package id made
+/// `wascmd -u` fail, and the `pkgcmd+home` fallback then left webappservice's
+/// state stale, so a reinstall never got its Home row back.
+fn was_app_id(pkg_type: PackageType, pkgid: &str, app_id: &str) -> String {
+    if pkg_type == PackageType::Wgt && crate::identity::is_valid_package_id(app_id) {
+        app_id.to_owned()
+    } else {
+        pkgid.to_owned()
+    }
+}
+
 /// Install through `webappservice` when configured (Home registration and
-/// WGT), else the stock `pkgcmd`.
+/// WGT), else the stock `pkgcmd`. `pkgid` is the WAS id (see `was_app_id`).
 fn install_package(
     packages: &PackageConfig,
     pkgid: &str,
@@ -1778,8 +1793,11 @@ fn clean_home_registration(packages: &PackageConfig, pkgid: &str, appid: &str) {
             10_000,
         );
     }
-    if crate::identity::is_valid_package_id(appid) {
-        let _ = std::fs::remove_dir_all(packages.icon_root.join(appid));
+    // Icon folders are named after the WAS id, which has been either id.
+    for id in [pkgid, appid] {
+        if crate::identity::is_valid_package_id(id) {
+            let _ = std::fs::remove_dir_all(packages.icon_root.join(id));
+        }
     }
     let _ = executor::execute_argv(
         &packages.vconf,
@@ -2901,7 +2919,8 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&log).contains("install completed"));
         let recorded = std::fs::read_to_string(&args).unwrap();
-        assert!(recorded.starts_with("-i\norg.example.app\n-p\n"));
+        // WGTs register under their application id, like Samsung's installs.
+        assert!(recorded.starts_with("-i\norg.example.app.App\n-p\n"));
         assert!(recorded.contains("package.wgt"));
 
         drop(client);
@@ -3031,6 +3050,20 @@ mod tests {
         assert_eq!(client.read()["error"], "not_ui");
         drop(client);
         handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn webappservice_ids_match_samsungs_own_installs() {
+        // WGTs by application id (like vetrotvapp.app), TPKs by package id.
+        assert_eq!(
+            was_app_id(PackageType::Wgt, "DvNullSh01", "DvNullSh01.DevNull"),
+            "DvNullSh01.DevNull"
+        );
+        assert_eq!(was_app_id(PackageType::Wgt, "DvNullSh01", ""), "DvNullSh01");
+        assert_eq!(
+            was_app_id(PackageType::Tpk, "org.ex.tpk", "org.ex.tpk.ui"),
+            "org.ex.tpk"
+        );
     }
 
     fn uninstall_request(id: &str, pkgid: &str) -> Value {

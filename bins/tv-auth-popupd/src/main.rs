@@ -27,8 +27,8 @@ const COLOR_ROW: i32 = 0x27_2b_34;
 const COLOR_DANGER: i32 = 0xe5_48_4d;
 const COLOR_ACCENT: i32 = 0x3e_7b_fa;
 const CARD_WIDTH: i32 = 1200;
-const CARD_PADDING: i32 = 56;
-const MAX_PRIVILEGES_SHOWN: usize = 7;
+const CARD_PADDING: i32 = 40;
+const MAX_PRIVILEGES_SHOWN: usize = 12;
 
 const TOAST_WIDTH: i32 = 640;
 const TOAST_PADDING: i32 = 28;
@@ -409,7 +409,7 @@ impl Popup {
             evas_object_size_hint_weight_set(card, 1.0, 1.0);
             evas_object_size_hint_align_set(card, 0.5, 0.5);
             elm_table_pack(layout, card, 0, 0, 1, 1);
-            elm_box_padding_set(card_box, 0, 18);
+            elm_box_padding_set(card_box, 0, 10);
 
             self.accent_bar = create_rect(card, COLOR_ACCENT, 255);
             evas_object_size_hint_min_set(self.accent_bar, CARD_WIDTH, 8);
@@ -425,7 +425,7 @@ impl Popup {
             self.content_box = elm_box_add(card_box);
             evas_object_size_hint_weight_set(self.content_box, 1.0, 1.0);
             evas_object_size_hint_align_set(self.content_box, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            elm_box_padding_set(self.content_box, 0, 24);
+            elm_box_padding_set(self.content_box, 0, 14);
             elm_box_pack_end(card_box, self.content_box);
             evas_object_show(self.content_box);
 
@@ -551,7 +551,7 @@ impl Popup {
              and system files. Only allow apps you trust.",
         );
 
-        let (app, app_box) = panel(self.content_box, COLOR_ROW, 32, 24);
+        let (app, app_box) = panel(self.content_box, COLOR_ROW, 28, 14);
         self.add_content(app);
         add_to_box(
             app_box,
@@ -562,7 +562,7 @@ impl Popup {
             create_label(
                 app_box,
                 &format!(
-                    "<font_size=34><b>{}</b></font_size>",
+                    "<font_size=30><b>{}</b></font_size>",
                     escape(&prompt.package)
                 ),
             ),
@@ -573,7 +573,7 @@ impl Popup {
         );
 
         self.add_content(create_label(self.content_box, &small("COMMAND", "#8a8f99")));
-        let (command_panel, command_box) = panel(self.content_box, COLOR_INSET, 28, 20);
+        let (command_panel, command_box) = panel(self.content_box, COLOR_INSET, 24, 14);
         self.add_content(command_panel);
         add_to_box(
             command_box,
@@ -682,7 +682,7 @@ impl Popup {
             );
         }
 
-        let (app, app_box) = panel(self.content_box, COLOR_ROW, 32, 24);
+        let (app, app_box) = panel(self.content_box, COLOR_ROW, 28, 14);
         self.add_content(app);
         add_to_box(
             app_box,
@@ -693,7 +693,7 @@ impl Popup {
             create_label(
                 app_box,
                 &format!(
-                    "<font_size=34><b>{}</b></font_size>",
+                    "<font_size=30><b>{}</b></font_size>",
                     escape(&prompt.package)
                 ),
             ),
@@ -750,7 +750,7 @@ impl Popup {
             }
         }
 
-        let (package_panel, package_box) = panel(self.content_box, COLOR_INSET, 28, 20);
+        let (package_panel, package_box) = panel(self.content_box, COLOR_INSET, 24, 14);
         self.add_content(package_panel);
         add_to_box(
             package_box,
@@ -770,7 +770,7 @@ impl Popup {
             package_box,
             create_label(
                 package_box,
-                &format!("<font_size=32><b>{}</b></font_size>", escape(&name)),
+                &format!("<font_size=28><b>{}</b></font_size>", escape(&name)),
             ),
         );
         if !details.is_empty() {
@@ -807,36 +807,29 @@ impl Popup {
                         "#8a8f99",
                     ),
                 ));
-                let (privileges, privilege_box) = panel(self.content_box, COLOR_ROW, 28, 20);
-                self.add_content(privileges);
-                for privilege in info.privileges.iter().take(MAX_PRIVILEGES_SHOWN) {
-                    add_to_box(
-                        privilege_box,
-                        create_label(
-                            privilege_box,
-                            &small(
-                                &format!("\u{2022} {}", privilege_label(privilege)),
-                                "#e8e8e8",
-                            ),
-                        ),
-                    );
-                }
+                // One wrapped line: a list per privilege outgrew 1080 px.
+                let mut names: Vec<String> = info
+                    .privileges
+                    .iter()
+                    .take(MAX_PRIVILEGES_SHOWN)
+                    .map(|privilege| privilege_label(privilege))
+                    .collect();
                 if info.privileges.len() > MAX_PRIVILEGES_SHOWN {
-                    let more = info.privileges.len() - MAX_PRIVILEGES_SHOWN;
-                    add_to_box(
-                        privilege_box,
-                        create_label(
-                            privilege_box,
-                            &small(
-                                &format!(
-                                    "+ {more} more privilege{}",
-                                    if more == 1 { "" } else { "s" }
-                                ),
-                                "#8a8f99",
-                            ),
-                        ),
-                    );
+                    names.push(format!(
+                        "+ {} more",
+                        info.privileges.len() - MAX_PRIVILEGES_SHOWN
+                    ));
                 }
+                let (privileges, privilege_box) = panel(self.content_box, COLOR_ROW, 24, 12);
+                self.add_content(privileges);
+                let label = create_label(
+                    privilege_box,
+                    &small(&names.join("  \u{00b7}  "), "#e8e8e8"),
+                );
+                // Word wrap alone sizes a nested label to its full line;
+                // pin the width to the card's inner width.
+                unsafe { elm_label_wrap_width_set(label, CARD_WIDTH - 2 * CARD_PADDING - 48) };
+                add_to_box(privilege_box, label);
             }
         }
 
@@ -880,7 +873,7 @@ impl Popup {
             self.header_label,
             &format!(
                 "<font_size=20><b><color={hex}>{}</color></b></font_size><br/>\
-                 <font_size=46><b>{}</b></font_size>",
+                 <font_size=38><b>{}</b></font_size>",
                 escape(eyebrow),
                 escape(title)
             ),

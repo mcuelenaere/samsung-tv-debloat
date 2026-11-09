@@ -84,6 +84,8 @@ pub struct SignatureContext {
 #[derive(Debug, Clone)]
 pub struct PackageMeta {
     pub pkgid: String,
+    /// WGT `<tizen:application id>` (empty for TPKs).
+    pub app_id: String,
     pub name: String,
     pub pkg_version: String,
     pub pkg_type: PackageType,
@@ -143,7 +145,7 @@ pub fn inspect(
     let manifest = String::from_utf8(manifest)
         .map_err(|_| MetaError::BadPackage("manifest is not valid UTF-8"))?;
 
-    let (pkgid, name, version, privileges) = parse_manifest(&manifest, pkg_type)?;
+    let (pkgid, app_id, name, version, privileges) = parse_manifest(&manifest, pkg_type)?;
     if !crate::identity::is_valid_package_id(&pkgid) {
         return Err(MetaError::BadPackage("manifest package id is invalid"));
     }
@@ -179,6 +181,7 @@ pub fn inspect(
 
     Ok(PackageMeta {
         pkgid: prompt_text(&pkgid, MAX_PKGID_BYTES),
+        app_id: prompt_text(&app_id, MAX_PKGID_BYTES),
         name: prompt_text(&name, MAX_PKG_NAME_BYTES),
         pkg_version: prompt_text(&version, MAX_PKG_VERSION_BYTES),
         pkg_type,
@@ -246,7 +249,7 @@ fn read_entry(
 fn parse_manifest(
     text: &str,
     pkg_type: PackageType,
-) -> Result<(String, String, String, Vec<String>), MetaError> {
+) -> Result<(String, String, String, String, Vec<String>), MetaError> {
     let document = roxmltree::Document::parse(text)
         .map_err(|_| MetaError::BadPackage("manifest is not XML"))?;
     let root = document.root_element();
@@ -265,6 +268,7 @@ fn parse_manifest(
     let mut version = attribute(&root, "version");
     let mut name = String::new();
     let mut application_package = String::new();
+    let mut app_id = String::new();
 
     for node in root.descendants().filter(|node| node.is_element()) {
         match node.tag_name().name() {
@@ -276,6 +280,7 @@ fn parse_manifest(
             // the widget id is usually a URL.
             "application" if pkg_type == PackageType::Wgt => {
                 application_package = attribute(&node, "package");
+                app_id = attribute(&node, "id");
                 if version.is_empty() {
                     version = attribute(&node, "version");
                 }
@@ -312,7 +317,7 @@ fn parse_manifest(
         ));
     }
 
-    Ok((pkgid, name, version, privileges))
+    Ok((pkgid, app_id, name, version, privileges))
 }
 
 fn attribute(node: &roxmltree::Node<'_, '_>, name: &str) -> String {
@@ -477,7 +482,7 @@ mod tests {
         xmlns:tizen="http://tizen.org/ns/widgets"
         id="http://example.com/Example" version="1.0.0">
   <name>Example</name>
-  <tizen:application id="org.example.app" package="org.example.app"/>
+  <tizen:application id="org.example.app.Main" package="org.example.app"/>
   {privileges}
 </widget>"#
         )
@@ -500,6 +505,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta.pkgid, "org.example.app");
+        assert_eq!(meta.app_id, "org.example.app.Main");
         assert_eq!(meta.name, "Example");
         assert_eq!(meta.pkg_version, "1.0.0");
         assert_eq!(
