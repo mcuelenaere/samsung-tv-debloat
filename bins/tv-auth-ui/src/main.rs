@@ -8,11 +8,11 @@
 //!   daemon's recent decisions (`grants.audit`).
 //!
 //! It never sends `ui.hello`, so it does not compete with the popup daemon.
-//! It is a full-screen notification window holding the BACK keygrab (a plain
-//! `ELM_WIN_BASIC` window never reached the compositor on this firmware). The
-//! compositor keeps the systemd-started popup below notification windows, so
-//! the manager hides itself, keygrab released, while a store change waits for
-//! the popup's prompt, and returns with the result. Network, hashing and broker calls run on worker threads
+//! It is a full-screen notification window at the lowest notification level
+//! (a plain `ELM_WIN_BASIC` window never reached the compositor on this
+//! firmware), so the popup's TOP-level prompt always stacks above it. It holds
+//! the BACK keygrab, and releases it while a store change waits for the
+//! prompt. Network, hashing and broker calls run on worker threads
 //! that report through a channel drained by a 100 ms timer.
 //!
 //! The daemon stages the executable at `/run/tv-auth/ui-bin/tv-auth-ui` (see
@@ -482,7 +482,6 @@ impl Ui {
         }
         self.store.busy = true;
         self.grab_back(false);
-        unsafe { evas_object_hide(self.window) };
         true
     }
 

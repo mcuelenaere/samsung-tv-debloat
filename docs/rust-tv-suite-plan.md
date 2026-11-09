@@ -346,13 +346,13 @@ re-sign → WAS → Home row) and a removal of `DvNullSh01` from the store, and
 the Permissions tab, all through injected remote keys and checked with
 `enlightenment_info -dump_screen`.
 
-Found while validating: **the Phase 2 popup never gets the TOP notification
-layer**. efl_util accepts the request, but the compositor places the
-systemd-started popup's prompt in `E_LAYER_CLIENT_ABOVE` (toast in
-`NOTIFICATION_LOW`), so notification-layer windows can cover it. The manager
-works around this by hiding itself during a change. Fixing it (e20's level
-policy for non-AUL clients) is open, and until then the consent prompt is
-less robust against overlays than the pre-Phase-2 AUL-launched UI.
+Found while validating, and fixed: **no prompt had ever been in the TOP
+notification layer**, including the managed and native UIs before Phase 2.
+`tv-efl` (copied from the managed UI) sent notification levels 1–4, but
+efl_util's values are `DEFAULT=10 … TOP=40`, and e20 puts unknown values in
+`NOTIFICATION_LOW`; the prompt also set floating mode, which e20 places in
+`E_LAYER_CLIENT_ABOVE`. With both fixed, prompts and toasts are at layer 800
+and the manager at 650, so the prompt covers the store while it asks.
 
 Not done: progress percentages for downloads (a status line only), the
 `pkgid` renaming the Apps2Samsung TV-Store applies to colliding community

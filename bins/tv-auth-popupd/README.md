@@ -12,16 +12,15 @@ heuristic, and launch retry/cooldown state in the daemon).
   before the first window and ~13 MB after.
 - `ui.prompt`: full-screen modal, BACK grabbed only while it is shown.
 
-**Known limitation (2026-11-09):** `efl_util_set_notification_window_level`
-returns success for this systemd-started process, but the compositor does not
-honour it: `enlightenment_info -topvwins` shows the prompt in
-`E_LAYER_CLIENT_ABOVE` and the toast in `NOTIFICATION_LOW`, so any
-notification-layer window (Samsung overlays, the `org.tvauth.ui` manager) can
-cover the prompt. The old AUL-launched UI did get TOP. The level is re-applied
-on every show (it is dropped on unmap anyway), and the manager hides itself
-while it waits on a prompt. Getting real TOP for a non-AUL client needs a look
-at e20's level policy; until then this is weaker than the pre-Phase-2 UI.
-- `ui.notice`: a focus-skipping toast that never grabs keys.
+**Notification levels (fixed 2026-11-09):** the prompt and the toast are at
+`E_LAYER_CLIENT_NOTIFICATION_TOP` (layer 800). Two bugs, both inherited from
+the managed UI, had kept every earlier prompt lower: `tv-efl` sent
+`set_notification_level` values 1–4, but `efl_util_notification_level_e` is
+`DEFAULT=10 … TOP=40` and e20 maps unknown values to `NOTIFICATION_LOW`; and
+`elm_win_floating_mode_set` moves a window to `E_LAYER_CLIENT_ABOVE` whatever
+its level. e20 does not care whether the client was launched by AUL. Check the
+layer with `enlightenment_info -connected_clients` (and the real screen with
+`enlightenment_info -dump_screen`).
 
 ## Behavior
 
@@ -31,7 +30,7 @@ When an app without a persistent grant connects, the daemon sends a
 `ui.prompt` frame to the attached popup, which:
 
 - raises a full-screen notification-type EFL window (requesting notification
-  level TOP, then HIGH, MEDIUM, DEFAULT; see the limitation above) with a dimmed scrim and a solid centered card;
+  level TOP, then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card;
 - displays the exact package ID and SMACK label from the daemon, plus the
   daemon-generated **FULL ROOT ACCESS** warning;
 - displays a sanitized display copy of the command (long commands are
@@ -117,9 +116,8 @@ the `window.priority.set` privilege for the label. The log is
 ## Validation (tv-living, 2026-11-09)
 
 - A standalone overlay probe (`crates/tv-efl/examples/overlay-probe.rs`) under
-  `systemd-run` with this identity created a notification window (efl_util
-  returned `0` for TOP, but see the limitation above) and set/unset the
-  XF86Back keygrab.
+  `systemd-run` with this identity created a notification window and set/unset
+  the XF86Back keygrab.
 - The unit started as uid 5001 with `User::Pkg::org.tvauth.ui`, mapped
   `/run/opt/tv-auth/tv-auth-popupd`, and registered with both the previous and
   the new daemon; after a `tv-authd` restart it re-attached within 2 s.
@@ -132,3 +130,6 @@ the `window.priority.set` privilege for the label. The log is
   `id` ran as root. **Always allow** was not exercised (it would persist a
   grant).
 - Idle CPU stayed at 0 ticks over 10 s after a prompt.
+- After the level fix: two consecutive prompts and two toasts each at layer
+  800; a store install prompt stacked over the manager (layer 650) on the
+  composited screen, and an injected BACK reached the prompt (`user_denied`).

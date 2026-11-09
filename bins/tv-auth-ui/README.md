@@ -75,9 +75,10 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   the package's main app through `app_control`.
 - Icons are fetched for the visible page only, hash-checked, and cached in
   `/tmp/tv-store/icons/`.
-- While a change waits for approval the manager hides itself and releases
-  BACK, then comes back with the result: the popup's prompt is not stacked
-  above notification windows (see the popup README's known limitation).
+- The manager is a notification window at the lowest level (`DEFAULT`,
+  layer 650), so the popup's TOP-level prompt (800) covers it. While a change
+  waits for approval it releases its BACK keygrab; the result then shows in
+  its status line.
 
 ### Permissions
 

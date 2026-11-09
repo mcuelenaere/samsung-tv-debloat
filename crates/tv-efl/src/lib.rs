@@ -24,10 +24,13 @@ pub const ELM_WIN_NOTIFICATION: c_int = 11;
 pub const EEXT_CALLBACK_BACK: c_int = 0;
 pub const ECORE_WL2_WINDOW_TYPE_NOTIFICATION: c_int = 5;
 pub const ELM_WRAP_WORD: c_int = 2;
-pub const NOTIFICATION_TOP: c_int = 4;
-pub const NOTIFICATION_HIGH: c_int = 3;
-pub const NOTIFICATION_MEDIUM: c_int = 2;
-pub const NOTIFICATION_DEFAULT: c_int = 1;
+/// `efl_util_notification_level_e`. These go to e20 unchanged; anything else
+/// (the deprecated 0-2, or the 1-4 this crate used to send) lands in
+/// E_LAYER_CLIENT_NOTIFICATION_LOW or NORMAL, below Samsung's own overlays.
+pub const NOTIFICATION_TOP: c_int = 40;
+pub const NOTIFICATION_HIGH: c_int = 30;
+pub const NOTIFICATION_MEDIUM: c_int = 20;
+pub const NOTIFICATION_DEFAULT: c_int = 10;
 
 #[repr(C)]
 pub struct UiAppLifecycleCallback {
@@ -71,7 +74,6 @@ extern "C" {
     pub fn elm_win_activate(window: *mut c_void);
     pub fn elm_win_raise(window: *mut c_void);
     pub fn elm_win_modal_set(window: *mut c_void, modal: EinaBool);
-    pub fn elm_win_floating_mode_set(window: *mut c_void, floating: EinaBool);
     pub fn elm_win_wl_window_get(window: *mut c_void) -> *mut c_void;
     pub fn elm_win_alpha_set(window: *mut c_void, alpha: EinaBool);
     pub fn elm_win_prop_focus_skip_set(window: *mut c_void, skip: EinaBool);
