@@ -61,20 +61,30 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   libcrypto against the Apps2Samsung key pinned in `src/store.rs` (the one
   their TV-Store pins), and rejects a catalog older than 7 days or dated more
   than an hour ahead.
-- Lists one row per installable file (community catalog entries plus every
-  asset of each release provider's latest release), sorted by name, in one
-  scrolling list: rows are appended 16 at a time as focus nears the end, and
-  the scroller follows focus. A category dropdown (`elm_hoversel`) filters
-  it. Adult entries, non-HTTPS URLs, entries without a
+- Lists one row per app (135 today): community entries grouped by their
+  `group` (variants become builds), and each release provider's latest
+  release as one app whose assets are its builds. Apps with several builds
+  show "N builds" and a **Show builds** toggle that expands them inline.
+  Installed apps sort first, then by name; the order stays put until the
+  filter changes. One scrolling list: rows are appended 16 at a time as
+  focus nears the end, and the scroller follows focus.
+- A search field (`elm_entry`; OK opens the TV keyboard) filters by name,
+  description, build name and package id as you type; a category dropdown
+  (`elm_hoversel`) filters by category. Adult entries, non-HTTPS URLs, entries without a
   SHA-256, and apps needing Tizen > 6.5 are left out; Partner-level apps are
   labelled.
 - Matches `package_id`/`package_version` against `pkg.list`: **Install**,
   **Update** (`vX → vY`), or **Open** + **Remove**.
+- A progress bar next to the status line fills while a package downloads
+  and pulses while the prompt and the installer run.
+- After a change only the visible rows are rebuilt in place, so the
+  selection and scroll position survive.
 - Install: downloads to `/tmp/tv-store/<pkgid>.<wgt|tpk>` on a worker thread,
   keeps it only if size and SHA-256 match the signed catalog, then sends
   `pkg.install`. `tv-authd` stages and re-signs it and asks the user on the
   popup's prompt. Remove sends `pkg.uninstall` (also prompted). Open launches
-  the package's main app through `app_control`.
+  the package's main app through `app_control` (needs the
+  `appmanager.launch` privilege; without it launches fail with -13).
 - Icons are fetched as rows are appended, hash-checked, cached in
   `/tmp/tv-store/icons/`, and swapped into their row in place.
 - The window is an ordinary app toplevel (`E_LAYER_CLIENT_NORMAL`, layer 200).

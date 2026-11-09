@@ -381,3 +381,12 @@ lines.
   removes WGTs by application id (TPKs keep the package id) and the fallback
   removes icon folders under both ids. Stale entries from before the fix were
   cleared with `wascmd -u <pkgid>`.
+- **Store list, round 2:** apps are grouped (135 apps from 234 files; the
+  Jellyfin release providers carry 40 and 25 builds) with inline build
+  lists, installed apps sort first, a search field filters as you type (the
+  TV keyboard works with the entry), a progress bar tracks downloads, rows
+  update in place after changes so selection survives, and the manifest
+  gained `appmanager.launch` so **Open** stops failing with
+  `APP_CONTROL_ERROR_PERMISSION_DENIED` (-13). A scrollable `elm_entry`
+  recomputes its own minimum size on every change, so it sits in a table
+  cell sized by a fixed rectangle.

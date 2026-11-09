@@ -118,6 +118,16 @@ extern "C" {
         part: *const c_char,
         content: *mut c_void,
     );
+    pub fn elm_box_pack_after(object: *mut c_void, child: *mut c_void, after: *mut c_void);
+    pub fn elm_box_unpack(object: *mut c_void, child: *mut c_void);
+    pub fn elm_progressbar_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_progressbar_value_set(object: *mut c_void, value: c_double);
+    pub fn elm_progressbar_pulse_set(object: *mut c_void, pulse: EinaBool);
+    pub fn elm_progressbar_pulse(object: *mut c_void, state: EinaBool);
+    pub fn elm_entry_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_entry_single_line_set(object: *mut c_void, single_line: EinaBool);
+    pub fn elm_entry_scrollable_set(object: *mut c_void, scrollable: EinaBool);
+    pub fn elm_object_part_text_get(object: *const c_void, part: *const c_char) -> *const c_char;
     pub fn elm_scroller_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_scroller_policy_set(scroller: *mut c_void, horizontal: c_int, vertical: c_int);
     pub fn elm_scroller_bounce_set(scroller: *mut c_void, horizontal: EinaBool, vertical: EinaBool);

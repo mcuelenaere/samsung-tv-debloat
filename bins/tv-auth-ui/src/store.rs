@@ -37,6 +37,11 @@ pub const TIZEN_VERSION: &str = "6.5";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
     pub name: String,
+    /// The app this file is a build of (rows group by it).
+    pub group: String,
+    /// What distinguishes this build within its group (empty if it is the
+    /// only one the catalog describes that way).
+    pub variant: String,
     pub description: String,
     pub category: String,
     pub package_id: String,
@@ -229,22 +234,39 @@ pub fn apps(payload: &[u8], now: i64) -> Result<Vec<App>, String> {
                         &entry.category
                     };
                     let partner = entry.cert_level.eq_ignore_ascii_case("partner");
-                    apps.extend(app(asset, name, &entry.description, category, partner));
+                    let (group, variant) = if entry.group.is_empty() {
+                        (name.clone(), String::new())
+                    } else {
+                        (entry.group.clone(), entry.variant.clone())
+                    };
+                    apps.extend(app(asset, name, &entry.description, category, partner).map(
+                        |app| App {
+                            group,
+                            variant,
+                            ..app
+                        },
+                    ));
                 }
             }
             None => {
                 let title = if provider.display_name.is_empty() {
-                    &provider.id
+                    title_case(&provider.id)
                 } else {
-                    &provider.display_name
+                    provider.display_name.clone()
                 };
                 for asset in &release.assets {
                     let stem = asset
                         .name
                         .rsplit_once('.')
                         .map_or(asset.name.as_str(), |(stem, _)| stem);
-                    let description = format!("{title} {}", release.tag_name);
-                    apps.extend(app(asset, stem.to_owned(), &description, "media", false));
+                    let description = format!("{title} release {}", release.tag_name);
+                    apps.extend(
+                        app(asset, stem.to_owned(), &description, "media", false).map(|app| App {
+                            group: title.clone(),
+                            variant: stem.to_owned(),
+                            ..app
+                        }),
+                    );
                 }
             }
         }
@@ -276,6 +298,8 @@ fn app(
         .then(|| hex_digest(&asset.icon_digest).map(|digest| (asset.icon.clone(), digest)))
         .flatten();
     Some(App {
+        group: name.clone(),
+        variant: String::new(),
         name,
         description: description.to_owned(),
         category: category.to_owned(),
@@ -288,6 +312,103 @@ fn app(
         icon,
         partner,
     })
+}
+
+/// `jellyfin-tizen-builds` → `Jellyfin Tizen Builds`.
+fn title_case(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or(String::new(), |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// All builds of one app, as the store lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    /// Icon URL and SHA-256 of the first build that has one.
+    pub icon: Option<(String, String)>,
+    /// Sorted by name.
+    pub variants: Vec<App>,
+}
+
+impl Group {
+    /// Whether any build's package is installed.
+    pub fn installed(&self, installed: &HashMap<String, String>) -> bool {
+        self.variants
+            .iter()
+            .any(|app| installed.contains_key(&app.package_id))
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let contains = |text: &str| text.to_lowercase().contains(query);
+        query.is_empty()
+            || contains(&self.name)
+            || contains(&self.description)
+            || self
+                .variants
+                .iter()
+                .any(|app| contains(&app.variant) || contains(&app.package_id))
+    }
+}
+
+/// Collect builds into groups, in first-seen order.
+pub fn groups(apps: Vec<App>) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for app in apps {
+        let slot = *index.entry(app.group.clone()).or_insert_with(|| {
+            groups.push(Group {
+                name: app.group.clone(),
+                description: app.description.clone(),
+                category: app.category.clone(),
+                icon: None,
+                variants: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        let group = &mut groups[slot];
+        if group.icon.is_none() {
+            group.icon = app.icon.clone();
+        }
+        group.variants.push(app);
+    }
+    for group in &mut groups {
+        group
+            .variants
+            .sort_by_key(|app| (app.variant.to_lowercase(), app.name.to_lowercase()));
+    }
+    groups
+}
+
+/// Indices of the groups to list: in `category` (empty = all) and matching
+/// `query` (case-insensitive substring), installed ones first, then by name.
+pub fn arrange(
+    groups: &[Group],
+    installed: &HashMap<String, String>,
+    category: &str,
+    query: &str,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let mut indices: Vec<usize> = (0..groups.len())
+        .filter(|&index| category.is_empty() || groups[index].category == category)
+        .filter(|&index| groups[index].matches(&query))
+        .collect();
+    indices.sort_by_key(|&index| {
+        (
+            !groups[index].installed(installed),
+            groups[index].name.to_lowercase(),
+        )
+    });
+    indices
 }
 
 /// `sha256:<64 hex>` → lower-case hex.
@@ -410,14 +531,89 @@ mod tests {
         let apps = apps(&catalog("2026-11-09T20:53:47.6130349+00:00"), NOW).unwrap();
         let names: Vec<&str> = apps.iter().map(|app| app.name.as_str()).collect();
         assert_eq!(names, ["Group (Tizen 6)", "Jellyfin-A", "Zed"]);
+        assert_eq!(
+            (apps[0].group.as_str(), apps[0].variant.as_str()),
+            ("Group", "Tizen 6")
+        );
+        assert_eq!(
+            (apps[1].group.as_str(), apps[1].variant.as_str()),
+            ("Jellyfin", "Jellyfin-A")
+        );
+        assert_eq!(
+            (apps[2].group.as_str(), apps[2].variant.as_str()),
+            ("Zed", "")
+        );
         let group = &apps[0];
         assert!(group.partner);
         assert_eq!(group.pkg_type, "tpk");
         let jellyfin = &apps[1];
-        assert_eq!(jellyfin.description, "jellyfin t2");
+        assert_eq!(jellyfin.description, "Jellyfin release t2");
         assert_eq!(jellyfin.sha256, "ab".repeat(32));
         assert_eq!(jellyfin.icon.as_ref().unwrap().1, "cd".repeat(32));
         assert_eq!(apps[2].category, "games");
+    }
+
+    fn build(group: &str, variant: &str, package_id: &str, category: &str) -> App {
+        App {
+            name: format!("{group} {variant}"),
+            group: group.into(),
+            variant: variant.into(),
+            description: format!("about {group}"),
+            category: category.into(),
+            package_id: package_id.into(),
+            version: "1.0".into(),
+            pkg_type: "wgt".into(),
+            url: String::new(),
+            size: 1,
+            sha256: String::new(),
+            icon: None,
+            partner: false,
+        }
+    }
+
+    #[test]
+    fn groups_sorts_and_filters() {
+        let groups = groups(vec![
+            build("Zed", "", "Zed", "games"),
+            build("Jellyfin", "B", "Jelly", "media"),
+            build("Alpha", "", "Alpha", "media"),
+            build("Jellyfin", "A", "Jelly", "media"),
+        ]);
+        assert_eq!(groups.len(), 3);
+        let jellyfin = &groups[1];
+        let variants: Vec<&str> = jellyfin
+            .variants
+            .iter()
+            .map(|app| app.variant.as_str())
+            .collect();
+        assert_eq!(variants, ["A", "B"]);
+
+        let names = |indices: Vec<usize>| -> Vec<String> {
+            indices
+                .into_iter()
+                .map(|index| groups[index].name.clone())
+                .collect()
+        };
+        let mut installed = HashMap::new();
+        assert_eq!(
+            names(arrange(&groups, &installed, "", "")),
+            ["Alpha", "Jellyfin", "Zed"]
+        );
+        installed.insert("Zed".to_owned(), "1.0".to_owned());
+        assert_eq!(
+            names(arrange(&groups, &installed, "", "")),
+            ["Zed", "Alpha", "Jellyfin"]
+        );
+        assert_eq!(
+            names(arrange(&groups, &installed, "media", "")),
+            ["Alpha", "Jellyfin"]
+        );
+        assert_eq!(
+            names(arrange(&groups, &installed, "", " JELLY ")),
+            ["Jellyfin"]
+        );
+        assert_eq!(names(arrange(&groups, &installed, "", "about z")), ["Zed"]);
+        assert_eq!(title_case("jellyfin-tizen-builds"), "Jellyfin Tizen Builds");
     }
 
     #[test]
@@ -473,9 +669,17 @@ mod tests {
         let apps = apps(payload, parse_rfc3339(&generated.generated_at).unwrap()).unwrap();
         let installable = apps.len();
         let icons = apps.iter().filter(|app| app.icon.is_some()).count();
+        eprintln!("{installable} apps, {icons} with icons");
+        let groups = groups(apps);
+        let mut sizes: Vec<(usize, &str)> = groups
+            .iter()
+            .map(|group| (group.variants.len(), group.name.as_str()))
+            .collect();
+        sizes.sort();
         eprintln!(
-            "{installable} apps, {icons} with icons, first {:?}",
-            apps.first()
+            "{} groups, largest {:?}",
+            groups.len(),
+            &sizes[sizes.len() - 6..]
         );
         assert!(installable > 100);
     }

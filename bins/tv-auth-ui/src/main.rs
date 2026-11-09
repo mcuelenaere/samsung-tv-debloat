@@ -31,8 +31,9 @@ use std::ptr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tv_auth_ui::store::{self, App, State};
+use tv_auth_ui::store::{self, App, Group, State};
 use tv_efl::log::log_line;
 use tv_efl::widgets::*;
 use tv_efl::*;
@@ -43,6 +44,7 @@ use tv_proto::DEFAULT_SOCKET;
 
 const COLOR_BACKGROUND: i32 = 0x10_12_17;
 const COLOR_ROW: i32 = 0x1c_1f_26;
+const COLOR_BUILD_ROW: i32 = 0x16_19_1f;
 /// Rows are appended in chunks as focus approaches the end of the list.
 const CHUNK_ROWS: usize = 16;
 const LOOKAHEAD_ROWS: usize = 6;
@@ -67,6 +69,8 @@ const CATEGORIES: &[(&str, &str)] = &[
 const APP_ID: &[u8] = b"org.tvauth.ui\0";
 const DELETE_REQUEST: &[u8] = b"delete,request\0";
 const FOCUSED: &[u8] = b"focused\0";
+const CHANGED_USER: &[u8] = b"changed,user\0";
+const GUIDE_PART: &[u8] = b"elm.guide\0";
 
 thread_local! {
     static UI_PTR: Cell<*mut Ui> = const { Cell::new(ptr::null_mut()) };
@@ -93,6 +97,8 @@ enum Job {
     /// An icon with this SHA-256 is now cached.
     Icon(String),
     Status(String),
+    /// Download fraction, or `None` while waiting on the prompt/installer.
+    Progress(Option<f64>),
     Finished(Result<String, String>),
     Audit(Vec<String>),
 }
@@ -105,31 +111,47 @@ struct Installed {
 
 #[derive(Default)]
 struct Store {
-    apps: Vec<App>,
+    groups: Vec<Group>,
     installed: HashMap<String, Installed>,
     loaded: bool,
+    /// The list has been arranged once with the installed packages known.
+    arranged: bool,
     category: usize,
-    /// Row that last had focus, kept across re-renders.
-    focus_row: usize,
+    query: String,
+    /// Groups whose builds are shown, by name.
+    expanded: HashSet<String>,
+    /// Row key that last had focus, kept across in-place updates.
+    focus_key: Option<usize>,
     busy: bool,
     icons_requested: HashSet<String>,
 }
 
 impl Store {
-    fn visible(&self) -> Vec<&App> {
-        let category = CATEGORIES[self.category].0;
-        self.apps
-            .iter()
-            .filter(|app| category.is_empty() || app.category == category)
-            .collect()
-    }
-
     fn versions(&self) -> HashMap<String, String> {
         self.installed
             .iter()
             .map(|(pkgid, installed)| (pkgid.clone(), installed.version.clone()))
             .collect()
     }
+}
+
+/// A list row is keyed by its group and build: `(group << 8 | slot) + 1`,
+/// where slot 0 is the group row and `n + 1` its n-th build. The key is also
+/// the button callback data (never 0).
+fn row_key(group: usize, build: Option<usize>) -> usize {
+    ((group << 8) | build.map_or(0, |build| build + 1)) + 1
+}
+
+fn split_key(key: usize) -> (usize, Option<usize>) {
+    let raw = key - 1;
+    (raw >> 8, (raw & 0xff).checked_sub(1))
+}
+
+struct Row {
+    key: usize,
+    widget: *mut c_void,
+    primary: *mut c_void,
+    icon: Option<(String, *mut c_void)>,
 }
 
 struct Ui {
@@ -147,13 +169,14 @@ struct Ui {
     tab: Tab,
     status: String,
     store: Store,
-    /// The listed apps (current category), indexed by button data (row + 1).
-    rows: Vec<App>,
+    /// Keys of every listed row, in order; `rows` holds the rendered prefix.
+    entries: Vec<usize>,
+    rows: Vec<Row>,
     list_box: *mut c_void,
-    rendered: usize,
-    primary_buttons: Vec<*mut c_void>,
-    /// Icon image objects by the SHA-256 they show.
-    row_images: Vec<(String, *mut c_void)>,
+    count_label: *mut c_void,
+    status_row: *mut c_void,
+    progress: *mut c_void,
+    progress_shown: bool,
     grants: Vec<GrantInfo>,
     audit: Vec<String>,
     exiting: bool,
@@ -178,11 +201,13 @@ impl Ui {
             tab: Tab::Store,
             status: String::new(),
             store: Store::default(),
+            entries: Vec::new(),
             rows: Vec::new(),
             list_box: ptr::null_mut(),
-            rendered: 0,
-            primary_buttons: Vec::new(),
-            row_images: Vec::new(),
+            count_label: ptr::null_mut(),
+            status_row: ptr::null_mut(),
+            progress: ptr::null_mut(),
+            progress_shown: false,
             grants: Vec::new(),
             audit: Vec::new(),
             exiting: false,
@@ -248,7 +273,15 @@ impl Ui {
                 ptr::without_provenance_mut(2),
             );
 
-            self.status_label = add_to_box(main, create_label(main, ""));
+            self.status_row = create_row(main);
+            elm_box_pack_end(main, self.status_row);
+            self.status_label = add_to_box(self.status_row, create_label(self.status_row, ""));
+            // Packed into the status row only while a change runs.
+            self.progress = elm_progressbar_add(self.status_row);
+            evas_object_size_hint_min_set(self.progress, 480, 24);
+            evas_object_size_hint_weight_set(self.progress, 0.0, 0.0);
+            evas_object_size_hint_align_set(self.progress, 1.0, 0.5);
+            evas_object_hide(self.progress);
 
             self.content_box = elm_box_add(main);
             evas_object_size_hint_weight_set(self.content_box, 1.0, 1.0);
@@ -371,19 +404,40 @@ impl Ui {
     fn on_job(&mut self, job: Job) -> bool {
         match job {
             Job::Catalog(Ok(apps)) => {
-                self.status = format!("{} apps in the Apps2Samsung catalog.", apps.len());
-                self.store.apps = apps;
+                self.store.groups = store::groups(apps);
+                self.status = format!(
+                    "{} apps in the Apps2Samsung catalog.",
+                    self.store.groups.len()
+                );
                 self.store.loaded = true;
-                self.store.focus_row = 0;
+                self.store.arranged = false;
+                self.store.focus_key = None;
+                // Listed once the installed packages are known, so they
+                // can sort first without the list jumping.
                 self.list_installed();
+                return false;
             }
             Job::Catalog(Err(error)) => {
                 log_line(&format!("catalog: {error}"));
                 self.status = format!("Could not load the catalog: {error}");
             }
-            Job::Installed(Ok(installed)) => self.store.installed = installed,
-            Job::Installed(Err(error)) => {
-                self.status = format!("Could not read installed packages: {error}");
+            Job::Installed(result) => {
+                match result {
+                    Ok(installed) => self.store.installed = installed,
+                    Err(error) => {
+                        self.status = format!("Could not read installed packages: {error}");
+                    }
+                }
+                if !self.store.loaded || self.tab != Tab::Store {
+                    return false;
+                }
+                if !self.store.arranged {
+                    self.store.arranged = true;
+                    return true;
+                }
+                // Keep order, scroll position and focus: rebuild rows in place.
+                self.refresh_rows();
+                return false;
             }
             Job::Icon(digest) => {
                 self.show_icon(&digest);
@@ -393,8 +447,13 @@ impl Ui {
                 self.set_status(message);
                 return false;
             }
+            Job::Progress(fraction) => {
+                self.show_progress(fraction);
+                return false;
+            }
             Job::Finished(result) => {
                 self.store.busy = false;
+                self.hide_progress();
                 self.show();
                 self.set_status(result.unwrap_or_else(|error| error));
                 log_line(&self.status);
@@ -439,9 +498,9 @@ impl Ui {
         });
     }
 
-    fn fetch_icons(&mut self, rows: std::ops::Range<usize>) {
+    fn fetch_icons(&mut self, icons: Vec<(String, String)>) {
         let mut wanted = Vec::new();
-        for (url, digest) in self.rows[rows].iter().filter_map(|app| app.icon.clone()) {
+        for (url, digest) in icons {
             if self.store.icons_requested.insert(digest.clone()) && !icon_path(&digest).exists() {
                 wanted.push((url, digest));
             }
@@ -452,7 +511,7 @@ impl Ui {
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             for (url, digest) in wanted {
-                match fetch_verified(&url, &digest, 1 << 20, &icon_path(&digest)) {
+                match fetch_verified(&url, &digest, 1 << 20, &icon_path(&digest), None) {
                     Ok(_) => {
                         let _ = jobs.send(Job::Icon(digest));
                     }
@@ -475,6 +534,7 @@ impl Ui {
         if !self.start_change() {
             return;
         }
+        self.show_progress(Some(0.0));
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             let _ = jobs.send(Job::Finished(install_app(&app, &jobs)));
@@ -486,6 +546,7 @@ impl Ui {
             return;
         }
         self.set_status(format!("Removing {}: approve it on the prompt.", app.name));
+        self.show_progress(None);
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             let request = json!({"version": 2, "id": "store-uninstall", "method": "pkg.uninstall",
@@ -495,6 +556,39 @@ impl Ui {
                 .map(|()| format!("Removed {}.", app.name));
             let _ = jobs.send(Job::Finished(result));
         });
+    }
+
+    fn show_progress(&mut self, fraction: Option<f64>) {
+        unsafe {
+            if !self.progress_shown {
+                self.progress_shown = true;
+                elm_box_pack_end(self.status_row, self.progress);
+                evas_object_show(self.progress);
+            }
+            match fraction {
+                Some(fraction) => {
+                    elm_progressbar_pulse(self.progress, 0);
+                    elm_progressbar_pulse_set(self.progress, 0);
+                    elm_progressbar_value_set(self.progress, fraction.clamp(0.0, 1.0));
+                }
+                None => {
+                    elm_progressbar_pulse_set(self.progress, 1);
+                    elm_progressbar_pulse(self.progress, 1);
+                }
+            }
+        }
+    }
+
+    fn hide_progress(&mut self) {
+        if !self.progress_shown {
+            return;
+        }
+        self.progress_shown = false;
+        unsafe {
+            elm_progressbar_pulse(self.progress, 0);
+            elm_box_unpack(self.status_row, self.progress);
+            evas_object_hide(self.progress);
+        }
     }
 
     fn open(&mut self, app: &App) {
@@ -527,16 +621,36 @@ impl Ui {
     fn render_store(&mut self) -> *mut c_void {
         let toolbar = create_row(self.content_box);
         self.add_content(toolbar);
-        self.rows = self.store.visible().into_iter().cloned().collect();
-        self.store.focus_row = self.store.focus_row.min(self.rows.len().saturating_sub(1));
-        add_to_box(
-            toolbar,
-            create_label(
-                toolbar,
-                &small(&format!("{} apps", self.rows.len()), "#8a8f99"),
-            ),
-        );
-        let category = unsafe {
+        self.count_label = add_to_box(toolbar, create_label(toolbar, ""));
+        let search = unsafe {
+            // A scrollable entry resets its own minimum size whenever its
+            // text changes (and the toolbar then squeezes it to nothing), so
+            // size the cell with a fixed transparent rectangle instead.
+            let cell = elm_table_add(toolbar);
+            let sizer = create_rect(cell, 0, 0);
+            evas_object_size_hint_min_set(sizer, 460, 72);
+            elm_table_pack(cell, sizer, 0, 0, 1, 1);
+            let entry = elm_entry_add(cell);
+            elm_entry_single_line_set(entry, 1);
+            elm_entry_scrollable_set(entry, 1);
+            let guide = c_string("Search apps");
+            elm_object_part_text_set(entry, GUIDE_PART.as_ptr().cast(), guide.as_ptr());
+            set_text(entry, &escape(&self.store.query));
+            evas_object_size_hint_weight_set(entry, 1.0, 1.0);
+            evas_object_size_hint_align_set(entry, EVAS_HINT_FILL, EVAS_HINT_FILL);
+            evas_object_smart_callback_add(
+                entry,
+                CHANGED_USER.as_ptr().cast(),
+                on_search_changed,
+                ptr::null_mut(),
+            );
+            elm_table_pack(cell, entry, 0, 0, 1, 1);
+            evas_object_show(entry);
+            evas_object_show(cell);
+            elm_box_pack_end(toolbar, cell);
+            entry
+        };
+        unsafe {
             let hoversel = elm_hoversel_add(toolbar);
             elm_hoversel_hover_parent_set(hoversel, self.window);
             set_text(
@@ -557,8 +671,7 @@ impl Ui {
             evas_object_size_hint_min_set(hoversel, 340, 72);
             elm_box_pack_end(toolbar, hoversel);
             evas_object_show(hoversel);
-            hoversel
-        };
+        }
         create_button(toolbar, "Reload", on_reload_clicked, ptr::null_mut());
 
         unsafe {
@@ -576,132 +689,334 @@ impl Ui {
             evas_object_show(scroller);
             self.add_content(scroller);
         }
-        self.rendered = 0;
-        self.primary_buttons.clear();
-        self.row_images.clear();
-        self.append_rows(self.store.focus_row + CHUNK_ROWS);
-        if self.rows.is_empty() && self.store.loaded {
-            add_to_box(
-                self.list_box,
-                create_label(
-                    self.list_box,
-                    &small("No apps in this category.", "#8a8f99"),
-                ),
-            );
-        }
-        self.primary_buttons
-            .get(self.store.focus_row)
-            .copied()
-            .unwrap_or(category)
+        self.rows.clear();
+        self.rebuild_list();
+        let focus = self
+            .store
+            .focus_key
+            .and_then(|key| self.rows.iter().find(|row| row.key == key))
+            .or_else(|| self.rows.first())
+            .map(|row| row.primary);
+        focus.unwrap_or(search)
     }
 
-    /// Append rows up to `upto` (exclusive) to the store list.
-    fn append_rows(&mut self, upto: usize) {
-        let start = self.rendered;
-        let end = upto.min(self.rows.len());
-        if start >= end {
+    /// (Re)list the arranged groups for the current category and search,
+    /// keeping the toolbar (and its focus) intact.
+    fn rebuild_list(&mut self) {
+        for row in self.rows.drain(..) {
+            unsafe { evas_object_del(row.widget) };
+        }
+        if self.list_box.is_null() {
             return;
         }
-        let versions = self.store.versions();
-        for index in start..end {
-            let app = self.rows[index].clone();
-            let (row, row_box) = panel(self.list_box, COLOR_ROW, 24, 12);
-            unsafe {
-                elm_box_pack_end(self.list_box, row);
-                elm_box_horizontal_set(row_box, 1);
-                elm_box_padding_set(row_box, 24, 0);
+        let order = store::arrange(
+            &self.store.groups,
+            &self.store.versions(),
+            CATEGORIES[self.store.category].0,
+            &self.store.query,
+        );
+        self.entries.clear();
+        for &group in &order {
+            self.entries.push(row_key(group, None));
+            if self.store.expanded.contains(&self.store.groups[group].name) {
+                for build in 0..self.store.groups[group].variants.len() {
+                    self.entries.push(row_key(group, Some(build)));
+                }
             }
-            add_to_box(row_box, self.icon(row_box, &app));
+        }
+        set_text(
+            self.count_label,
+            &small(&format!("{} apps", order.len()), "#8a8f99"),
+        );
+        let focus = self
+            .store
+            .focus_key
+            .and_then(|key| self.entries.iter().position(|&entry| entry == key))
+            .unwrap_or(0);
+        self.append_rows(focus + CHUNK_ROWS);
+        if self.entries.is_empty() && self.store.loaded {
+            let label = create_label(self.list_box, &small("No apps match.", "#8a8f99"));
+            add_to_box(self.list_box, label);
+            self.rows.push(Row {
+                key: 0,
+                widget: label,
+                primary: ptr::null_mut(),
+                icon: None,
+            });
+        }
+    }
 
-            let state = store::state(&app, &versions);
-            let state_text = match &state {
-                State::NotInstalled => format!("v{}", app.version),
-                State::Installed => format!("v{} \u{00b7} installed", app.version),
-                State::Upgradable { installed } => {
-                    format!("v{installed} \u{2192} v{}", app.version)
-                }
-                State::Newer { installed } => {
-                    format!("v{installed} installed (catalog v{})", app.version)
-                }
-            };
-            let mut facts = vec![
-                state_text,
-                app.pkg_type.to_uppercase(),
-                format_size(app.size),
-            ];
-            if app.partner {
-                facts.push("partner".into());
+    /// Render entries up to `upto` (exclusive) at the end of the list.
+    fn append_rows(&mut self, upto: usize) {
+        let end = upto.min(self.entries.len());
+        let mut icons = Vec::new();
+        while self.rows.len() < end {
+            let key = self.entries[self.rows.len()];
+            let row = self.build_row(key, ptr::null_mut());
+            icons.extend(self.row_icon(key));
+            self.rows.push(row);
+        }
+        self.fetch_icons(icons);
+    }
+
+    fn row_icon(&self, key: usize) -> Option<(String, String)> {
+        let (group, build) = split_key(key);
+        match build {
+            None => self.store.groups[group].icon.clone(),
+            Some(_) => None,
+        }
+    }
+
+    /// The single app behind a row: a build row, or a group with one build.
+    fn row_app(&self, key: usize) -> Option<&App> {
+        let (group, build) = split_key(key);
+        let variants = &self.store.groups.get(group)?.variants;
+        match build {
+            Some(build) => variants.get(build),
+            None if variants.len() == 1 => variants.first(),
+            None => None,
+        }
+    }
+
+    /// Build one row and pack it after `after` (or at the end when null).
+    fn build_row(&mut self, key: usize, after: *mut c_void) -> Row {
+        let (group_index, build) = split_key(key);
+        let group = self.store.groups[group_index].clone();
+        let versions = self.store.versions();
+        let (row, row_box) = panel(
+            self.list_box,
+            if build.is_some() {
+                COLOR_BUILD_ROW
+            } else {
+                COLOR_ROW
+            },
+            24,
+            if build.is_some() { 8 } else { 12 },
+        );
+        unsafe {
+            if after.is_null() {
+                elm_box_pack_end(self.list_box, row);
+            } else {
+                elm_box_pack_after(self.list_box, row, after);
             }
-            add_to_box(
-                row_box,
-                create_label(
-                    row_box,
-                    &format!(
+            elm_box_horizontal_set(row_box, 1);
+            elm_box_padding_set(row_box, 24, 0);
+        }
+        let mut icon = None;
+        if build.is_none() {
+            let image = unsafe {
+                let image = elm_image_add(row_box);
+                evas_object_size_hint_min_set(image, ICON_SIZE, ICON_SIZE);
+                evas_object_show(image);
+                image
+            };
+            if let Some((_, digest)) = &group.icon {
+                set_image_file(image, &icon_path(digest));
+                icon = Some((digest.clone(), image));
+            }
+            add_to_box(row_box, image);
+        } else {
+            // Indent builds under their app.
+            let spacer = create_rect(row_box, COLOR_BUILD_ROW, 255);
+            unsafe { evas_object_size_hint_min_set(spacer, ICON_SIZE, 1) };
+            add_to_box(row_box, spacer);
+        }
+
+        let data = ptr::without_provenance_mut(key);
+        let mut buttons = Vec::new();
+        match self.row_app(key).cloned() {
+            Some(app) => {
+                let state = store::state(&app, &versions);
+                let mut facts = vec![
+                    state_text(&app, &state),
+                    app.pkg_type.to_uppercase(),
+                    format_size(app.size),
+                ];
+                if app.partner {
+                    facts.push("partner".into());
+                }
+                let markup = if build.is_some() {
+                    let title = if app.variant.is_empty() {
+                        &app.name
+                    } else {
+                        &app.variant
+                    };
+                    format!(
+                        "<font_size=24><b>{}</b></font_size>  {}",
+                        escape(&shorten(title, 60, false)),
+                        small(&facts.join(" \u{00b7} "), "#8a8f99")
+                    )
+                } else {
+                    format!(
                         "<font_size=28><b>{}</b></font_size>  {}<br/>{}",
-                        escape(&shorten(&app.name, 48, false)),
+                        escape(&shorten(&group.name, 48, false)),
                         small(&facts.join(" \u{00b7} "), "#8a8f99"),
                         small(
-                            &shorten(&app.description, DESCRIPTION_CHARS, false),
+                            &shorten(&group.description, DESCRIPTION_CHARS, false),
                             "#b4b9c2"
                         )
+                    )
+                };
+                add_to_box(row_box, create_label(row_box, &markup));
+                buttons.push(match state {
+                    State::NotInstalled => {
+                        create_button(row_box, "Install", on_install_clicked, data)
+                    }
+                    State::Upgradable { .. } => {
+                        create_button(row_box, "Update", on_install_clicked, data)
+                    }
+                    State::Installed | State::Newer { .. } => {
+                        create_button(row_box, "Open", on_open_clicked, data)
+                    }
+                });
+                if !matches!(state, State::NotInstalled) {
+                    buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
+                }
+            }
+            None => {
+                // An app with several builds: a summary and a toggle.
+                let installed = group
+                    .variants
+                    .iter()
+                    .find_map(|app| versions.get(&app.package_id));
+                let mut facts = vec![format!("{} builds", group.variants.len())];
+                if let Some(version) = installed {
+                    facts.push(format!("v{version} installed"));
+                }
+                add_to_box(
+                    row_box,
+                    create_label(
+                        row_box,
+                        &format!(
+                            "<font_size=28><b>{}</b></font_size>  {}<br/>{}",
+                            escape(&shorten(&group.name, 48, false)),
+                            small(&facts.join(" \u{00b7} "), "#8a8f99"),
+                            small(
+                                &shorten(&group.description, DESCRIPTION_CHARS, false),
+                                "#b4b9c2"
+                            )
+                        ),
                     ),
-                ),
-            );
-
-            let data = ptr::without_provenance_mut(index + 1);
-            let mut buttons = vec![match state {
-                State::NotInstalled => create_button(row_box, "Install", on_install_clicked, data),
-                State::Upgradable { .. } => {
-                    create_button(row_box, "Update", on_install_clicked, data)
-                }
-                State::Installed | State::Newer { .. } => {
-                    create_button(row_box, "Open", on_open_clicked, data)
-                }
-            }];
-            if !matches!(state, State::NotInstalled) {
-                buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
-            }
-            for button in &buttons {
-                unsafe {
-                    evas_object_smart_callback_add(
-                        *button,
-                        FOCUSED.as_ptr().cast(),
-                        on_row_focused,
-                        data,
-                    );
+                );
+                let expanded = self.store.expanded.contains(&group.name);
+                buttons.push(create_button(
+                    row_box,
+                    if expanded {
+                        "Hide builds"
+                    } else {
+                        "Show builds"
+                    },
+                    on_builds_clicked,
+                    data,
+                ));
+                if installed.is_some() {
+                    buttons.push(create_button(row_box, "Open", on_open_clicked, data));
                 }
             }
-            self.primary_buttons.push(buttons[0]);
         }
-        self.rendered = end;
-        self.fetch_icons(start..end);
+        for button in &buttons {
+            unsafe {
+                evas_object_smart_callback_add(
+                    *button,
+                    FOCUSED.as_ptr().cast(),
+                    on_row_focused,
+                    data,
+                );
+            }
+        }
+        Row {
+            key,
+            widget: row,
+            primary: buttons[0],
+            icon,
+        }
+    }
+
+    /// Re-create every rendered row in place (states changed), keeping the
+    /// order, scroll position and focus.
+    fn refresh_rows(&mut self) {
+        for index in 0..self.rows.len() {
+            let old_key = self.rows[index].key;
+            if old_key == 0 {
+                continue;
+            }
+            let old = self.rows[index].widget;
+            let row = self.build_row(old_key, old);
+            let focused = self.store.focus_key == Some(old_key);
+            unsafe {
+                evas_object_del(old);
+                if focused {
+                    elm_object_focus_set(row.primary, 1);
+                }
+            }
+            self.rows[index] = row;
+        }
+    }
+
+    /// Show or hide a group's builds right below its row.
+    fn toggle_builds(&mut self, key: usize) {
+        let (group, _) = split_key(key);
+        let Some(position) = self.entries.iter().position(|&entry| entry == key) else {
+            return;
+        };
+        let name = self.store.groups[group].name.clone();
+        let count = self.store.groups[group].variants.len();
+        if self.store.expanded.remove(&name) {
+            self.entries.drain(position + 1..position + 1 + count);
+            let rendered = self.rows.len().min(position + 1 + count);
+            if rendered > position + 1 {
+                for row in self.rows.drain(position + 1..rendered) {
+                    unsafe { evas_object_del(row.widget) };
+                }
+            }
+        } else {
+            self.store.expanded.insert(name);
+            let keys: Vec<usize> = (0..count)
+                .map(|build| row_key(group, Some(build)))
+                .collect();
+            self.entries
+                .splice(position + 1..position + 1, keys.iter().copied());
+            if position < self.rows.len() {
+                let mut after = self.rows[position].widget;
+                for (offset, &build_key) in keys.iter().enumerate() {
+                    let row = self.build_row(build_key, after);
+                    after = row.widget;
+                    self.rows.insert(position + 1 + offset, row);
+                }
+            }
+        }
+        // The toggle's label changed; rebuild the group row itself.
+        if position < self.rows.len() {
+            let old = self.rows[position].widget;
+            let row = self.build_row(key, old);
+            unsafe {
+                evas_object_del(old);
+                elm_object_focus_set(row.primary, 1);
+            }
+            self.rows[position] = row;
+        }
     }
 
     /// Focus moved to a row: remember it, and extend the list before the
     /// user reaches its end.
-    fn row_focused(&mut self, index: usize) {
-        self.store.focus_row = index;
-        if index + LOOKAHEAD_ROWS >= self.rendered {
-            self.append_rows(self.rendered + CHUNK_ROWS);
-        }
-    }
-
-    fn icon(&mut self, parent: *mut c_void, app: &App) -> *mut c_void {
-        unsafe {
-            let image = elm_image_add(parent);
-            evas_object_size_hint_min_set(image, ICON_SIZE, ICON_SIZE);
-            evas_object_show(image);
-            if let Some((_, digest)) = &app.icon {
-                set_image_file(image, &icon_path(digest));
-                self.row_images.push((digest.clone(), image));
+    fn row_focused(&mut self, key: usize) {
+        self.store.focus_key = Some(key);
+        let rendered = self.rows.len();
+        if let Some(position) = self.entries.iter().position(|&entry| entry == key) {
+            if position + LOOKAHEAD_ROWS >= rendered {
+                self.append_rows(rendered + CHUNK_ROWS);
             }
-            image
         }
     }
 
     fn show_icon(&mut self, digest: &str) {
         let path = icon_path(digest);
-        for (_, image) in self.row_images.iter().filter(|(d, _)| d == digest) {
+        for (_, image) in self
+            .rows
+            .iter()
+            .filter_map(|row| row.icon.as_ref())
+            .filter(|(d, _)| d == digest)
+        {
             set_image_file(*image, &path);
         }
     }
@@ -826,6 +1141,15 @@ impl Ui {
     }
 }
 
+fn state_text(app: &App, state: &State) -> String {
+    match state {
+        State::NotInstalled => format!("v{}", app.version),
+        State::Installed => format!("v{} \u{00b7} installed", app.version),
+        State::Upgradable { installed } => format!("v{installed} \u{2192} v{}", app.version),
+        State::Newer { installed } => format!("v{installed} installed (catalog v{})", app.version),
+    }
+}
+
 fn or_unknown(error: &str) -> &str {
     if error.is_empty() {
         "unknown"
@@ -931,16 +1255,32 @@ fn installed_packages() -> Result<HashMap<String, Installed>, String> {
     Ok(installed)
 }
 
-/// Writes through to a file while hashing.
+/// Writes through to a file while hashing, optionally reporting progress.
 struct Hashing {
     file: fs::File,
     hasher: Sha256,
+    progress: Option<Progress>,
+}
+
+struct Progress {
+    jobs: Sender<Job>,
+    total: u64,
+    written: u64,
+    last: Instant,
 }
 
 impl Write for Hashing {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = self.file.write(bytes)?;
         self.hasher.update(&bytes[..written]);
+        if let Some(progress) = &mut self.progress {
+            progress.written += written as u64;
+            if progress.last.elapsed() >= std::time::Duration::from_millis(200) {
+                progress.last = Instant::now();
+                let fraction = progress.written as f64 / progress.total.max(1) as f64;
+                let _ = progress.jobs.send(Job::Progress(Some(fraction)));
+            }
+        }
         Ok(written)
     }
 
@@ -951,7 +1291,13 @@ impl Write for Hashing {
 
 /// Download `url` to `path` (through a `.part` file) only if it hashes to
 /// `sha256` and is at most `max_bytes`; returns the size.
-fn fetch_verified(url: &str, sha256: &str, max_bytes: u64, path: &Path) -> Result<u64, String> {
+fn fetch_verified(
+    url: &str,
+    sha256: &str,
+    max_bytes: u64,
+    path: &Path,
+    jobs: Option<&Sender<Job>>,
+) -> Result<u64, String> {
     if let Some(parent) = path.parent() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -969,6 +1315,12 @@ fn fetch_verified(url: &str, sha256: &str, max_bytes: u64, path: &Path) -> Resul
     let mut sink = Hashing {
         file,
         hasher: Sha256::new(),
+        progress: jobs.map(|jobs| Progress {
+            jobs: jobs.clone(),
+            total: max_bytes,
+            written: 0,
+            last: Instant::now(),
+        }),
     };
     let result = tv_tizen::http::get_to(url, &mut sink, max_bytes, 600).and_then(|written| {
         let digest: String = sink
@@ -998,7 +1350,7 @@ fn install_app(app: &App, jobs: &Sender<Job>) -> Result<String, String> {
         format_size(app.size)
     )));
     let path = Path::new(STORE_DIR).join(format!("{}.{}", app.package_id, app.pkg_type));
-    let written = fetch_verified(&app.url, &app.sha256, app.size, &path)?;
+    let written = fetch_verified(&app.url, &app.sha256, app.size, &path, Some(jobs))?;
     if written != app.size {
         let _ = fs::remove_file(&path);
         return Err(format!(
@@ -1010,6 +1362,7 @@ fn install_app(app: &App, jobs: &Sender<Job>) -> Result<String, String> {
         "Verified {}. Approve the install on the prompt.",
         app.name
     )));
+    let _ = jobs.send(Job::Progress(None));
     let request = json!({"version": 2, "id": "store-install", "method": "pkg.install",
                          "pkg_type": app.pkg_type, "path": path.to_string_lossy(),
                          "timeout_ms": 120_000});
@@ -1089,13 +1442,45 @@ unsafe extern "C" fn on_category_selected(
 ) {
     let state = ui();
     state.store.category = (data as usize).saturating_sub(1).min(CATEGORIES.len() - 1);
-    state.store.focus_row = 0;
+    state.store.focus_key = None;
     state.render();
 }
 
+unsafe extern "C" fn on_search_changed(
+    _data: *mut c_void,
+    object: *mut c_void,
+    _info: *mut c_void,
+) {
+    let state = ui();
+    let text = elm_object_part_text_get(object, ptr::null());
+    let markup = if text.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(text)
+            .to_string_lossy()
+            .into_owned()
+    };
+    state.store.query = markup
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    state.store.focus_key = None;
+    state.rebuild_list();
+}
+
 unsafe extern "C" fn on_row_focused(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    if let Some(index) = (data as usize).checked_sub(1) {
-        ui().row_focused(index);
+    if data as usize != 0 {
+        ui().row_focused(data as usize);
+    }
+}
+
+unsafe extern "C" fn on_builds_clicked(
+    data: *mut c_void,
+    _object: *mut c_void,
+    _info: *mut c_void,
+) {
+    if data as usize != 0 {
+        ui().toggle_builds(data as usize);
     }
 }
 
@@ -1110,9 +1495,23 @@ unsafe extern "C" fn on_reload_clicked(
     state.set_status(state.status.clone());
 }
 
-fn row_app(data: *mut c_void) -> Option<App> {
-    let index = (data as usize).checked_sub(1)?;
-    ui().rows.get(index).cloned()
+fn clicked_app(data: *mut c_void) -> Option<App> {
+    let key = data as usize;
+    if key == 0 {
+        return None;
+    }
+    let state = ui();
+    if let Some(app) = state.row_app(key) {
+        return Some(app.clone());
+    }
+    // A group row's "Open": its installed build.
+    let (group, _) = split_key(key);
+    let group = state.store.groups.get(group)?;
+    group
+        .variants
+        .iter()
+        .find(|app| state.store.installed.contains_key(&app.package_id))
+        .cloned()
 }
 
 unsafe extern "C" fn on_install_clicked(
@@ -1120,14 +1519,14 @@ unsafe extern "C" fn on_install_clicked(
     _object: *mut c_void,
     _info: *mut c_void,
 ) {
-    if let Some(app) = row_app(data) {
+    if let Some(app) = clicked_app(data) {
         log_line(&format!("install clicked {}", app.package_id));
         ui().install(app);
     }
 }
 
 unsafe extern "C" fn on_open_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    if let Some(app) = row_app(data) {
+    if let Some(app) = clicked_app(data) {
         ui().open(&app);
     }
 }
@@ -1137,7 +1536,7 @@ unsafe extern "C" fn on_remove_clicked(
     _object: *mut c_void,
     _info: *mut c_void,
 ) {
-    if let Some(app) = row_app(data) {
+    if let Some(app) = clicked_app(data) {
         log_line(&format!("remove clicked {}", app.package_id));
         ui().uninstall(app);
     }
