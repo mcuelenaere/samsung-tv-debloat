@@ -920,3 +920,18 @@ removed both the copy and the delay.
 Known limitation: WGT packages are rejected by the firmware's package manager.
 The WAS backend is in place, so if a future firmware accepts WGT, the daemon
 needs no change.
+
+**Update 2026-11-09 (same firmware `T-PTMDEUC-1720.7`, tv-living):** the
+limitation did not reproduce. A minimal unsigned WGT (`config.xml` with
+`tizen:application`, `required_version="6.5"`, `index.html`, icon) sent with
+`tvauth-cli install wgt` was re-signed (`files=5`) and installed through
+`wascmd` (`was_install_webapp return WAS_TRUE`); it appeared in
+`package_info` and in `widgetinfo` (`install_type=user`, `is_display=1`,
+`install_state=3`), launched via AUL, and uninstalled (`pkgcmd+home`). A variant
+without `<tizen:profile name="tv-samsung"/>` behaved the same. Plain `pkgcmd -i
+-t wgt` of the unsigned archive in PID 1's namespace (with `/etc/release`
+visible) got past archive loading and failed only at `Check certificate error
+[-12]`, so neither the namespace nor `/etc/release` explains the old `-4`. The
+cause of the 2026-11-08 failures is undetermined (they predate commits
+`ad975b3`/`7b39883`, which replaced the `/etc` copy with the symlink overlay).
+Foreign-signed community WGTs are untested.

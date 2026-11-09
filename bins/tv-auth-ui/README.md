@@ -1,17 +1,15 @@
-# tv-auth approval and grant-manager UI
+# tv-auth grant manager (`org.tvauth.ui`)
 
-This is the native Tizen `type="capp"` UI for `tv-authd`. It has four jobs:
+The native Tizen `type="capp"` app that lists, re-modes, and revokes
+`tv-authd`'s persistent **Always allow** grants. Approval prompts and toasts
+moved to the persistent [`tv-auth-popupd`](../tv-auth-popupd/README.md) on
+2026-11-09; before that, this app did all four jobs and the daemon launched it
+on demand.
 
-1. show the daemon-generated approval prompt when an application requests root;
-2. show a package-aware prompt for `pkg.install` (`kind: "install"`) and
-   `pkg.uninstall` (`kind: "uninstall"`);
-3. list and revoke persistent **Always allow** grants;
-4. show a small toast when an **Always allow** app runs a root command, and when
-   a uid-0 client installs or removes a package without a prompt.
-
-The UI is a normal UID-5001 package with the exact SMACK label
-`User::Pkg::org.tvauth.ui`. It never runs as root and has no network privilege.
-It talks directly to `/run/tv-auth/broker.sock`; there is no helper process.
+The package also defines the identity both UIs run as: UID 5001 with the exact
+SMACK label `User::Pkg::org.tvauth.ui` and the `window.priority.set`
+privilege. It never runs as root and has no network privilege. It talks
+directly to `/run/tv-auth/broker.sock`.
 
 ## Why a `/run` alias
 
@@ -56,92 +54,24 @@ is re-established on every daemon start.
 
 ## Behavior
 
-### Approval prompt
+Opening the app icon shows the persistent-grant list. Each row has a toast
+toggle that cycles **Toast: every** → **Toast: first use** (first command after
+30 min idle) → **Toast: never**, and a **Revoke** button. Focus starts on the
+toggle, not Revoke. The list refreshes when the manager opens or is relaunched,
+after each change, on reconnect, and via **Refresh**. The first 5 grants are
+shown. BACK exits.
 
-When an app without a persistent grant connects, the daemon launches
-`app_launcher -s org.tvauth.ui` and sends a `ui.prompt` frame. The UI:
-
-- raises a full-screen notification-type EFL window (notification level TOP,
-  then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card;
-- displays the exact package ID and SMACK label from the daemon, plus the
-  daemon-generated **FULL ROOT ACCESS** warning;
-- displays a sanitized display copy of the command (long commands are
-  truncated and marked);
-- offers **Deny**, **Allow once**, and **Always allow**, focusing **Deny** by
-  default;
-- shows a live "Denied automatically in N s" countdown for the daemon timeout;
-- sends `ui.decision` with the prompt ID and nonce;
-- exits shortly after the daemon acknowledges the decision.
-
-**Always allow** is bound to a SHA-256 of the installed package's
-`author-signature.xml`. A package upgrade, changed reinstall, or signer change
-invalidates the grant and the next request prompts again. If the daemon cannot
-verify the package identity, it fails closed and reports
-`package_identity_unavailable`.
-
-### Package prompt
-
-For `pkg.install` the daemon sends `kind: "install"` with an `install` object.
-The UI shows the requester, package name/id/version/type/size, an upgrade note,
-a signature badge, and the requested privileges (up to 7; the rest are
-summarised). It offers **Deny** and **Install** only; there is deliberately no
-**Always allow** for package operations.
-
-For `pkg.uninstall` the daemon sends `kind: "uninstall"` with an `uninstall`
-object and a `remove <pkgid>` command. The same layout shows **REMOVE PACKAGE**,
-the package facts, **Deny**, and **Remove**. A package request without the
-matching object renders "Malformed package request" with only **Deny**.
-
-### Execution toast
-
-A granted app's executions arrive as `ui.notice` within 250 ms. A notice-only
-launch (`"launch": "notice"`) never shows the full-screen window or grabs BACK.
-A separate focus-skip notification window in the top-right corner shows up to
-three apps, e.g. "**org.example.app** ran 3 commands as root", plus the last
-command's first line. New notices update the counters in place and keep the
-toast up for 6 s after the last command. The UI then stays connected but
-invisible for 60 s so a burst of notices does not relaunch it, and exits.
-
-Prompt-free root package operations also arrive as `ui.notice` with
-`kind: "install"`/`"uninstall"` and `package: "root"`, rendered as
-**PACKAGE CHANGE**.
-
-### Grant manager
-
-Opening the app icon with no pending prompt shows the persistent-grant list.
-Each row has a toast toggle that cycles **Toast: every** → **Toast: first use**
-(first command after 30 min idle) → **Toast: never**, and a **Revoke** button.
-Focus starts on the toggle, not Revoke. The list refreshes when the manager
-opens, after each change, and via **Refresh**. The first 5 grants are shown.
-
-### Failure behavior
-
-- UI timeout: the UI enforces the daemon's `timeout_ms` locally, logs
-  `prompt expired`, shows a timeout message, and exits after two seconds; the
-  daemon independently denies.
-- UI crash or socket loss: the daemon sees EOF and denies the active request;
-  the UI clears the dead prompt and reconnects in manager mode.
-- Broker restart: the UI reconnects every two seconds, re-sends `ui.hello`, and
-  refreshes grants.
-- After sending a decision, the UI has a five-second safety exit even if the
-  broker stops responding.
-
-The UI is a **best-effort consent interface**, not a proven secure-attention
-path. Notification priority and key grab do not prevent another app from
-imitating or obscuring the prompt. The daemon-side nonce prevents a different
-app from forging the decision message, but visual spoofing is outside this
-milestone.
+The manager never sends `ui.hello`, so it does not take prompts or toasts from
+`tv-auth-popupd`; `tv-authd` serves `grants.*` to the UI identity without
+registration.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | EFL window, prompt/package/manager views, timer dispatch |
-| `src/client.rs` | direct Unix-socket NDJSON client and reconnect loop |
-| `src/view.rs` | host-testable display formatting |
-| `src/log.rs` | bounded `/tmp/tvauth-ui.log` writer |
-| `../../crates/tv-efl` | the raw EFL/Tizen FFI surface |
-| `../../crates/tv-proto` (`ui` module) | protocol v2 prompt/notice/grant types |
+| `src/main.rs` | EFL window, manager view, timer dispatch |
+| `../../crates/tv-proto` | broker client (`client`), markup (`markup`), message types (`ui`) |
+| `../../crates/tv-efl` | EFL FFI, widgets, bounded `/tmp/tvauth-ui.log` writer (`log`) |
 | `tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |
 | `icon.png` | package icon |
 | `build-ui.sh` | ARMv7 soft-float cross-build and unsigned TPK assembly |
@@ -165,8 +95,8 @@ Host checks:
 
 ```sh
 cargo fmt --all --check
-cargo clippy -p tv-auth-ui --all-targets -- -D warnings
-cargo test -p tv-auth-ui --lib   # pure formatting/protocol helpers
+cargo clippy -p tv-auth-ui -- -D warnings
+cargo test -p tv-proto            # client parsing and markup helpers
 ```
 
 Observed artifact (2026-11-08, host cross-build):
@@ -210,6 +140,14 @@ Partner-signed rollback TPK produced before removal was kept locally under
 check out that commit and use its `ui/build-ui-dotnet.sh`.
 
 ## Validation status
+
+- **TV (manager-only split, 2026-11-09):** the rebuilt TPK installed through
+  the root role (`re_signed=true`, `backend=was`); launched via
+  `app_launcher -s`, it mapped the `/run` alias, showed the manager, and the
+  daemon logged `ui_grants_list` with no `ui_attached`.
+
+Earlier results (the combined prompt + manager UI):
+
 
 - **Host:** `cargo check`, `cargo clippy -D warnings`, and `cargo test` pass.
   The ARMv7 soft-float artifact links against the seven TV libraries.

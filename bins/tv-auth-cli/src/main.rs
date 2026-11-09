@@ -9,6 +9,7 @@
 //! tvauth-cli [--socket PATH] list
 //! tvauth-cli [--socket PATH] install <wgt|tpk> <path>
 //! tvauth-cli [--socket PATH] uninstall <pkgid>
+//! tvauth-cli [--socket PATH] exec <command>    # package identities only
 //! ```
 //!
 //! It prints the raw response line and exits 0 when the status is `ok`.
@@ -70,10 +71,17 @@ fn build_request(positional: &[String]) -> Result<Value, String> {
             Ok(json!({"version": 2, "id": id, "method": "pkg.install",
                       "pkg_type": pkg_type, "path": path}))
         }
+        // Refused for the root role; under a package identity (e.g. via
+        // `systemd-run -p SmackProcessLabel=...`) it exercises the prompt.
+        [command, line] if command == "exec" => {
+            Ok(json!({"version": 2, "id": id, "method": "exec", "command": line}))
+        }
         [command, pkgid] if command == "uninstall" => {
             Ok(json!({"version": 2, "id": id, "method": "pkg.uninstall", "pkgid": pkgid}))
         }
-        _ => Err("expected list, install <type> <path>, or uninstall <pkgid>".into()),
+        _ => {
+            Err("expected list, install <type> <path>, uninstall <pkgid>, or exec <command>".into())
+        }
     }
 }
 
@@ -87,7 +95,8 @@ fn print_usage() {
     eprintln!(
         "usage: tvauth-cli [--socket PATH] list\n\
          \x20      tvauth-cli [--socket PATH] install <wgt|tpk> <path>\n\
-         \x20      tvauth-cli [--socket PATH] uninstall <pkgid>"
+         \x20      tvauth-cli [--socket PATH] uninstall <pkgid>\n\
+         \x20      tvauth-cli [--socket PATH] exec <command>"
     );
 }
 
@@ -117,6 +126,7 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert!(matches!(parse(&["exec", "id"]), tv_proto::Request::Exec(_)));
         assert!(build_request(&["install".into(), "rpm".into(), "/x".into()]).is_err());
         assert!(build_request(&[]).is_err());
     }

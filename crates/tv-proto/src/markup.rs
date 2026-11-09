@@ -1,4 +1,4 @@
-//! Pure display helpers shared by the prompt and manager views.
+//! Elementary markup for broker data, shared by the popup and manager UIs.
 //!
 //! Kept free of EFL calls so the formatting rules can be tested on the host.
 

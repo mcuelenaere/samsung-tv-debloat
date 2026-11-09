@@ -42,8 +42,9 @@ uid 0 with the `System::Privileged` label may use `pkg.*` without a prompt
 
 Only one prompt is visible globally, and only one request per package label may
 be pending. Prompt decisions are bound to a fresh 128-bit nonce, the prompt ID,
-the registered UI connection, and a timeout. Timeouts, UI disconnects, launcher
-failures, and stale/nonce-mismatched decisions all deny without executing.
+the registered UI connection, and a timeout. Timeouts, UI disconnects, a popup
+that does not attach in time, and stale/nonce-mismatched decisions all deny
+without executing.
 
 ## Host tests
 
@@ -110,13 +111,9 @@ validated M4 build was 584,452 bytes, SHA-256
 | `--socket-gid` | `100` | `root:users` socket group |
 | `--ui-package` | `org.tvauth.ui` | approved UI package |
 | `--ui-uid` | `5001` | approved UI UID |
-| `--ui-app-id` | same as `--ui-package` | AUL app ID |
-| `--app-launcher` | `/usr/bin/app_launcher` | fixed launcher |
 | `--prompt-timeout-ms` | `60000` | decision timeout |
-| `--ui-launch-timeout-ms` | `10000` | wait for UI hello |
-| `--launch-cooldown-ms` | `1000` | relaunch rate limit |
+| `--ui-attach-timeout-ms` | `10000` | wait for `tv-auth-popupd` to (re)attach |
 | `--prompt-queue-max` | `8` | pending requests |
-| `--max-launch-attempts` | `3` | UI launches per request burst |
 | `--staging-dir` | `/opt/tv-auth/staging` | package staging (`0711`, wiped at start) |
 | `--max-package-bytes` | `134217728` (128 MiB) | staged package cap (max 256 MiB) |
 | `--pkgcmd` | `/usr/bin/pkgcmd` | stock installer |
@@ -237,8 +234,8 @@ daemon is at `/opt/tv-auth/tv-authd.m4-20261108`. The managed UI source remains
 at git commit `7b39883`; a Partner-signed rollback TPK produced before removal
 was kept locally under `ui/out/` (not committed).
 
-The launcher inherits the daemon's systemd environment. On this TV that includes
-`XDG_RUNTIME_DIR=/run`, which AUL's launcher path uses. Do not clear it.
+The daemon never launches a UI: prompts and toasts go to the persistent
+`tv-auth-popupd` (`../tv-auth-popupd`), which systemd keeps running.
 
 ## Grant file and package identity
 
@@ -319,17 +316,17 @@ startup). The VDFS in `/opt` rejects unsigned ELFs, so the daemon (and any
 
 ## Approval UI
 
-The UI is maintained separately under `../tv-auth-ui/`:
+Two processes share the `User::Pkg::org.tvauth.ui` identity:
 
-```sh
-../tv-auth-ui/build-ui.sh             # unsigned native TPK
-```
+- `../tv-auth-popupd/` — the persistent prompt/toast overlay, started by its
+  own systemd unit; it registers with `ui.hello`;
+- `../tv-auth-ui/` — the user-launched grant manager TPK (`org.tvauth.ui`),
+  which only uses `grants.*`.
 
-It is a native Rust/EFL `type="capp"` app. UEP rejects ELFs mapped from `/opt`,
-so the daemon's `ui_alias.rs` exposes the installed binary through a `/run`
-bind mount. The daemon launches it through `app_launcher -s org.tvauth.ui` only
-when a prompt or toast is needed. See `../tv-auth-ui/README.md` for the UI's
-behavior, build, signing, and limitations.
+UEP rejects ELFs mapped from `/opt`, so the daemon's `ui_alias.rs` exposes the
+installed manager binary through a `/run` bind mount, and the popup unit maps
+`/opt/tv-auth` at `/run/opt/tv-auth` like this daemon's unit. See the two
+READMEs for behavior, build, and deployment.
 
 ## Test clients
 
@@ -341,8 +338,10 @@ broker `exec` request and save the response under `/tmp/tvauth-<probe>.response`
 ```
 
 They were used for M1 with a pre-seeded grant. In M2 they are useful as
-untrusted requesters: the daemon should launch the UI instead of returning
-`not_granted`. Their hard-coded response handling is unchanged, and the request
+untrusted requesters: the daemon should prompt instead of returning
+`not_granted`. `tvauth-cli exec <command>` under `systemd-run -p User=owner
+-p SmackProcessLabel=User::Pkg::<installed pkgid>` does the same without a
+.NET build. Their hard-coded response handling is unchanged, and the request
 file can carry any method, so the same probe drove `pkg.uninstall` and
 `pkg.list` for M2 validation.
 

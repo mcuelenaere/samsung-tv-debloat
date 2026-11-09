@@ -8,6 +8,8 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+pub mod client;
+pub mod markup;
 pub mod ui;
 
 pub const DEFAULT_SOCKET: &str = "/run/tv-auth/broker.sock";
@@ -457,10 +459,6 @@ pub struct Response {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// `ui.hello` only: `"notice"` when the daemon launched the UI just to
-    /// show execution notices, so it should stay out of the way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub launch: Option<&'static str>,
 }
 
 impl Response {
@@ -483,7 +481,6 @@ impl Response {
             packages: None,
             detail: None,
             error: None,
-            launch: None,
         }
     }
 
@@ -512,7 +509,6 @@ impl Response {
             packages: None,
             detail: None,
             error: None,
-            launch: None,
         }
     }
 
@@ -577,10 +573,8 @@ impl Response {
         response
     }
 
-    pub fn hello(id: &str, launch: Option<&'static str>) -> Self {
-        let mut response = Self::base(id, "ok");
-        response.launch = launch;
-        response
+    pub fn hello(id: &str) -> Self {
+        Self::base(id, "ok")
     }
 }
 

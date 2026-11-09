@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/*", "bins/*"]
 # Spikes keep their own lockfiles and toolchains.
 exclude = ["root-broker"]
-# Host builds: the EFL binary only links against the TV sysroot (see
-# bins/tv-auth-ui/build-ui.sh), so plain `cargo build` skips it.
+# Host builds: the EFL binaries only link against the TV sysroot (see
+# cross-build.sh), so plain `cargo build` skips them.
 default-members = ["crates/tv-proto", "bins/tv-authd", "bins/tv-auth-cli"]
 
 [workspace.dependencies]

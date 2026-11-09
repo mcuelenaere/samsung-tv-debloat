@@ -74,12 +74,11 @@ fn run(args: Args) -> io::Result<()> {
     let grants = Arc::new(Mutex::new(GrantStore::load(&args.grants)?));
     let logger = Arc::new(Logger::new(&args.log)?);
     logger.log(&format!(
-        "starting socket={} grants={} socket_gid={} ui_label={} ui_app_id={}",
+        "starting socket={} grants={} socket_gid={} ui_label={}",
         args.socket.display(),
         args.grants.display(),
         args.socket_gid,
         args.server.ui_label,
-        args.approval.ui_app_id
     ))?;
 
     if let Some(packages) = &args.packages {
@@ -241,15 +240,11 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut socket_gid = 100_u32;
     let mut ui_package = "org.tvauth.ui".to_owned();
     let mut ui_uid = 5001_u32;
-    let mut ui_app_id: Option<String> = None;
     let mut ui_exec = ui_alias::DEFAULT_EXEC_NAME.to_owned();
     let mut ui_alias_dir = PathBuf::from(ui_alias::DEFAULT_ALIAS_DIR);
-    let mut app_launcher = PathBuf::from("/usr/bin/app_launcher");
     let mut prompt_timeout_ms = 60_000_u64;
-    let mut ui_launch_timeout_ms = 10_000_u64;
-    let mut launch_cooldown_ms = 1_000_u64;
+    let mut ui_attach_timeout_ms = 10_000_u64;
     let mut prompt_queue_max = 8_usize;
-    let mut max_launch_attempts = 3_usize;
     let mut max_connections = 16_usize;
     let mut staging_dir = PathBuf::from("/opt/tv-auth/staging");
     let mut max_package_bytes = pkgstage::DEFAULT_MAX_PACKAGE_BYTES;
@@ -272,23 +267,15 @@ fn parse_args() -> Result<Option<Args>, String> {
             Long("max-connections") => max_connections = value(&mut parser, "max-connections")?,
             Long("ui-package") => ui_package = value(&mut parser, "ui-package")?,
             Long("ui-uid") => ui_uid = value(&mut parser, "ui-uid")?,
-            Long("ui-app-id") => ui_app_id = Some(value(&mut parser, "ui-app-id")?),
             Long("ui-exec") => ui_exec = value(&mut parser, "ui-exec")?,
             Long("ui-alias-dir") => ui_alias_dir = path(&mut parser)?,
-            Long("app-launcher") => app_launcher = path(&mut parser)?,
             Long("prompt-timeout-ms") => {
                 prompt_timeout_ms = value(&mut parser, "prompt-timeout-ms")?
             }
-            Long("ui-launch-timeout-ms") => {
-                ui_launch_timeout_ms = value(&mut parser, "ui-launch-timeout-ms")?
-            }
-            Long("launch-cooldown-ms") => {
-                launch_cooldown_ms = value(&mut parser, "launch-cooldown-ms")?
+            Long("ui-attach-timeout-ms") => {
+                ui_attach_timeout_ms = value(&mut parser, "ui-attach-timeout-ms")?
             }
             Long("prompt-queue-max") => prompt_queue_max = value(&mut parser, "prompt-queue-max")?,
-            Long("max-launch-attempts") => {
-                max_launch_attempts = value(&mut parser, "max-launch-attempts")?
-            }
             Long("staging-dir") => staging_dir = path(&mut parser)?,
             Long("max-package-bytes") => {
                 max_package_bytes = value(&mut parser, "max-package-bytes")?
@@ -315,15 +302,11 @@ fn parse_args() -> Result<Option<Args>, String> {
                      --max-connections COUNT      concurrent clients (default 16)\n\
                      --ui-package PKGID           approval UI package (default org.tvauth.ui)\n\
                      --ui-uid UID                 approval UI uid (default 5001)\n\
-                     --ui-app-id APPID            app_launcher id (default: --ui-package)\n\
                      --ui-exec NAME               native UI exec (default tv-auth-ui)\n\
                      --ui-alias-dir PATH          UEP-exempt UI mount (default /run/tv-auth/ui-bin)\n\
-                     --app-launcher PATH          app launcher (default /usr/bin/app_launcher)\n\
                      --prompt-timeout-ms MS       decision timeout (default 60000)\n\
-                     --ui-launch-timeout-ms MS    UI connect timeout (default 10000)\n\
-                     --launch-cooldown-ms MS      relaunch cooldown (default 1000)\n\
+                     --ui-attach-timeout-ms MS    wait for tv-auth-popupd (default 10000)\n\
                      --prompt-queue-max COUNT     waiting requests (default 8)\n\
-                     --max-launch-attempts COUNT  UI launch attempts (default 3)\n\
                      --staging-dir PATH           package staging root (default /opt/tv-auth/staging)\n\
                      --max-package-bytes BYTES    staged package cap (default 134217728)\n\
                      --pkgcmd PATH                stock installer (default /usr/bin/pkgcmd)\n\
@@ -356,34 +339,19 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
     if max_connections == 0
         || prompt_timeout_ms == 0
-        || ui_launch_timeout_ms == 0
-        || launch_cooldown_ms == 0
+        || ui_attach_timeout_ms == 0
         || prompt_queue_max == 0
-        || max_launch_attempts == 0
     {
-        return Err(
-            "connections, timeouts, queue size, and launch attempts must be greater than zero"
-                .into(),
-        );
+        return Err("connections, timeouts, and queue size must be greater than zero".into());
     }
-    if prompt_timeout_ms > 600_000
-        || ui_launch_timeout_ms > 120_000
-        || launch_cooldown_ms > 60_000
-        || prompt_queue_max > 64
-        || max_launch_attempts > 10
-    {
-        return Err("timeout, queue, or launch-attempt value is too large".into());
+    if prompt_timeout_ms > 600_000 || ui_attach_timeout_ms > 120_000 || prompt_queue_max > 64 {
+        return Err("timeout or queue value is too large".into());
     }
 
-    let ui_app_id = ui_app_id.unwrap_or_else(|| ui_package.clone());
     let approval = ApprovalConfig {
-        ui_app_id: ui_app_id.clone(),
-        app_launcher,
         prompt_timeout: Duration::from_millis(prompt_timeout_ms),
-        ui_launch_timeout: Duration::from_millis(ui_launch_timeout_ms),
-        launch_cooldown: Duration::from_millis(launch_cooldown_ms),
+        ui_attach_timeout: Duration::from_millis(ui_attach_timeout_ms),
         prompt_queue_max,
-        max_launch_attempts,
         notice_interval: Duration::from_millis(250),
     };
     if !(1024 * 1024..=pkgstage::MAX_PACKAGE_BYTES_LIMIT).contains(&max_package_bytes) {

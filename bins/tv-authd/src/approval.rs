@@ -7,8 +7,6 @@ use crate::protocol::{
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -17,13 +15,11 @@ use std::time::{Duration, Instant};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-/// How many times a prompt is re-shown after the UI disconnected while it was
-/// active (the UI exits shortly after each decision, which can race with the
-/// next queued prompt).
+/// How many times a prompt is re-shown after the popup disconnected while it
+/// was active (systemd restarts `tv-auth-popupd`, which then re-attaches).
 const MAX_PROMPT_UI_RETRIES: u8 = 2;
 
-/// After the UI could not be launched for notices, wait this long before
-/// launching it again, so a broken UI is not respawned for every granted exec.
+/// After a notice could not be delivered twice, pause notices this long.
 const NOTICE_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 /// A `first`-mode package is shown again only after being idle this long.
@@ -36,13 +32,10 @@ const MAX_NOTICE_PACKAGES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct ApprovalConfig {
-    pub ui_app_id: String,
-    pub app_launcher: PathBuf,
     pub prompt_timeout: Duration,
-    pub ui_launch_timeout: Duration,
-    pub launch_cooldown: Duration,
+    /// How long a queued prompt waits for `tv-auth-popupd` to (re)attach.
+    pub ui_attach_timeout: Duration,
     pub prompt_queue_max: usize,
-    pub max_launch_attempts: usize,
     /// Minimum gap between `ui.notice` messages for granted executions.
     pub notice_interval: Duration,
 }
@@ -51,7 +44,7 @@ impl ApprovalConfig {
     pub fn approval_wait_timeout(&self) -> Duration {
         let retries = u32::from(MAX_PROMPT_UI_RETRIES);
         self.prompt_timeout * (self.prompt_queue_max as u32 + 1 + retries)
-            + self.ui_launch_timeout * (self.max_launch_attempts as u32) * (1 + retries)
+            + self.ui_attach_timeout * (1 + retries)
             + Duration::from_secs(30)
     }
 }
@@ -266,15 +259,6 @@ struct ActivePrompt {
     ui_token: u64,
 }
 
-#[derive(Default)]
-struct LaunchState {
-    attempts: usize,
-    last_attempt: Option<Instant>,
-    awaiting_until: Option<Instant>,
-    /// The outstanding launch was only for notices (no prompt was waiting).
-    for_notice: bool,
-}
-
 struct Manager {
     config: ApprovalConfig,
     grants: Arc<Mutex<GrantStore>>,
@@ -282,7 +266,8 @@ struct Manager {
     ui: Option<UiClient>,
     queue: VecDeque<PendingRequest>,
     active: Option<ActivePrompt>,
-    launch: LaunchState,
+    /// Since when a queued prompt has been waiting for a popup to attach.
+    ui_wait_since: Option<Instant>,
     notices: Vec<NoticeEntry>,
     notice_next_at: Instant,
     notice_retries: u8,
@@ -304,7 +289,7 @@ impl Manager {
             ui: None,
             queue: VecDeque::new(),
             active: None,
-            launch: LaunchState::default(),
+            ui_wait_since: None,
             notices: Vec::new(),
             notice_next_at: Instant::now(),
             notice_retries: 0,
@@ -404,11 +389,7 @@ impl Manager {
         writer: Arc<Mutex<UnixStream>>,
         control: UnixStream,
     ) {
-        let notice_only = self.launch.for_notice
-            && self.launch.attempts > 0
-            && self.active.is_none()
-            && self.queue.is_empty();
-        let hello = Response::hello(hello_id, notice_only.then_some("notice"));
+        let hello = Response::hello(hello_id);
         let written = {
             let mut stream = writer.lock().unwrap_or_else(|error| error.into_inner());
             write_response(&mut *stream, &hello)
@@ -439,10 +420,8 @@ impl Manager {
             writer,
             control,
         });
-        self.launch = LaunchState::default();
-        self.log(&format!(
-            "ui_attached token={token} label={label} notice_only={notice_only}"
-        ));
+        self.ui_wait_since = None;
+        self.log(&format!("ui_attached token={token} label={label}"));
         self.ensure_prompt();
         self.flush_notices();
     }
@@ -498,8 +477,9 @@ impl Manager {
         if self.active.is_some() || !self.queue.is_empty() {
             return;
         }
+        // Without a popup, notices stay queued (bounded, coalesced) until one
+        // attaches.
         let Some(ui) = &self.ui else {
-            self.launch_if_needed();
             return;
         };
         let notices = std::mem::take(&mut self.notices);
@@ -523,10 +503,6 @@ impl Manager {
                 if let Some(dead) = self.ui.take() {
                     let _ = dead.control.shutdown(std::net::Shutdown::Both);
                 }
-                self.launch = LaunchState {
-                    last_attempt: Some(now),
-                    ..LaunchState::default()
-                };
                 if self.notice_retries < 1 {
                     self.notice_retries += 1;
                     self.notices = notices;
@@ -552,8 +528,8 @@ impl Manager {
         self.log(&format!("ui_detached token={token}"));
         if let Some(active) = self.active.take() {
             if active.ui_retries < MAX_PROMPT_UI_RETRIES {
-                // The UI may simply have been exiting after the previous
-                // decision; show the prompt again via a fresh UI.
+                // systemd restarts the popup; show the prompt again once it
+                // re-attaches.
                 self.queue.push_front(PendingRequest {
                     request: active.request,
                     ui_retries: active.ui_retries + 1,
@@ -567,10 +543,6 @@ impl Manager {
                 self.log("prompt_cancelled=ui_disconnected");
             }
         }
-        self.launch = LaunchState {
-            last_attempt: Some(Instant::now()),
-            ..LaunchState::default()
-        };
     }
 
     fn handle_cancel(&mut self, ticket: u64) {
@@ -702,13 +674,11 @@ impl Manager {
             return;
         }
         if self.queue.is_empty() {
-            if self.notices.is_empty() {
-                self.launch = LaunchState::default();
-            }
+            self.ui_wait_since = None;
             return;
         }
         if self.ui.is_none() {
-            self.launch_if_needed();
+            self.wait_for_ui();
             return;
         }
 
@@ -782,10 +752,6 @@ impl Manager {
                     ui.token
                 ));
                 let _ = ui.control.shutdown(std::net::Shutdown::Both);
-                self.launch = LaunchState {
-                    last_attempt: Some(Instant::now()),
-                    ..LaunchState::default()
-                };
                 if pending.ui_retries < MAX_PROMPT_UI_RETRIES {
                     self.queue.push_front(PendingRequest {
                         request: pending.request,
@@ -803,77 +769,15 @@ impl Manager {
         }
     }
 
-    fn launch_if_needed(&mut self) {
+    /// No popup is attached: give `tv-auth-popupd` (restarted by systemd) a
+    /// bounded time to (re)attach before failing the waiting prompts closed.
+    fn wait_for_ui(&mut self) {
         let now = Instant::now();
-        if let Some(until) = self.launch.awaiting_until {
-            if now < until {
-                return;
-            }
-            self.launch.awaiting_until = None;
-        }
-        if self.launch.attempts >= self.config.max_launch_attempts {
+        let since = *self.ui_wait_since.get_or_insert(now);
+        if now >= since + self.config.ui_attach_timeout {
+            self.log("ui_attach_timeout");
             self.fail_all("ui_unavailable");
-            return;
         }
-        if let Some(last) = self.launch.last_attempt {
-            if now < last + self.config.launch_cooldown {
-                return;
-            }
-        }
-        match self.spawn_launcher() {
-            Ok(()) => {
-                self.launch.attempts += 1;
-                self.launch.last_attempt = Some(now);
-                self.launch.awaiting_until = Some(now + self.config.ui_launch_timeout);
-                self.launch.for_notice = self.queue.is_empty();
-                self.log(&format!(
-                    "ui_launch_attempt={} app={}",
-                    self.launch.attempts, self.config.ui_app_id
-                ));
-            }
-            Err(error) => {
-                self.log(&format!("ui_launch_failed={error}"));
-                self.launch.attempts = self.config.max_launch_attempts;
-                self.fail_all("ui_launch_failed");
-            }
-        }
-    }
-
-    fn spawn_launcher(&self) -> io::Result<()> {
-        if !self.config.app_launcher.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("launcher not found: {}", self.config.app_launcher.display()),
-            ));
-        }
-        let mut child = Command::new(&self.config.app_launcher)
-            .arg("-s")
-            .arg(&self.config.ui_app_id)
-            // Inherit the systemd environment (notably XDG_RUNTIME_DIR) but
-            // make the two values AUL commonly needs explicit.
-            .env("HOME", "/root")
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let logger = self.logger.clone();
-        let app_id = self.config.ui_app_id.clone();
-        thread::Builder::new()
-            .name("tv-auth-ui-launch".into())
-            .spawn(move || {
-                let status = child.wait();
-                if let Some(logger) = logger {
-                    let message = match status {
-                        Ok(status) => format!("ui_launch_exit app={app_id} status={status}"),
-                        Err(error) => {
-                            format!("ui_launch_wait_error app={app_id} error={error}")
-                        }
-                    };
-                    let _ = logger.log(&message);
-                }
-            })?;
-        Ok(())
     }
 
     fn has_pending(&self, label: &str) -> bool {
@@ -893,13 +797,7 @@ impl Manager {
                 ApprovalResult::Denied("ui_unavailable", error),
             );
         }
-        if !self.notices.is_empty() {
-            // Best effort: never retry a broken UI for every granted exec.
-            self.notices.clear();
-            self.notice_next_at = Instant::now() + NOTICE_RETRY_AFTER_FAILURE;
-            self.log(&format!("notices_dropped={error}"));
-        }
-        self.launch = LaunchState::default();
+        self.ui_wait_since = None;
     }
 
     fn reply(&self, request: ApprovalRequest, result: ApprovalResult) {
@@ -974,13 +872,9 @@ mod tests {
 
     fn test_config() -> ApprovalConfig {
         ApprovalConfig {
-            ui_app_id: "org.tvauth.ui".into(),
-            app_launcher: PathBuf::from("/nonexistent/tv-auth-launcher"),
             prompt_timeout: Duration::from_secs(5),
-            ui_launch_timeout: Duration::from_millis(100),
-            launch_cooldown: Duration::from_millis(10),
+            ui_attach_timeout: Duration::from_millis(100),
             prompt_queue_max: 4,
-            max_launch_attempts: 1,
             notice_interval: Duration::from_millis(300),
         }
     }
@@ -1269,17 +1163,16 @@ mod tests {
         );
     }
 
-    fn no_relaunch_config() -> ApprovalConfig {
+    fn patient_config() -> ApprovalConfig {
         let mut config = test_config();
-        // Keep the (missing) launcher from failing the queue while a test
-        // swaps UI connections.
-        config.launch_cooldown = Duration::from_secs(60);
+        // Keep the queue from failing while a test swaps UI connections.
+        config.ui_attach_timeout = Duration::from_secs(60);
         config
     }
 
     #[test]
     fn ui_disconnect_requeues_prompt_for_next_ui() {
-        let fixture = fixture(no_relaunch_config());
+        let fixture = fixture(patient_config());
         let mut ui = attach_ui(&fixture.manager, 1);
         let (ask, reply) = request("User::Pkg::org.example.app");
         fixture.manager.handle().request(ask).unwrap();
@@ -1308,7 +1201,7 @@ mod tests {
 
     #[test]
     fn ui_disconnect_denies_after_retry_limit() {
-        let fixture = fixture(no_relaunch_config());
+        let fixture = fixture(patient_config());
         let (ask, reply) = request("User::Pkg::org.example.app");
         let mut ui = attach_ui(&fixture.manager, 1);
         fixture.manager.handle().request(ask).unwrap();
@@ -1328,7 +1221,7 @@ mod tests {
 
     #[test]
     fn cancel_drops_active_and_queued_requests() {
-        let fixture = fixture(no_relaunch_config());
+        let fixture = fixture(patient_config());
         let mut ui = attach_ui(&fixture.manager, 1);
         let handle = fixture.manager.handle();
         let (first, _first_reply) = request("User::Pkg::org.example.one");
@@ -1394,14 +1287,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_launcher_fails_closed() {
+    fn missing_popup_fails_closed() {
         let fixture = fixture(test_config());
         let (ask, reply) = request("User::Pkg::org.example.app");
         fixture.manager.handle().request(ask).unwrap();
         assert_eq!(
             reply.recv_timeout(Duration::from_secs(2)),
-            Ok(ApprovalResult::Denied("ui_unavailable", "ui_launch_failed"))
+            Ok(ApprovalResult::Denied("ui_unavailable", "ui_unavailable"))
         );
+    }
+
+    #[test]
+    fn prompt_waits_for_a_late_popup() {
+        let fixture = fixture(patient_config());
+        let (ask, reply) = request("User::Pkg::org.example.app");
+        fixture.manager.handle().request(ask).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(reply.try_recv().is_err());
+        let mut ui = attach_ui(&fixture.manager, 1);
+        assert_eq!(read_json(&mut ui)["type"], "ui.prompt");
     }
 
     #[test]
@@ -1461,32 +1365,14 @@ mod tests {
     }
 
     #[test]
-    fn notice_only_launch_is_flagged_in_hello() {
-        let mut config = test_config();
-        config.app_launcher = PathBuf::from("/usr/bin/true");
-        config.ui_launch_timeout = Duration::from_secs(5);
-        let fixture = fixture(config);
+    fn notices_wait_for_a_popup() {
+        let fixture = fixture(test_config());
         let handle = fixture.manager.handle();
         handle
             .notice("User::Pkg::org.example.granted".into(), "id".into(), false)
             .unwrap();
-        // Let the manager spawn the (dummy) launcher before the UI attaches.
-        thread::sleep(Duration::from_millis(100));
-
-        let (ui, daemon) = UnixStream::pair().unwrap();
-        ui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let control = daemon.try_clone().unwrap();
-        handle
-            .attach_ui(
-                1,
-                "hello-1".into(),
-                "User::Pkg::org.tvauth.ui".into(),
-                Arc::new(Mutex::new(daemon)),
-                control,
-            )
-            .unwrap();
-        let mut ui = BufReader::new(ui);
-        assert_eq!(read_json(&mut ui)["launch"], "notice");
+        thread::sleep(Duration::from_millis(300));
+        let mut ui = attach_ui(&fixture.manager, 1);
         assert_eq!(read_json(&mut ui)["type"], "ui.notice");
     }
 
@@ -1515,7 +1401,7 @@ mod tests {
 
     #[test]
     fn prompt_write_failure_counts_toward_retry_limit() {
-        let fixture = fixture(no_relaunch_config());
+        let fixture = fixture(patient_config());
         let handle = fixture.manager.handle();
         let dead_ui = attach_ui(&fixture.manager, 1);
         drop(dead_ui.into_inner());
@@ -1539,7 +1425,7 @@ mod tests {
 
     #[test]
     fn notice_write_failure_requeues_for_next_ui() {
-        let fixture = fixture(no_relaunch_config());
+        let fixture = fixture(patient_config());
         let handle = fixture.manager.handle();
         let dead_ui = attach_ui(&fixture.manager, 1);
         drop(dead_ui.into_inner());

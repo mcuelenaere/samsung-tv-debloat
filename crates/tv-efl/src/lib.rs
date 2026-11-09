@@ -6,6 +6,9 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod log;
+pub mod widgets;
+
 use std::ffi::CString;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 
@@ -54,6 +57,11 @@ extern "C" {
 
 #[link(name = "elementary")]
 extern "C" {
+    /// Standalone (non-AUL) processes call these instead of `ui_app_main`.
+    pub fn elm_init(argc: c_int, argv: *mut *mut c_char) -> c_int;
+    pub fn elm_run();
+    pub fn elm_exit();
+    pub fn elm_shutdown() -> c_int;
     pub fn elm_win_add(parent: *mut c_void, name: *const c_char, window_type: c_int)
         -> *mut c_void;
     pub fn elm_win_title_set(window: *mut c_void, title: *const c_char);
@@ -152,8 +160,14 @@ extern "C" {
     pub fn eext_win_keygrab_unset(window: *mut c_void, key: *const c_char) -> EinaBool;
 }
 
+pub type EcorePipeCb = unsafe extern "C" fn(data: *mut c_void, buffer: *mut c_void, bytes: u32);
+
 #[link(name = "ecore")]
 extern "C" {
+    /// `ecore_pipe_write` is the thread-safe way to wake the main loop.
+    pub fn ecore_pipe_add(handler: EcorePipeCb, data: *const c_void) -> *mut c_void;
+    pub fn ecore_pipe_write(pipe: *mut c_void, buffer: *const c_void, bytes: u32) -> EinaBool;
+    pub fn ecore_timer_del(timer: *mut c_void) -> *mut c_void;
     pub fn ecore_timer_add(
         interval: c_double,
         callback: EcoreTimerCb,

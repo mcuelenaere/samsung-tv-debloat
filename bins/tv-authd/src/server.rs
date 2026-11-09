@@ -434,13 +434,6 @@ fn handle_ui_request(
             }
         }
         Request::GrantsList(request) => {
-            if ui_token.is_none() {
-                send(
-                    writer,
-                    &Response::error(&request.id, "error", "not_registered"),
-                )?;
-                return Ok(());
-            }
             log(broker, &format!("ui_grants_list label={}", identity.label));
             let grants = {
                 let store = broker
@@ -460,13 +453,6 @@ fn handle_ui_request(
             send(writer, &Response::grants(&request.id, grants))?;
         }
         Request::GrantsRevoke(request) => {
-            if ui_token.is_none() {
-                send(
-                    writer,
-                    &Response::error(&request.id, "error", "not_registered"),
-                )?;
-                return Ok(());
-            }
             if let Err(error) = validate_label(&request.label) {
                 send(writer, &Response::error(&request.id, "error", error))?;
                 return Ok(());
@@ -497,13 +483,6 @@ fn handle_ui_request(
             }
         }
         Request::GrantsNotify(request) => {
-            if ui_token.is_none() {
-                send(
-                    writer,
-                    &Response::error(&request.id, "error", "not_registered"),
-                )?;
-                return Ok(());
-            }
             if let Err(error) = validate_label(&request.label) {
                 send(writer, &Response::error(&request.id, "error", error))?;
                 return Ok(());
@@ -1887,13 +1866,9 @@ mod tests {
             GrantStore::load_with_roots(&path, vec![apps.clone()]).unwrap(),
         ));
         let approval_config = ApprovalConfig {
-            ui_app_id: "org.tvauth.ui".into(),
-            app_launcher: PathBuf::from("/nonexistent/tv-auth-launcher"),
             prompt_timeout,
-            ui_launch_timeout: Duration::from_millis(50),
-            launch_cooldown: Duration::from_millis(10),
+            ui_attach_timeout: Duration::from_millis(50),
             prompt_queue_max: 4,
-            max_launch_attempts: 1,
             notice_interval: Duration::from_millis(250),
         };
         let manager = ApprovalManager::start(approval_config, Arc::clone(&grants), None).unwrap();
@@ -2022,7 +1997,7 @@ mod tests {
         // The stale grant must not execute. With no UI and a missing launcher,
         // the approval path fails closed.
         assert_eq!(response["status"], "ui_unavailable");
-        assert_eq!(response["error"], "ui_launch_failed");
+        assert_eq!(response["error"], "ui_unavailable");
         drop(client);
         handle.join().unwrap().unwrap();
         assert_eq!(
@@ -2043,7 +2018,7 @@ mod tests {
         client.send(exec_request("exec-1", "printf should-not-run"));
         let response = client.read();
         assert_eq!(response["status"], "ui_unavailable");
-        assert_eq!(response["error"], "ui_launch_failed");
+        assert_eq!(response["error"], "ui_unavailable");
         drop(client);
         handle.join().unwrap().unwrap();
     }
@@ -2117,6 +2092,20 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    /// The grant manager app does not register with `ui.hello` (that is the
+    /// popup daemon's role) but may still manage grants.
+    #[test]
+    fn ui_identity_lists_grants_without_hello() {
+        let fixture = fixture();
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
+        client.send(json!({"version": 2, "id": "list-1", "method": "grants.list"}));
+        let response = client.read();
+        assert_eq!(response["status"], "ok");
+        assert!(response["grants"].is_array());
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
     #[test]
     fn ui_label_requires_the_configured_uid() {
         let fixture = fixture();
@@ -2164,7 +2153,7 @@ mod tests {
         client.send(exec_request("exec-1", "printf should-not-run"));
         let response = client.read();
         assert_eq!(response["status"], "ui_unavailable");
-        assert_eq!(response["error"], "ui_launch_failed");
+        assert_eq!(response["error"], "ui_unavailable");
         drop(client);
         handle.join().unwrap().unwrap();
     }

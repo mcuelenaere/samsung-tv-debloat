@@ -1,0 +1,15 @@
+[package]
+name = "tv-auth-popupd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tv-auth-popupd"
+path = "src/main.rs"
+# Links the TV's EFL libraries; build with ../../cross-build.sh gnueabi.
+test = false
+
+[dependencies]
+tv-efl.workspace = true
+tv-proto.workspace = true

@@ -1,10 +1,11 @@
-//! Direct, in-process NDJSON client for `tv-authd`.
+//! Long-lived, reconnecting `tv-authd` client for the UIs.
 //!
-//! The reader runs on a blocking thread and forwards parsed messages to the
-//! EFL main loop through a channel.  Writes happen on the UI thread through a
-//! shared stream, mirroring the managed implementation.
+//! The reader runs on a blocking thread and forwards parsed messages through a
+//! channel, then calls `wake` so an event loop can drain it. Writes happen on
+//! the caller's thread through a shared stream.
 
-use crate::log::log_line;
+use crate::ui::{GrantInfo, NoticeInfo, PromptInfo};
+use crate::{read_message, MAX_RESPONSE_BYTES};
 use serde_json::{json, Value};
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
@@ -15,10 +16,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tv_proto::ui::{GrantInfo, NoticeInfo, PromptInfo};
-use tv_proto::{read_message, MAX_RESPONSE_BYTES};
 
-pub use tv_proto::DEFAULT_SOCKET;
+pub use crate::DEFAULT_SOCKET;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -26,8 +25,8 @@ pub enum Event {
     ConnectionChanged(bool),
     Prompt(PromptInfo),
     Notice(Vec<NoticeInfo>),
-    /// `ui.hello` accepted; the value is the daemon's launch reason.
-    HelloAccepted(String),
+    /// `ui.hello` accepted: prompts and notices will follow.
+    HelloAccepted,
     Grants(Vec<GrantInfo>),
     DecisionFinished(bool, String),
     RevokeFinished(bool, String),
@@ -52,19 +51,41 @@ impl Counters {
 
 type SharedSocket = Arc<Mutex<Option<UnixStream>>>;
 
+/// Event sink: the channel plus a hook that wakes the consumer's loop.
+#[derive(Clone)]
+pub struct Notifier {
+    tx: Sender<Event>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    log: fn(&str),
+}
+
+impl Notifier {
+    pub fn new(tx: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>, log: fn(&str)) -> Self {
+        Self { tx, wake, log }
+    }
+
+    fn send(&self, event: Event) {
+        if self.tx.send(event).is_ok() {
+            (self.wake)();
+        }
+    }
+}
+
 pub struct BrokerClient {
     socket: SharedSocket,
     stopped: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    tx: Sender<Event>,
+    events: Notifier,
 }
 
 impl BrokerClient {
-    pub fn start(tx: Sender<Event>) -> Self {
-        Self::start_with(DEFAULT_SOCKET, tx)
+    /// Connect to [`DEFAULT_SOCKET`], reconnecting forever. With `hello`, the
+    /// client registers as the prompt/notice UI after every (re)connect.
+    pub fn start(events: Notifier, hello: bool) -> Self {
+        Self::start_with(DEFAULT_SOCKET, events, hello)
     }
 
-    pub fn start_with(socket_path: impl Into<PathBuf>, tx: Sender<Event>) -> Self {
+    pub fn start_with(socket_path: impl Into<PathBuf>, events: Notifier, hello: bool) -> Self {
         let socket_path = socket_path.into();
         let socket: SharedSocket = Arc::new(Mutex::new(None));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -72,7 +93,7 @@ impl BrokerClient {
         let thread_socket = Arc::clone(&socket);
         let thread_stopped = Arc::clone(&stopped);
         let thread_counters = Arc::clone(&counters);
-        let thread_tx = tx.clone();
+        let thread_events = events.clone();
         thread::Builder::new()
             .name("tv-auth-broker-client".into())
             .spawn(move || {
@@ -81,7 +102,8 @@ impl BrokerClient {
                     thread_socket,
                     thread_stopped,
                     thread_counters,
-                    thread_tx,
+                    thread_events,
+                    hello,
                 );
             })
             .ok();
@@ -89,7 +111,7 @@ impl BrokerClient {
             socket,
             stopped,
             counters,
-            tx,
+            events,
         }
     }
 
@@ -114,8 +136,7 @@ impl BrokerClient {
             "method": "grants.list"
         });
         if !self.send_raw(&request.to_string()) {
-            let _ = self
-                .tx
+            self.events
                 .send(Event::StatusMessage("Not connected to tv-authd.".into()));
         }
     }
@@ -129,8 +150,7 @@ impl BrokerClient {
             "label": label
         });
         if !self.send_raw(&request.to_string()) {
-            let _ = self
-                .tx
+            self.events
                 .send(Event::RevokeFinished(false, "not_connected".into()));
         }
     }
@@ -146,8 +166,7 @@ impl BrokerClient {
             "notify": notify
         });
         if !self.send_raw(&request.to_string()) {
-            let _ = self
-                .tx
+            self.events
                 .send(Event::NotifyFinished(false, "not_connected".into()));
         }
     }
@@ -164,8 +183,7 @@ impl BrokerClient {
             "decision": decision
         });
         if !self.send_raw(&request.to_string()) {
-            let _ = self
-                .tx
+            self.events
                 .send(Event::DecisionFinished(false, "not_connected".into()));
         }
     }
@@ -184,7 +202,7 @@ impl BrokerClient {
         {
             Ok(()) => true,
             Err(error) => {
-                log_line(&format!("broker send: {error}"));
+                (self.events.log)(&format!("broker send: {error}"));
                 false
             }
         }
@@ -202,13 +220,14 @@ fn run_loop(
     socket: SharedSocket,
     stopped: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    tx: Sender<Event>,
+    events: Notifier,
+    hello: bool,
 ) {
     while !stopped.load(Ordering::SeqCst) {
         match UnixStream::connect(&socket_path) {
             Ok(stream) => {
                 let Ok(reader_stream) = stream.try_clone() else {
-                    log_line("broker: cannot clone the connection");
+                    (events.log)("broker: cannot clone the connection");
                     wait_before_reconnect(&stopped);
                     continue;
                 };
@@ -216,17 +235,21 @@ fn run_loop(
                     let mut guard = socket.lock().unwrap_or_else(|error| error.into_inner());
                     *guard = Some(stream);
                 }
-                let _ = tx.send(Event::ConnectionChanged(true));
-                send_hello(&socket, &counters);
+                events.send(Event::ConnectionChanged(true));
+                if hello {
+                    send_hello(&socket, &counters, events.log);
+                }
 
                 let mut reader = BufReader::new(reader_stream);
                 loop {
                     match read_message(&mut reader, MAX_RESPONSE_BYTES) {
-                        Ok(line) => handle_line(&String::from_utf8_lossy(&line), &counters, &tx),
+                        Ok(line) => {
+                            handle_line(&String::from_utf8_lossy(&line), &counters, &events)
+                        }
                         Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
                         Err(error) => {
                             if !stopped.load(Ordering::SeqCst) {
-                                log_line(&format!("broker read: {error}"));
+                                (events.log)(&format!("broker read: {error}"));
                             }
                             break;
                         }
@@ -235,7 +258,7 @@ fn run_loop(
             }
             Err(error) => {
                 if !stopped.load(Ordering::SeqCst) {
-                    log_line(&format!("broker connect: {error}"));
+                    (events.log)(&format!("broker connect: {error}"));
                 }
             }
         }
@@ -246,7 +269,7 @@ fn run_loop(
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
-        let _ = tx.send(Event::ConnectionChanged(false));
+        events.send(Event::ConnectionChanged(false));
         wait_before_reconnect(&stopped);
     }
 }
@@ -260,7 +283,7 @@ fn wait_before_reconnect(stopped: &AtomicBool) {
     }
 }
 
-fn send_hello(socket: &SharedSocket, counters: &Counters) {
+fn send_hello(socket: &SharedSocket, counters: &Counters, log: fn(&str)) {
     let id = counters.next();
     counters.last_hello.store(id, Ordering::SeqCst);
     let request = json!({
@@ -274,24 +297,25 @@ fn send_hello(socket: &SharedSocket, counters: &Counters) {
             .write_all(request.to_string().as_bytes())
             .and_then(|()| stream.write_all(b"\n"))
         {
-            log_line(&format!("broker hello: {error}"));
+            log(&format!("broker hello: {error}"));
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
 }
 
-fn handle_line(line: &str, counters: &Counters, tx: &Sender<Event>) {
+fn handle_line(line: &str, counters: &Counters, events: &Notifier) {
+    let log = events.log;
     let Ok(root) = serde_json::from_str::<Value>(line) else {
-        log_line(&format!("broker parse: {line}"));
+        log(&format!("broker parse: {line}"));
         return;
     };
 
     if string(&root, "type") == "ui.prompt" {
         match serde_json::from_value::<PromptInfo>(root.clone()) {
             Ok(prompt) => {
-                let _ = tx.send(Event::Prompt(prompt));
+                events.send(Event::Prompt(prompt));
             }
-            Err(error) => log_line(&format!("prompt parse: {error}")),
+            Err(error) => log(&format!("prompt parse: {error}")),
         }
         return;
     }
@@ -300,9 +324,9 @@ fn handle_line(line: &str, counters: &Counters, tx: &Sender<Event>) {
         if let Some(notices) = root.get("notices") {
             match serde_json::from_value::<Vec<NoticeInfo>>(notices.clone()) {
                 Ok(notices) => {
-                    let _ = tx.send(Event::Notice(notices));
+                    events.send(Event::Notice(notices));
                 }
-                Err(error) => log_line(&format!("notice parse: {error}")),
+                Err(error) => log(&format!("notice parse: {error}")),
             }
         }
         return;
@@ -314,13 +338,13 @@ fn handle_line(line: &str, counters: &Counters, tx: &Sender<Event>) {
 
     if let Some(grants) = root.get("grants") {
         if let Ok(grants) = serde_json::from_value::<Vec<GrantInfo>>(grants.clone()) {
-            let _ = tx.send(Event::Grants(grants));
+            events.send(Event::Grants(grants));
         }
         return;
     }
 
     if let Some(revoked) = root.get("revoked").and_then(Value::as_bool) {
-        let _ = tx.send(Event::RevokeFinished(
+        events.send(Event::RevokeFinished(
             revoked,
             if revoked {
                 String::new()
@@ -328,35 +352,32 @@ fn handle_line(line: &str, counters: &Counters, tx: &Sender<Event>) {
                 "not_found".into()
             },
         ));
-        if revoked {
-            // The UI asks for the fresh list itself after a successful revoke.
-        }
         return;
     }
 
     if id == format!("hello-{}", counters.last_hello.load(Ordering::SeqCst)) {
         if status != "ok" {
-            let _ = tx.send(Event::StatusMessage(format!(
+            events.send(Event::StatusMessage(format!(
                 "tv-authd rejected this UI ({error})."
             )));
         } else {
-            let _ = tx.send(Event::HelloAccepted(string(&root, "launch")));
+            events.send(Event::HelloAccepted);
         }
         return;
     }
 
     if id == format!("notify-{}", counters.last_notify.load(Ordering::SeqCst)) {
-        let _ = tx.send(Event::NotifyFinished(status == "ok", error));
+        events.send(Event::NotifyFinished(status == "ok", error));
         return;
     }
 
     if id == format!("decision-{}", counters.last_decision.load(Ordering::SeqCst)) {
-        let _ = tx.send(Event::DecisionFinished(status == "ok", error));
+        events.send(Event::DecisionFinished(status == "ok", error));
         return;
     }
 
     if id == format!("grants-{}", counters.last_grants.load(Ordering::SeqCst)) && status != "ok" {
-        let _ = tx.send(Event::StatusMessage(format!(
+        events.send(Event::StatusMessage(format!(
             "Could not load grants ({error})."
         )));
     }
@@ -374,9 +395,14 @@ fn string(value: &Value, name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn notifier() -> (Notifier, std::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Notifier::new(tx, Arc::new(|| {}), |_| {}), rx)
+    }
+
     #[test]
     fn parses_prompt_notice_and_grants() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = notifier();
         let counters = Counters::default();
         handle_line(
             r#"{"version":2,"type":"ui.prompt","prompt_id":"p","nonce":"n","request_id":"r","label":"User::Pkg::org.example.app","package":"org.example.app","kind":"install","install":{"pkgid":"org.example.app","name":"Example","pkg_version":"1.0.0","pkg_type":"wgt","size_bytes":12,"privileges":["http://tizen.org/privilege/internet"],"signature":"user_ca","is_upgrade":false},"command":"install wgt /x","command_bytes":15,"command_truncated":false,"timeout_ms":60000}"#,
@@ -417,16 +443,16 @@ mod tests {
 
     #[test]
     fn matches_response_ids() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = notifier();
         let counters = Counters::default();
         counters.last_hello.store(7, Ordering::SeqCst);
         handle_line(
-            r#"{"version":2,"id":"hello-7","status":"ok","launch":"notice"}"#,
+            r#"{"version":2,"id":"hello-7","status":"ok"}"#,
             &counters,
             &tx,
         );
         match rx.try_recv().unwrap() {
-            Event::HelloAccepted(launch) => assert_eq!(launch, "notice"),
+            Event::HelloAccepted => {}
             other => panic!("unexpected: {other:?}"),
         }
     }

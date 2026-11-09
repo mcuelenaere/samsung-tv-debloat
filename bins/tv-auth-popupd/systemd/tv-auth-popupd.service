@@ -1,0 +1,37 @@
+# Install this unit source at /opt/tv-units/tv-auth-popupd.service (0600) and
+# the binary at /opt/tv-auth/tv-auth-popupd (0755, SMACK label "_" so the
+# User::Pkg::org.tvauth.ui domain may map it). The AT-HUB boot hook copies the
+# unit into /run/systemd/system and starts it.
+[Unit]
+Description=tv-auth prompt and toast overlay
+After=tv-authd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# tv-authd accepts ui.hello only from uid 5001 with the UI package's label;
+# the same identity is what Wayland and cynara check for the TOP notification
+# level (window.priority.set is declared by the org.tvauth.ui package).
+User=owner
+Group=users
+SupplementaryGroups=display
+SmackProcessLabel=User::Pkg::org.tvauth.ui
+Environment=HOME=/home/owner
+Environment=XDG_RUNTIME_DIR=/run
+Environment=WAYLAND_DISPLAY=wayland-0
+# /opt is on the VDFS, where UEP rejects unsigned ELFs: map it through /run,
+# exactly like tv-authd.service.
+BindReadOnlyPaths=/opt/tv-auth:/run/opt/tv-auth
+ExecStart=/run/opt/tv-auth/tv-auth-popupd
+# EFL logs every window commit at ERR level; the popup keeps its own log in
+# /tmp/tvauth-popupd.log.
+StandardOutput=null
+StandardError=null
+# The broker client reconnects on its own; restart only if the process dies
+# (for example when Wayland is not up yet early in boot).
+Restart=always
+RestartSec=2
+
+[Install]
+# The systemd unit path is read-only; this section is documentation only.
+WantedBy=multi-user.target

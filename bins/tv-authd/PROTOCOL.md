@@ -16,7 +16,7 @@ Limits:
 - default and maximum install timeout: 120,000 ms;
 - maximum package source path: 4096 bytes;
 - default prompt timeout: 60,000 ms;
-- default UI launch/connect timeout: 10,000 ms;
+- default wait for the popup UI to (re)attach: 10,000 ms;
 - maximum concurrent clients: 16 by default, plus a separate allowance of 2 for the approval UI;
 - a complete request line must arrive within the idle timeout (30 s apps, 600 s UI) of the daemon starting to wait for it;
 - at most 1024 distinct request IDs per connection;
@@ -41,6 +41,10 @@ role is fixed for the whole connection:
 - **approval UI**: exact `User::Pkg::org.tvauth.ui` label and UID 5001 by
   default; may send `ui.hello`, `ui.decision`, `grants.list`,
   `grants.notify`, and `grants.revoke`, and may not send `exec` or `pkg.*`.
+  Two processes hold this identity: the persistent `tv-auth-popupd` (systemd
+  sets the label; it registers with `ui.hello` and receives prompts/notices)
+  and the user-launched `org.tvauth.ui` grant manager (`grants.*` only, no
+  `ui.hello`).
 
 The UI package and UID are daemon settings (`--ui-package`, `--ui-uid`). Missing,
 unexpected, or non-package labels fail closed; UID 0 with any other label is
@@ -114,8 +118,7 @@ approval flow. M2 errors include:
 | `user_denied` | the user chose Deny |
 | `prompt_timeout` | no decision arrived before the prompt timeout |
 | `ui_disconnected` | the UI connection dropped while the prompt was pending and the retry limit (2 re-shows) was exhausted |
-| `ui_unavailable` | no UI connected and launch attempts were exhausted |
-| `ui_launch_failed` | the fixed launcher could not be started |
+| `ui_unavailable` | no popup UI attached within the attach timeout |
 | `prompt_queue_full` | the global approval queue is full |
 | `request_already_pending` | this package already has a queued or active request |
 | `grant_persist_failed` | Always allow could not be saved; the command did not run |
@@ -307,9 +310,9 @@ Failures return `package_list_failed`; a daemon without package support returns
 
 ## `ui.hello`
 
-Registers this connection as the approval UI. It is required before any other UI
-method. A newer registration replaces an older one and cancels/re-prompts the
-active request.
+Registers this connection as the prompt/notice UI (`tv-auth-popupd`). It is
+required before `ui.decision`; `grants.*` work without it. A newer
+registration replaces an older one and re-prompts the active request.
 
 ```json
 {"version": 2, "id": "hello-1", "method": "ui.hello"}
@@ -321,10 +324,8 @@ Response:
 {"version": 2, "id": "hello-1", "status": "ok"}
 ```
 
-When the daemon launched the UI only to show execution notices (no prompt was
-waiting), the response carries `"launch": "notice"`. The UI should then stay
-out of the way: no full-screen window, no key grabs. The approval manager writes
-this response, so it always precedes any `ui.prompt` or `ui.notice`.
+The daemon never launches a UI. The approval manager writes this response, so
+it always precedes any `ui.prompt` or `ui.notice`.
 
 Errors: `not_ui` (wrong label or UID), `already_registered` (this connection
 already registered), `ui_register_failed`.
@@ -432,9 +433,13 @@ one. Delivery is near real-time:
 - execs within the next 250 ms are coalesced per package into one message,
   which only caps the message rate during bursts;
 - notices are held while a prompt is active or queued;
-- if no UI is connected the daemon launches it (same launcher and attempt
-  limits as prompts); if that fails the notices are dropped and no launch is
-  retried for notices for 60 s. Notices never delay or block execution.
+- if no popup is attached they stay queued (coalesced, at most 16 packages)
+  until one attaches; a notice that fails to write twice pauses notices for
+  60 s. Notices never delay or block execution.
+
+A queued prompt with no popup attached waits up to the attach timeout
+(`--ui-attach-timeout-ms`, default 10 s, covering a systemd restart of
+`tv-auth-popupd`) and is then denied with `ui_unavailable`.
 
 Keeping the screen quiet is the UI's job: it shows one toast and updates it in
 place.
@@ -532,8 +537,7 @@ Sets when a granted package's executions produce a `ui.notice`:
 - `never` — no notices.
 
 Response: `{"version": 2, "id": "notify-1", "status": "ok"}`. Errors:
-`not_found` (no grant for that label), `invalid_label`, `grant_save_failed`,
-`not_registered`.
+`not_found` (no grant for that label), `invalid_label`, `grant_save_failed`.
 
 ## `grants.revoke`
 
@@ -553,7 +557,7 @@ Response:
 ```
 
 `revoked` is `false` if the grant did not exist. Errors: `invalid_label`,
-`grant_save_failed`, `not_registered`.
+`grant_save_failed`.
 
 ## Package installation policy
 

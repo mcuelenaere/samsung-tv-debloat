@@ -311,3 +311,22 @@ change subscriptions and the `.webappservice.db` reader for Phases 4/6; streamed
 downloads with progress for Phase 3. Note for Phase 4: `tv-tizen` links
 glibc libraries, so a static-musl `tv-blockd` cannot use it and would need the
 gnueabi target or `vconftool`.
+
+### Phase 2 — done (2026-11-09)
+
+| Plan | Implemented |
+|---|---|
+| `tv-auth-popupd` systemd daemon | `bins/tv-auth-popupd` + `systemd/tv-auth-popupd.service`: uid 5001 with `SmackProcessLabel=User::Pkg::org.tvauth.ui` (no AUL; `elm_init`/`elm_run`), `/opt/tv-auth` mapped at `/run/opt/tv-auth` for UEP like `tv-authd`. Hidden and key-free when idle; `Ecore_Pipe` wake-ups, timer only while visible. Prompts at TOP with BACK grabbed only during the prompt; toasts never grab. ~469 KB binary (std + serde_json; the plan's ~30 KB was optimistic), 7–14 MB RSS. |
+| simplify `approval.rs` | the `app_launcher` spawn, `LaunchState`, launch retries/cooldown, and the notice-only `launch` hello flag are gone. A queued prompt waits `--ui-attach-timeout-ms` (10 s) for a popup, then fails `ui_unavailable`; notices queue until a popup attaches; disconnect re-prompts are kept. CLI flags `--app-launcher`, `--ui-app-id`, `--ui-launch-timeout-ms`, `--launch-cooldown-ms`, `--max-launch-attempts` were removed. |
+| `org.tvauth.ui` as manager | now manager-only and sends no `ui.hello`; the daemon serves `grants.*` to the UI identity without registration. Full Store/Tweaks UI is Phase 3. |
+| shared code | the UI's broker client moved to `tv_proto::client` (optional hello, injectable log and wake hooks) and its markup helpers to `tv_proto::markup`; widgets, log, `elm_init`/`elm_run`, `Ecore_Pipe` FFI to `tv-efl`. `tv-efl/examples/overlay-probe.rs` checks the standalone-overlay path on the TV. |
+| `.wgt` `Load archive info fail` | did not reproduce: minimal WGTs install through the existing WAS path, appear in Home, launch, and uninstall, and plain `pkgcmd` gets past archive loading. No daemon change was needed; see the 2026-11-09 update in `docs/tv-authd-pkg-install-plan.md`. |
+
+Validated on tv-living (2026-11-09): the popup registered with the old and the
+new daemon (re-attaching within 2 s of a daemon restart); toasts for a Vetro
+first-use exec and a root install; prompts from a package identity
+(`tvauth-cli exec id` under `systemd-run`) appeared within ~1 s and were
+decided by timeout (`prompt_timeout`), injected BACK (`user_denied`), and
+injected Right + Return (Allow once, `id` ran as root); idle CPU stayed at 0.
+Not exercised: **Always allow** from the popup, a popup crash during a prompt,
+and a cold boot with the new unit.

@@ -20,8 +20,14 @@ chmod 0755 /run/tvauth-cli
 
 It sends one version-2 request to `/run/tv-auth/broker.sock` (override with
 `--socket PATH`), prints the raw response line, and exits 0 only for
-`"status":"ok"`. `exec` is deliberately unsupported: root clients cannot run
-commands.
+`"status":"ok"`. The daemon refuses `exec` from the root role; `tvauth-cli exec
+<command>` exists to trigger a real approval prompt from a package identity:
+
+```sh
+systemd-run --unit=prompt-test -p User=owner -p Group=users \
+    -p SmackProcessLabel=User::Pkg::<installed pkgid> \
+    -p StandardOutput=file:/run/prompt-test.out /run/tvauth-cli exec id
+```
 
 It builds requests with `serde_json` and talks to the socket through
 `tv_proto::call`. `cargo test -p tvauth-cli` checks that every request it
