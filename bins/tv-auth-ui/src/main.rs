@@ -169,6 +169,15 @@ struct Row {
     icon: Option<(String, *mut c_void)>,
 }
 
+/// The store list, set aside while a details page is shown.
+struct ParkedList {
+    objects: Vec<*mut c_void>,
+    entries: Vec<usize>,
+    rows: Vec<Row>,
+    list_box: *mut c_void,
+    count_label: *mut c_void,
+}
+
 struct Ui {
     window: *mut c_void,
     status_label: *mut c_void,
@@ -189,6 +198,7 @@ struct Ui {
     rows: Vec<Row>,
     list_box: *mut c_void,
     count_label: *mut c_void,
+    parked_list: Option<ParkedList>,
     /// The on-screen progress bar and its label in the changing build's row,
     /// if rendered.
     progress: *mut c_void,
@@ -221,6 +231,7 @@ impl Ui {
             rows: Vec::new(),
             list_box: ptr::null_mut(),
             count_label: ptr::null_mut(),
+            parked_list: None,
             progress: ptr::null_mut(),
             progress_label: ptr::null_mut(),
             grants: Vec::new(),
@@ -607,6 +618,11 @@ impl Ui {
         if self.content_box.is_null() {
             return;
         }
+        if let Some(parked) = self.parked_list.take() {
+            for object in parked.objects {
+                unsafe { evas_object_del(object) };
+            }
+        }
         self.clear_content();
         self.progress = ptr::null_mut();
         self.progress_label = ptr::null_mut();
@@ -874,7 +890,9 @@ impl Ui {
                 if in_list {
                     buttons.push(create_button(row_box, "Details", on_details_clicked, data));
                 }
-                if !changing {
+                // In the list, an app that is not installed only offers
+                // Details; installing happens on its page.
+                if !changing && !(in_list && state == State::NotInstalled) {
                     buttons.push(match state {
                         State::NotInstalled => {
                             create_button(row_box, "Install", on_install_clicked, data)
@@ -1010,11 +1028,6 @@ impl Ui {
     fn render_details(&mut self, group_index: usize) -> *mut c_void {
         let group = self.store.groups[group_index].clone();
         let versions = self.store.versions();
-        let top = create_row(self.content_box);
-        self.add_content(top);
-        let back = create_button(top, "Back", on_details_back, ptr::null_mut());
-        add_to_box(top, create_label(top, ""));
-
         let (header, header_box) = panel(self.content_box, COLOR_ROW, 32, 24);
         self.add_content(header);
         unsafe {
@@ -1146,15 +1159,37 @@ impl Ui {
             .iter()
             .map(|row| row.primary)
             .find(|primary| !primary.is_null())
-            .unwrap_or(back)
+            .unwrap_or(ptr::null_mut())
     }
 
+    /// Open an app's details page. The list stays alive (unpacked and
+    /// hidden) so closing the page restores it exactly: scroll position,
+    /// loaded rows and focus.
     fn open_details(&mut self, key: usize) {
         let (group, _) = split_key(key);
         self.store.list_key = Some(row_key(group, None));
         self.store.focus_key = None;
         self.store.detail = Some(group);
-        self.render();
+        let objects = std::mem::take(&mut self.content_objects);
+        for &object in &objects {
+            unsafe {
+                elm_box_unpack(self.content_box, object);
+                evas_object_hide(object);
+            }
+        }
+        self.parked_list = Some(ParkedList {
+            objects,
+            entries: std::mem::take(&mut self.entries),
+            rows: std::mem::take(&mut self.rows),
+            list_box: self.list_box,
+            count_label: self.count_label,
+        });
+        self.progress = ptr::null_mut();
+        self.progress_label = ptr::null_mut();
+        let focus = self.render_details(group);
+        if !focus.is_null() {
+            unsafe { elm_object_focus_set(focus, 1) };
+        }
     }
 
     /// Back to the list, focused on the app whose details were open.
@@ -1162,7 +1197,29 @@ impl Ui {
         self.store.detail = None;
         self.store.focus_key = self.store.list_key.take();
         self.store.focus_on_action = false;
-        self.render();
+        let Some(parked) = self.parked_list.take() else {
+            self.render();
+            return;
+        };
+        // The details rows die with their scroller.
+        self.rows.clear();
+        self.clear_content();
+        for &object in &parked.objects {
+            unsafe {
+                elm_box_pack_end(self.content_box, object);
+                evas_object_show(object);
+            }
+        }
+        self.content_objects = parked.objects;
+        self.entries = parked.entries;
+        self.rows = parked.rows;
+        self.list_box = parked.list_box;
+        self.count_label = parked.count_label;
+        self.progress = ptr::null_mut();
+        self.progress_label = ptr::null_mut();
+        // Installs or removals on the details page changed some rows'
+        // buttons; rebuilding in place also refocuses the app's row.
+        self.refresh_rows();
     }
 
     /// Focus moved to a row: remember it, and extend the list before the
@@ -1670,10 +1727,6 @@ unsafe extern "C" fn on_details_clicked(
     if data as usize != 0 {
         ui().open_details(data as usize);
     }
-}
-
-unsafe extern "C" fn on_details_back(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    ui().close_details();
 }
 
 unsafe extern "C" fn on_reload_clicked(

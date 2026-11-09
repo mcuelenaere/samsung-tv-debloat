@@ -63,13 +63,15 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   than an hour ahead.
 - Lists one row per app (135 today): community entries grouped by their
   `group` (variants become builds), and each release provider's latest
-  release as one app whose assets are its builds. Each row has **Details**
-  plus its quick action (Install/Update/Open; apps with several builds show
-  "N builds" and Open when one is installed).
+  release as one app whose assets are its builds. Each row has **Details**;
+  installed apps also have **Open** (or **Update** when the catalog is
+  newer). Installing starts from the details page.
 - **Details** opens a page with the large icon, full description, category,
   package id(s), source repository, minimum Tizen version, catalog flags
   (closed-source, self-updating, root, Partner certificate), and every build
-  with Install/Update/Open/Remove. BACK returns to the list on the same app.
+  with Install/Update/Open/Remove. BACK (there is no on-screen Back button)
+  returns to the list exactly as it was: the list is unpacked and hidden
+  while the page is open, not rebuilt, so scroll position and focus survive.
   Installed apps sort first, then by name; the order stays put until the
   filter changes. One scrolling list: rows are appended 16 at a time as
   focus nears the end, and the scroller follows focus.
