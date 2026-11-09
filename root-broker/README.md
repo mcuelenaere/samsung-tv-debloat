@@ -7,8 +7,14 @@ The M0 platform spikes, M1 headless broker, M2 approval UI, M3/Vetro cutover, an
 - `spikes/armv7-hello/`: static ARMv7 Rust build and execution smoke test;
 - `spikes/peer-identity/`: Unix-socket `SO_PEERCRED` and `SO_PEERSEC` probe;
 - `spikes/efl-popup/`: native Rust/EFL probe (UEP-rejected) and the validated managed .NET/EFL popup;
-- `daemon/`: Rust broker, protocol, approval manager, tests, ARMv7 build, and systemd unit;
-- `ui/`: managed Tizen .NET approval prompt and grant manager.
+- `../bins/tv-authd/`: Rust broker, approval manager, tests, ARMv7 build, and systemd unit;
+- `../bins/tv-auth-ui/`: native Rust/EFL approval prompt and grant manager (`org.tvauth.ui`);
+- `../bins/tv-auth-cli/`: static root-role client (`tvauth-cli`);
+- `../crates/tv-proto/`: the broker wire protocol shared by the daemon and its clients.
+
+The production code moved into the repository's Cargo workspace (see
+[`../README.md`](../README.md)); this directory keeps the spikes, probes, and
+working notes.
 
 Each spike records its own build commands and validation results. Host builds and emulation do not count as on-TV validation.
 

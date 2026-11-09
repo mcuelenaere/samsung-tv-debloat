@@ -6,11 +6,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SPIKE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 ROOT_BROKER=$(cd -- "$SPIKE_DIR/../.." && pwd)
-SYSROOT="$ROOT_BROKER/sysroot/tv-6.5"
+SYSROOT="$ROOT_BROKER/../sysroot/tv-6.5"
 IMAGE=rust:1.85.0-slim-bullseye@sha256:a78439ac2ee14dc1c2c188fef0ff0b197e1cc1918d4b3daf486776ac0f60029a
 
 if [[ ! -f "$SYSROOT/usr/lib/libcapi-appfw-application.so" ]]; then
-    printf 'missing TV sysroot; run ../../sysroot/fetch-tv-sysroot.sh first\n' >&2
+    printf 'missing TV sysroot; run ../../../sysroot/fetch-tv-sysroot.sh first\n' >&2
     exit 1
 fi
 

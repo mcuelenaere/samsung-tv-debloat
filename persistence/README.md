@@ -136,7 +136,7 @@ Note: `systemctl reboot` fails on this firmware with
 | `parseinfo.sh` | `/opt/etc/parseinfo.sh` | Dynamic boot hook |
 | `dropbear.service` | `/opt/tv-units/dropbear.service` | Dropbear from root-only source |
 
-The broker unit and payload are maintained under `root-broker/daemon/`.
+The broker unit and payload are maintained under `bins/tv-authd/`.
 
 ## Deployment and recovery
 

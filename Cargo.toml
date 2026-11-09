@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bins/*"]
+# Spikes keep their own lockfiles and toolchains.
+exclude = ["root-broker"]
+# Host builds: the EFL binary only links against the TV sysroot (see
+# bins/tv-auth-ui/build-ui.sh), so plain `cargo build` skips it.
+default-members = ["crates/tv-proto", "bins/tv-authd", "bins/tv-auth-cli"]
+
+[workspace.dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tv-proto = { path = "crates/tv-proto" }
+tv-efl = { path = "crates/tv-efl" }
+tv-tizen = { path = "crates/tv-tizen" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Cross-link the Rust/EFL spike for the TV's soft-float ARMv7 ABI.
 # The TV is not contacted by this script; the minimal sysroot must already
-# exist under root-broker/sysroot/tv-6.5/.
+# exist under sysroot/tv-6.5/.
 set -euo pipefail
 
 SPIKE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_BROKER=$(cd -- "$SPIKE_DIR/../.." && pwd)
-SYSROOT="$ROOT_BROKER/sysroot/tv-6.5"
+SYSROOT="$ROOT_BROKER/../sysroot/tv-6.5"
 IMAGE=rust:1.85.0-slim-bullseye@sha256:a78439ac2ee14dc1c2c188fef0ff0b197e1cc1918d4b3daf486776ac0f60029a
 
 for lib in \
@@ -16,7 +16,7 @@ for lib in \
     libelementary.so \
     libevas.so; do
     if [[ ! -f "$SYSROOT/usr/lib/$lib" ]]; then
-        printf 'missing %s\nRun ../../sysroot/fetch-tv-sysroot.sh first.\n' "$SYSROOT/usr/lib/$lib" >&2
+        printf 'missing %s\nRun ../../../sysroot/fetch-tv-sysroot.sh first.\n' "$SYSROOT/usr/lib/$lib" >&2
         exit 1
     fi
 done

@@ -1,0 +1,14 @@
+[package]
+name = "tv-tizen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Links the TV's platform libraries; only buildable for
+# armv7-unknown-linux-gnueabi against ../../sysroot.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+libc.workspace = true

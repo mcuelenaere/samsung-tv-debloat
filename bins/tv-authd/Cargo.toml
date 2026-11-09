@@ -1,0 +1,26 @@
+[package]
+name = "tv-authd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+# Direct dependency only to select flate2's pure-Rust backend: zip's `deflate`
+# feature would also pull zopfli, whose current release needs Rust 1.88 (the
+# cross build uses 1.85).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+getrandom = "0.2"
+lexopt = "0.3"
+libc.workspace = true
+roxmltree = "0.21"
+rustix = { version = "1", default-features = false, features = ["std", "net", "event", "fs", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+sha1 = "0.10"
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["flate2", "deflate-flate2"] }
+tv-proto.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

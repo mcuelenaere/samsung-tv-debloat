@@ -87,7 +87,7 @@ Test with the existing `brokerone` requester. Build the changed-content upgrade
 with:
 
 ```sh
-./root-broker/daemon/test-clients/build-upgrade-client.sh
+./bins/tv-authd/test-clients/build-upgrade-client.sh
 ```
 
 1. Install `org.tvauth.spike.brokerone` 0.1.0, grant **Always allow**.

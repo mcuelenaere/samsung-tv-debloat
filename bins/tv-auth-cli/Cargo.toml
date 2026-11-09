@@ -1,0 +1,9 @@
+[package]
+name = "tvauth-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+tv-proto.workspace = true

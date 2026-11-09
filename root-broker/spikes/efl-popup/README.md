@@ -7,7 +7,7 @@ below. On 2026-11-08 the same signed TPK was installed, its `bin/efl-popup` was
 replaced by a symlink to a read-only bind mount at
 `/run/tv-auth/spike-popup-bin/efl-popup`, and `app_launcher -s
 org.tvauth.spike.popup` then mapped the custom ELF and displayed the window.
-Production uses this path in `daemon/src/ui_alias.rs` and `ui/rust/`.
+Production uses this path in `bins/tv-authd/src/ui_alias.rs` and `bins/tv-auth-ui/`.
 
 The managed .NET/EFL equivalent was previously validated on-device: it
 installed, launched through AUL, set notification TOP, appeared over YouTube, and
@@ -59,7 +59,7 @@ with the actual TV packaging tools.
 ## Device-collected sysroot facts
 
 On 2026-11-04, the five directly referenced libraries were copied read-only from
-the target TV into the ignored `root-broker/sysroot/tv-6.5/` directory:
+the target TV into the ignored `sysroot/tv-6.5/` directory:
 
 | SONAME | TV file version | SHA-256 |
 |---|---|---|
@@ -250,7 +250,7 @@ build then ran locally against those files; the device was not made to execute
 the binary.
 
 ```sh
-./../../sysroot/fetch-tv-sysroot.sh
+../../../sysroot/fetch-tv-sysroot.sh
 ./build-armv7-softfloat.sh
 ```
 
