@@ -210,6 +210,10 @@ impl Popup {
                 if !self.back_grabbed {
                     log_line("XF86Back keygrab failed");
                 }
+                // The compositor drops the level when the window is unmapped,
+                // so a re-shown prompt would sink to NOTIFICATION_LOW (below
+                // the manager). Re-apply it on every show.
+                set_highest_notification_level(self.window);
                 evas_object_show(self.window);
                 elm_win_raise(self.window);
                 elm_win_activate(self.window);
@@ -343,6 +347,7 @@ impl Popup {
                     self.screen_w - TOAST_WIDTH - 2 * TOAST_PADDING - TOAST_MARGIN,
                     TOAST_MARGIN,
                 );
+                set_highest_notification_level(self.toast_window);
                 evas_object_show(self.toast_window);
             }
         }

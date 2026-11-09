@@ -57,6 +57,8 @@ copy_as /usr/lib/libaul.so.0.43.16 libaul.so \
     3f6e0f15f125ffee8750914b6d795275fb56824f9017bb22799498feebf71f7a
 copy_as /usr/lib/libcurl.so.4.7.0 libcurl.so \
     6f3dd180cbc10c1a9753bd838eb47b51c04d9ffe76a889b597c8f3f0e075c5c3
+copy_as /usr/lib/libcrypto.so.1.1 libcrypto.so \
+    d763b8173e8aacf7e78fee2e20265cd8f199a8eed1522c0e7100324b6fb818a4
 
 printf 'Collected minimal sysroot from %s (%s)\n' "$HOST" "$actual_target"
 find "$DEST" -maxdepth 1 -type f -print0 | sort -z | xargs -0 shasum -a 256

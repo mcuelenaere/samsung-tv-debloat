@@ -387,7 +387,9 @@ fn parse_args() -> Result<Option<Args>, String> {
     });
     let server = ServerConfig {
         max_connections,
-        max_ui_connections: 2,
+        // tv-auth-popupd, the manager's grant client, and the manager's
+        // one-shot store calls (pkg.list, an install, grants.audit).
+        max_ui_connections: 6,
         max_requests_per_connection: 1024,
         ui_label: format!("User::Pkg::{ui_package}"),
         ui_uid,

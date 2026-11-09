@@ -2,10 +2,11 @@
 <manifest xmlns="http://tizen.org/ns/packages" package="org.tvauth.ui" version="0.1.0" api-version="6.5">
   <profile name="tv"/>
   <ui-application appid="org.tvauth.ui" exec="tv-auth-ui" type="capp" multiple="false" taskmanage="true" nodisplay="false" launch_mode="single">
-    <label>Root access manager</label>
+    <label>TV suite</label>
     <icon>org.tvauth.ui.png</icon>
   </ui-application>
   <privileges>
     <privilege>http://tizen.org/privilege/window.priority.set</privilege>
+    <privilege>http://tizen.org/privilege/internet</privilege>
   </privileges>
 </manifest>

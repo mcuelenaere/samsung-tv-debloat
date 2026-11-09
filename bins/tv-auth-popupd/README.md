@@ -5,13 +5,22 @@ on-demand launch of `org.tvauth.ui` (1–3 s AUL cold start, a notice-only
 heuristic, and launch retry/cooldown state in the daemon).
 
 - systemd runs it as uid 5001 with `SmackProcessLabel=User::Pkg::org.tvauth.ui`
-  (the identity the daemon accepts for `ui.hello`, and the one cynara checks
-  for the TOP notification level), outside AUL: plain `elm_init`/`elm_run`.
+  (the identity the daemon accepts for `ui.hello`), outside AUL: plain
+  `elm_init`/`elm_run`.
 - It stays connected and invisible. Idle: no mapped window, no key grab, no
   timer (broker events wake the loop through an `Ecore_Pipe`), 0 CPU, ~7 MB RSS
   before the first window and ~13 MB after.
-- `ui.prompt`: full-screen modal at notification level TOP, BACK grabbed only
-  while it is shown.
+- `ui.prompt`: full-screen modal, BACK grabbed only while it is shown.
+
+**Known limitation (2026-11-09):** `efl_util_set_notification_window_level`
+returns success for this systemd-started process, but the compositor does not
+honour it: `enlightenment_info -topvwins` shows the prompt in
+`E_LAYER_CLIENT_ABOVE` and the toast in `NOTIFICATION_LOW`, so any
+notification-layer window (Samsung overlays, the `org.tvauth.ui` manager) can
+cover the prompt. The old AUL-launched UI did get TOP. The level is re-applied
+on every show (it is dropped on unmap anyway), and the manager hides itself
+while it waits on a prompt. Getting real TOP for a non-AUL client needs a look
+at e20's level policy; until then this is weaker than the pre-Phase-2 UI.
 - `ui.notice`: a focus-skipping toast that never grabs keys.
 
 ## Behavior
@@ -21,8 +30,8 @@ heuristic, and launch retry/cooldown state in the daemon).
 When an app without a persistent grant connects, the daemon sends a
 `ui.prompt` frame to the attached popup, which:
 
-- raises a full-screen notification-type EFL window (notification level TOP,
-  then HIGH, MEDIUM, DEFAULT) with a dimmed scrim and a solid centered card;
+- raises a full-screen notification-type EFL window (requesting notification
+  level TOP, then HIGH, MEDIUM, DEFAULT; see the limitation above) with a dimmed scrim and a solid centered card;
 - displays the exact package ID and SMACK label from the daemon, plus the
   daemon-generated **FULL ROOT ACCESS** warning;
 - displays a sanitized display copy of the command (long commands are
@@ -108,13 +117,14 @@ the `window.priority.set` privilege for the label. The log is
 ## Validation (tv-living, 2026-11-09)
 
 - A standalone overlay probe (`crates/tv-efl/examples/overlay-probe.rs`) under
-  `systemd-run` with this identity created a notification window, got level
-  TOP (`0`), and set/unset the XF86Back keygrab.
+  `systemd-run` with this identity created a notification window (efl_util
+  returned `0` for TOP, but see the limitation above) and set/unset the
+  XF86Back keygrab.
 - The unit started as uid 5001 with `User::Pkg::org.tvauth.ui`, mapped
   `/run/opt/tv-auth/tv-auth-popupd`, and registered with both the previous and
   the new daemon; after a `tv-authd` restart it re-attached within 2 s.
 - Toasts: a Vetro first-use notice and a root `pkg.install` notice rendered at
-  TOP without launching any app.
+  without launching any app.
 - Prompts (requester: `tvauth-cli exec id` under `systemd-run` with an installed
   package's label): the window was visible within ~1 s of `prompt_sent`;
   timeout → `prompt_timeout` denial and the window unmapped 2 s later;

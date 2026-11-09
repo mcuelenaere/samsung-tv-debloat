@@ -142,6 +142,15 @@ pub struct GrantsNotifyRequest {
     pub notify: NotifyMode,
 }
 
+/// Recent approval decisions and package changes from the daemon log.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantsAuditRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
@@ -275,6 +284,7 @@ pub enum Request {
     GrantsList(GrantsListRequest),
     GrantsRevoke(GrantsRevokeRequest),
     GrantsNotify(GrantsNotifyRequest),
+    GrantsAudit(GrantsAuditRequest),
     PkgInstall(InstallRequest),
     PkgUninstall(UninstallRequest),
     PkgList(ListPackagesRequest),
@@ -289,6 +299,7 @@ impl Request {
             Self::GrantsList(request) => &request.id,
             Self::GrantsRevoke(request) => &request.id,
             Self::GrantsNotify(request) => &request.id,
+            Self::GrantsAudit(request) => &request.id,
             Self::PkgInstall(request) => &request.id,
             Self::PkgUninstall(request) => &request.id,
             Self::PkgList(request) => &request.id,
@@ -338,6 +349,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
         }
         "grants.notify" => {
             serde_json::from_slice::<GrantsNotifyRequest>(bytes).map(Request::GrantsNotify)
+        }
+        "grants.audit" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<GrantsAuditRequest>(bytes).map(Request::GrantsAudit)
         }
         "pkg.install" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
             serde_json::from_slice::<InstallRequest>(bytes).map(Request::PkgInstall)
@@ -441,6 +455,9 @@ pub struct Response {
     pub truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<GrantView>>,
+    /// `grants.audit` result: `"<unix seconds> <event>"` lines, oldest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,6 +490,7 @@ impl Response {
             stderr_b64: None,
             truncated: None,
             grants: None,
+            audit: None,
             revoked: None,
             pkgid: None,
             pkg_version: None,
@@ -501,6 +519,7 @@ impl Response {
             stderr_b64: Some(engine.encode(outcome.stderr)),
             truncated: Some(outcome.truncated),
             grants: None,
+            audit: None,
             revoked: None,
             pkgid: None,
             pkg_version: None,
@@ -564,6 +583,12 @@ impl Response {
     pub fn grants(id: &str, grants: Vec<GrantView>) -> Self {
         let mut response = Self::base(id, "ok");
         response.grants = Some(grants);
+        response
+    }
+
+    pub fn audit(id: &str, lines: Vec<String>) -> Self {
+        let mut response = Self::base(id, "ok");
+        response.audit = Some(lines);
         response
     }
 

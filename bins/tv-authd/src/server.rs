@@ -140,7 +140,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 16,
-            max_ui_connections: 2,
+            max_ui_connections: 6,
             max_requests_per_connection: 1024,
             ui_label: "User::Pkg::org.tvauth.ui".into(),
             ui_uid: 5001,
@@ -341,6 +341,7 @@ pub fn handle_connection(
                 &writer,
                 &identity,
                 &broker,
+                config,
                 request,
                 &mut ui_token,
                 &control,
@@ -360,10 +361,16 @@ pub fn handle_connection(
     result
 }
 
+/// `grants.audit` scans this much of the newest log and returns at most
+/// this many lines.
+const AUDIT_SCAN_BYTES: u64 = 128 * 1024;
+const AUDIT_LINES: usize = 30;
+
 fn handle_ui_request(
     writer: &Arc<Mutex<UnixStream>>,
     identity: &PeerIdentity,
     broker: &Arc<Broker>,
+    config: &ServerConfig,
     request: Request,
     ui_token: &mut Option<u64>,
     control: &UnixStream,
@@ -516,35 +523,35 @@ fn handle_ui_request(
             );
             send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
         }
+        // The manager's store installs like any package: through staging,
+        // policy, and a user prompt (shown by tv-auth-popupd). It can never
+        // change its own package; that guard applies to every non-root role.
         Request::PkgInstall(request) => {
-            log(
-                broker,
-                &format!(
-                    "requester={} uid={} pid={} request={} denied=ui_role_method=pkg.install",
-                    identity.label, identity.uid, identity.pid, request.id
-                ),
-            );
-            send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
+            handle_install(writer, identity, broker, config, request, true)?
         }
         Request::PkgUninstall(request) => {
-            log(
-                broker,
-                &format!(
-                    "requester={} uid={} pid={} request={} denied=ui_role_method=pkg.uninstall",
-                    identity.label, identity.uid, identity.pid, request.id
-                ),
-            );
-            send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
+            handle_uninstall(writer, identity, broker, config, request, true)?
         }
-        Request::PkgList(request) => {
-            log(
-                broker,
-                &format!(
-                    "requester={} uid={} pid={} request={} denied=ui_role_method=pkg.list",
-                    identity.label, identity.uid, identity.pid, request.id
-                ),
-            );
-            send(writer, &Response::error(&request.id, "denied", "ui_role"))?;
+        Request::PkgList(request) => handle_list(writer, identity, broker, config, request)?,
+        Request::GrantsAudit(request) => {
+            let lines = broker
+                .logger
+                .as_ref()
+                .map(|logger| logger.audit(AUDIT_SCAN_BYTES, AUDIT_LINES))
+                .transpose();
+            match lines {
+                Ok(lines) => send(
+                    writer,
+                    &Response::audit(&request.id, lines.unwrap_or_default()),
+                )?,
+                Err(error) => {
+                    log(broker, &format!("grants_audit_failed error={error}"));
+                    send(
+                        writer,
+                        &Response::error(&request.id, "error", "audit_unavailable"),
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -2990,24 +2997,38 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    /// The manager's store uses the ordinary, prompted package path, so it
+    /// is still barred from replacing or removing its own package.
     #[test]
-    fn ui_role_cannot_install_packages() {
-        let fixture = fixture();
+    fn ui_role_packages_follow_the_package_policy() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut fixture = fixture();
+        with_packages(&mut fixture, "#!/bin/sh\nprintf 'key[end] val[ok]\\n'\n");
+        let source = fixture
+            ._directory
+            .path()
+            .join("home/owner/org.tvauth.ui-0.1.0.wgt");
+        write_wgt(&source, "org.tvauth.ui");
+
         let (mut client, handle) = connect(&fixture, "User::Pkg::org.tvauth.ui", 5001);
-        client.send(json!({"version": 2, "id": "hello-1", "method": "ui.hello"}));
-        assert_eq!(client.read()["status"], "ok");
-        client.send(install_request("inst-1", "/opt/media/app.wgt"));
-        let response = client.read();
-        assert_eq!(response["status"], "denied");
-        assert_eq!(response["error"], "ui_role");
-        client.send(uninstall_request("uninst-1", "org.example.app"));
-        let response = client.read();
-        assert_eq!(response["status"], "denied");
-        assert_eq!(response["error"], "ui_role");
-        client.send(json!({"version": 2, "id": "list-1", "method": "pkg.list"}));
-        let response = client.read();
-        assert_eq!(response["status"], "denied");
-        assert_eq!(response["error"], "ui_role");
+        client.send(install_request("inst-1", source.to_str().unwrap()));
+        assert_eq!(client.read()["error"], "manifest_forbidden");
+        client.send(uninstall_request("uninst-1", "org.tvauth.ui"));
+        assert_eq!(client.read()["error"], "protected_package");
+        client.send(json!({"version": 2, "id": "audit-1", "method": "grants.audit"}));
+        assert!(client.read()["audit"].is_array());
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn grants_audit_is_ui_only() {
+        let fixture = fixture();
+        let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
+        client.send(json!({"version": 2, "id": "audit-1", "method": "grants.audit"}));
+        assert_eq!(client.read()["error"], "not_ui");
         drop(client);
         handle.join().unwrap().unwrap();
     }

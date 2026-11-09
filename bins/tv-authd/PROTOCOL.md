@@ -17,7 +17,7 @@ Limits:
 - maximum package source path: 4096 bytes;
 - default prompt timeout: 60,000 ms;
 - default wait for the popup UI to (re)attach: 10,000 ms;
-- maximum concurrent clients: 16 by default, plus a separate allowance of 2 for the approval UI;
+- maximum concurrent clients: 16 by default, plus a separate allowance of 6 for the UI identity (popup daemon, manager, and the manager's one-shot store calls);
 - a complete request line must arrive within the idle timeout (30 s apps, 600 s UI) of the daemon starting to wait for it;
 - at most 1024 distinct request IDs per connection;
 - default approval queue: 8 pending requests (including the active one).
@@ -43,8 +43,11 @@ role is fixed for the whole connection:
   `grants.notify`, and `grants.revoke`, and may not send `exec` or `pkg.*`.
   Two processes hold this identity: the persistent `tv-auth-popupd` (systemd
   sets the label; it registers with `ui.hello` and receives prompts/notices)
-  and the user-launched `org.tvauth.ui` grant manager (`grants.*` only, no
-  `ui.hello`).
+  and the user-launched `org.tvauth.ui` manager (`grants.*`, `grants.audit`,
+  no `ui.hello`). The UI identity may also send `pkg.install`,
+  `pkg.uninstall`, and `pkg.list`; they behave exactly as for an ordinary
+  package (staging, policy, and a user prompt), so the manager's store cannot
+  change anything without consent and can never touch its own package.
 
 The UI package and UID are daemon settings (`--ui-package`, `--ui-uid`). Missing,
 unexpected, or non-package labels fail closed; UID 0 with any other label is
@@ -538,6 +541,20 @@ Sets when a granted package's executions produce a `ui.notice`:
 
 Response: `{"version": 2, "id": "notify-1", "status": "ok"}`. Errors:
 `not_found` (no grant for that label), `invalid_label`, `grant_save_failed`.
+
+## `grants.audit`
+
+UI identity only, protocol v2:
+
+```json
+{"version": 2, "id": "audit-1", "method": "grants.audit"}
+```
+
+Response: `{"version": 2, "id": "audit-1", "status": "ok", "audit": ["1794260185 requester=… result=installed", …]}`
+— up to 30 recent daemon log lines (oldest first, `<unix seconds> <event>`)
+for approval outcomes, prompt decisions, package changes, denials, and
+revocations; per-exec lines of granted apps are left out. Errors:
+`audit_unavailable`.
 
 ## `grants.revoke`
 

@@ -1,15 +1,13 @@
-# tv-auth grant manager (`org.tvauth.ui`)
+# TV suite manager (`org.tvauth.ui`)
 
-The native Tizen `type="capp"` app that lists, re-modes, and revokes
-`tv-authd`'s persistent **Always allow** grants. Approval prompts and toasts
-moved to the persistent [`tv-auth-popupd`](../tv-auth-popupd/README.md) on
-2026-11-09; before that, this app did all four jobs and the daemon launched it
-on demand.
+The user-launched native Tizen `type="capp"` app of the suite (the plan's
+`tv-manager`; the binary keeps the `tv-auth-ui` name the daemon's `/run` alias
+expects). Approval prompts and toasts live in the persistent
+[`tv-auth-popupd`](../tv-auth-popupd/README.md).
 
 The package also defines the identity both UIs run as: UID 5001 with the exact
-SMACK label `User::Pkg::org.tvauth.ui` and the `window.priority.set`
-privilege. It never runs as root and has no network privilege. It talks
-directly to `/run/tv-auth/broker.sock`.
+SMACK label `User::Pkg::org.tvauth.ui`, the `window.priority.set` privilege,
+and (for the store) `internet`. It never runs as root.
 
 ## Why a `/run` alias
 
@@ -54,22 +52,49 @@ is re-established on every daemon start.
 
 ## Behavior
 
-Opening the app icon shows the persistent-grant list. Each row has a toast
-toggle that cycles **Toast: every** → **Toast: first use** (first command after
-30 min idle) → **Toast: never**, and a **Revoke** button. Focus starts on the
-toggle, not Revoke. The list refreshes when the manager opens or is relaunched,
-after each change, on reconnect, and via **Refresh**. The first 5 grants are
-shown. BACK exits.
+Two tabs, driven with the remote (arrows, OK, BACK to exit).
+
+### Store
+
+- Fetches `https://apps2samsung.com/catalog/resolved.json.signed` with the TV's
+  libcurl (TLS-validated), checks the RSA-SHA256 signature with the TV's
+  libcrypto against the Apps2Samsung key pinned in `src/store.rs` (the one
+  their TV-Store pins), and rejects a catalog older than 7 days or dated more
+  than an hour ahead.
+- Lists one row per installable file (community catalog entries plus every
+  asset of each release provider's latest release), sorted by name, 6 per page,
+  with a category filter. Adult entries, non-HTTPS URLs, entries without a
+  SHA-256, and apps needing Tizen > 6.5 are left out; Partner-level apps are
+  labelled.
+- Matches `package_id`/`package_version` against `pkg.list`: **Install**,
+  **Update** (`vX → vY`), or **Open** + **Remove**.
+- Install: downloads to `/tmp/tv-store/<pkgid>.<wgt|tpk>` on a worker thread,
+  keeps it only if size and SHA-256 match the signed catalog, then sends
+  `pkg.install`. `tv-authd` stages and re-signs it and asks the user on the
+  popup's prompt. Remove sends `pkg.uninstall` (also prompted). Open launches
+  the package's main app through `app_control`.
+- Icons are fetched for the visible page only, hash-checked, and cached in
+  `/tmp/tv-store/icons/`.
+- While a change waits for approval the manager hides itself and releases
+  BACK, then comes back with the result: the popup's prompt is not stacked
+  above notification windows (see the popup README's known limitation).
+
+### Permissions
+
+The persistent-grant list: a toast toggle per app that cycles **Toast: every**
+→ **Toast: first use** → **Toast: never**, and **Revoke** (focus starts on the
+toggle). Below it, **Recent activity** shows the newest `grants.audit` lines
+with their age. The first 5 grants are shown.
 
 The manager never sends `ui.hello`, so it does not take prompts or toasts from
-`tv-auth-popupd`; `tv-authd` serves `grants.*` to the UI identity without
-registration.
+the popup daemon.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | EFL window, manager view, timer dispatch |
+| `src/main.rs` | EFL window, Store/Permissions views, worker jobs |
+| `src/store.rs` | catalog envelope, freshness, flattening, version states (host-tested) |
 | `../../crates/tv-proto` | broker client (`client`), markup (`markup`), message types (`ui`) |
 | `../../crates/tv-efl` | EFL FFI, widgets, bounded `/tmp/tvauth-ui.log` writer (`log`) |
 | `tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |
@@ -95,7 +120,9 @@ Host checks:
 
 ```sh
 cargo fmt --all --check
-cargo clippy -p tv-auth-ui -- -D warnings
+cargo clippy -p tv-auth-ui --all-targets -- -D warnings
+cargo test -p tv-auth-ui --lib    # catalog logic
+STORE_CATALOG=resolved.json.signed cargo test -p tv-auth-ui --lib -- --ignored
 cargo test -p tv-proto            # client parsing and markup helpers
 ```
 
@@ -140,6 +167,18 @@ Partner-signed rollback TPK produced before removal was kept locally under
 check out that commit and use its `ui/build-ui-dotnet.sh`.
 
 ## Validation status
+
+- **TV (store, 2026-11-09):** the manager loaded and verified the live catalog
+  (234 apps, 39 pages) and the page's icons over the TV's libcurl; `pkg.list`
+  matched 126 installed packages. Installing "/dev/null on TV" (`DvNullSh01`
+  1.4.0, 728 KB WGT) downloaded and hash-checked the file, staged it, and
+  raised the popup's install prompt (captured with
+  `enlightenment_info -dump_screen`); approving it re-signed (36 files) and
+  installed it through WAS with a Home row, and the row switched to
+  Open/Remove. Remove went through a prompt and `pkgcmd+home`. The
+  Permissions tab showed the Vetro grant and the audit lines of both changes.
+  A plain `ELM_WIN_BASIC` window never reached the compositor, hence the
+  notification window.
 
 - **TV (manager-only split, 2026-11-09):** the rebuilt TPK installed through
   the root role (`re_signed=true`, `backend=was`); launched via

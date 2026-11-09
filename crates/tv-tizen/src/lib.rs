@@ -4,6 +4,7 @@
 //! callers log them, they never branch on them.
 
 pub mod app;
+pub mod crypto;
 pub mod http;
 pub mod pkgdb;
 pub mod vconf;

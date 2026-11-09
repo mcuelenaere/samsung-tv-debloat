@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -42,6 +42,45 @@ impl Logger {
             .as_secs();
         writeln!(file, "{timestamp} {message}")
     }
+
+    /// Lines worth showing a user from the newest `scan_bytes` of the log:
+    /// approval outcomes, prompt decisions, and package changes, without the
+    /// per-exec chatter of granted apps. At most `limit`, oldest first.
+    pub fn audit(&self, scan_bytes: u64, limit: usize) -> io::Result<Vec<String>> {
+        let mut file = File::open(&self.path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(scan_bytes)))?;
+        let mut tail = Vec::new();
+        file.take(scan_bytes).read_to_end(&mut tail)?;
+        Ok(audit_lines(&String::from_utf8_lossy(&tail), limit))
+    }
+}
+
+fn audit_lines(log: &str, limit: usize) -> Vec<String> {
+    const EVENTS: &[&str] = &[
+        " approval=",
+        " prompt_decision ",
+        " result=installed",
+        " result=uninstalled",
+        " result=failed",
+        " denied=",
+        " grant_revoked ",
+    ];
+    let mut lines: Vec<String> = log
+        .lines()
+        // The first line of a mid-file tail may be cut; it never parses as
+        // "<digits> <text>" reliably, so require the timestamp prefix.
+        .filter(|line| {
+            line.split(' ')
+                .next()
+                .is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter(|line| EVENTS.iter().any(|event| line.contains(event)))
+        .map(str::to_owned)
+        .collect();
+    let excess = lines.len().saturating_sub(limit);
+    lines.drain(..excess);
+    lines
 }
 
 fn open_private(path: &Path) -> io::Result<File> {
@@ -56,6 +95,22 @@ fn open_private(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_keeps_decisions_and_package_changes() {
+        let log = "ed request=x\n\
+                   100 requester=User::Pkg::a request=1 execute\n\
+                   101 requester=User::Pkg::a request=1 exit_code=0 timed_out=false\n\
+                   102 requester=User::Pkg::b request=2 approval=denied error=user_denied\n\
+                   103 prompt_decision label=User::Pkg::c request=3 kind=exec decision=Once\n\
+                   104 requester=System::Privileged request=4 pkgid=p version=1 backend=was result=installed\n\
+                   105 grant_revoked label=User::Pkg::c revoked=true\n";
+        let lines = audit_lines(log, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("103 "));
+        assert!(lines[2].starts_with("105 "));
+        assert_eq!(audit_lines(log, 10).len(), 4);
+    }
 
     #[test]
     fn creates_a_private_log_and_fixes_old_modes() {

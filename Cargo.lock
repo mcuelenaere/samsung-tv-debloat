@@ -378,8 +378,13 @@ dependencies = [
 name = "tv-auth-ui"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
  "tv-efl",
  "tv-proto",
+ "tv-tizen",
 ]
 
 [[package]]

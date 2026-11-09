@@ -10,6 +10,15 @@ path = "src/main.rs"
 # Links the TV's EFL libraries; build with ./build-ui.sh.
 test = false
 
+[lib]
+# Host-testable catalog logic (`cargo test -p tv-auth-ui --lib`).
+path = "src/lib.rs"
+
 [dependencies]
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 tv-efl.workspace = true
+tv-tizen.workspace = true
 tv-proto.workspace = true

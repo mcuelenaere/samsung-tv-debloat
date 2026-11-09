@@ -2,6 +2,7 @@
 //! firmware's OpenSSL and CA store instead of bundling a TLS stack.
 
 use crate::{borrowed, c_string};
+use std::io::Write;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::sync::Once;
 
@@ -29,9 +30,11 @@ extern "C" {
     fn curl_easy_cleanup(handle: *mut c_void);
 }
 
-struct Sink {
-    body: Vec<u8>,
-    limit: usize,
+struct Sink<'a> {
+    out: &'a mut dyn Write,
+    written: u64,
+    limit: u64,
+    error: Option<String>,
 }
 
 extern "C" fn write_body(
@@ -44,17 +47,35 @@ extern "C" fn write_body(
     // `data` holds `size * count` bytes for the duration of this call.
     let sink = unsafe { &mut *sink.cast::<Sink>() };
     let length = size * count;
-    if sink.body.len() + length > sink.limit {
+    if sink.written + length as u64 > sink.limit {
+        sink.error = Some(format!("larger than {} bytes", sink.limit));
         return 0; // aborts the transfer with CURLE_WRITE_ERROR
     }
-    sink.body
-        .extend_from_slice(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) });
+    let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
+    if let Err(error) = sink.out.write_all(bytes) {
+        sink.error = Some(error.to_string());
+        return 0;
+    }
+    sink.written += length as u64;
     length
 }
 
 /// GET `url` (following redirects) and return the body. Fails on HTTP >= 400,
 /// on a body larger than `max_bytes`, or after `timeout_secs`.
 pub fn get(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    get_to(url, &mut body, max_bytes as u64, timeout_secs)?;
+    Ok(body)
+}
+
+/// Stream a GET into `out`; returns the byte count. Same failure rules as
+/// [`get`]; `out` may hold a partial body on error.
+pub fn get_to(
+    url: &str,
+    out: &mut dyn Write,
+    max_bytes: u64,
+    timeout_secs: u32,
+) -> Result<u64, String> {
     static INIT: Once = Once::new();
     INIT.call_once(|| unsafe {
         curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -63,8 +84,10 @@ pub fn get(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>, St
     let url_c = c_string(url)?;
     let agent = c_string("tv-suite/0.1")?;
     let mut sink = Sink {
-        body: Vec::new(),
+        out,
+        written: 0,
         limit: max_bytes,
+        error: None,
     };
     let handle = unsafe { curl_easy_init() };
     if handle.is_null() {
@@ -95,8 +118,11 @@ pub fn get(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>, St
     if code == 0 && status >= 400 {
         code = -1;
     }
+    if let Some(error) = sink.error {
+        return Err(format!("GET {url}: {error}"));
+    }
     match code {
-        0 => Ok(sink.body),
+        0 => Ok(sink.written),
         -1 => Err(format!("GET {url}: HTTP {status}")),
         _ => Err(format!("GET {url}: {} (HTTP {status})", unsafe {
             borrowed(curl_easy_strerror(code))

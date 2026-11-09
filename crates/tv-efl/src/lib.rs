@@ -19,6 +19,7 @@ pub const EVAS_HINT_EXPAND: c_double = 1.0;
 pub const EVAS_HINT_FILL: c_double = -1.0;
 
 /// `Elm_Win_Type`: ELM_WIN_UNKNOWN is -1, basic is 0, notification is 11.
+pub const ELM_WIN_BASIC: c_int = 0;
 pub const ELM_WIN_NOTIFICATION: c_int = 11;
 pub const EEXT_CALLBACK_BACK: c_int = 0;
 pub const ECORE_WL2_WINDOW_TYPE_NOTIFICATION: c_int = 5;
@@ -105,6 +106,12 @@ extern "C" {
     pub fn elm_label_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_label_line_wrap_set(object: *mut c_void, wrap: c_int);
     pub fn elm_button_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_image_add(parent: *mut c_void) -> *mut c_void;
+    pub fn elm_image_file_set(
+        image: *mut c_void,
+        file: *const c_char,
+        group: *const c_char,
+    ) -> EinaBool;
     pub fn elm_object_part_text_set(object: *mut c_void, part: *const c_char, text: *const c_char);
     pub fn elm_object_focus_set(object: *mut c_void, focus: EinaBool);
 }

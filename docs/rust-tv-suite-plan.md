@@ -330,3 +330,31 @@ decided by timeout (`prompt_timeout`), injected BACK (`user_denied`), and
 injected Right + Return (Allow once, `id` ran as root); idle CPU stayed at 0.
 Not exercised: **Always allow** from the popup, a popup crash during a prompt,
 and a cold boot with the new unit.
+
+### Phase 3 — done (2026-11-09)
+
+| Plan | Implemented |
+|---|---|
+| `tv-manager` (`org.tvauth.ui`) | `bins/tv-auth-ui` (package and binary names kept: the daemon's UEP alias and protections key on them) is now the suite manager with **Store** and **Permissions** tabs. The **Tweaks** tab waits for Phases 4–5. |
+| Apps2Samsung store | reads the official signed index `resolved.json.signed` (not the `packages/*.json` sources): TLS via the TV's libcurl, RSA-SHA256 against the pinned Apps2Samsung key via the TV's libcrypto (`tv_tizen::crypto`), 7-day freshness, per-file SHA-256 before install. 234 installable apps today. User-configured repository feeds (`repos.json`) are not implemented. |
+| install via `tv-authd` | the UI identity may now send `pkg.install`/`pkg.uninstall`/`pkg.list`, handled exactly like an ordinary package's (staging, policy, prompt); its own package stays protected. UI connection allowance raised from 2 to 6. |
+| grants + audit | `grants.audit` (UI only) returns recent decision/package lines from the daemon log; the Permissions tab shows them. |
+| icons | fetched per visible page, hash-checked, cached in `/tmp/tv-store/icons` (the plan's `/run/tv-suite/cache` is root-owned). |
+
+Validated on tv-living: catalog verify + listing, an install (prompt →
+re-sign → WAS → Home row) and a removal of `DvNullSh01` from the store, and
+the Permissions tab, all through injected remote keys and checked with
+`enlightenment_info -dump_screen`.
+
+Found while validating: **the Phase 2 popup never gets the TOP notification
+layer**. efl_util accepts the request, but the compositor places the
+systemd-started popup's prompt in `E_LAYER_CLIENT_ABOVE` (toast in
+`NOTIFICATION_LOW`), so notification-layer windows can cover it. The manager
+works around this by hiding itself during a change. Fixing it (e20's level
+policy for non-AUL clients) is open, and until then the consent prompt is
+less robust against overlays than the pre-Phase-2 AUL-launched UI.
+
+Not done: progress percentages for downloads (a status line only), the
+`pkgid` renaming the Apps2Samsung TV-Store applies to colliding community
+package ids, user-added repositories, and human-friendly wording for audit
+lines.
