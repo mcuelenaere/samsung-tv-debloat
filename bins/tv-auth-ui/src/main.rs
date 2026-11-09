@@ -49,6 +49,9 @@ const COLOR_BUILD_ROW: i32 = 0x16_19_1f;
 const CHUNK_ROWS: usize = 16;
 const LOOKAHEAD_ROWS: usize = 6;
 const ICON_SIZE: i32 = 96;
+const DETAIL_ICON_SIZE: i32 = 200;
+/// Inner width available to wrapped text on the details page.
+const DETAIL_TEXT_WIDTH: i32 = 1500;
 const DESCRIPTION_CHARS: usize = 110;
 const AUDIT_SHOWN: usize = 8;
 
@@ -118,11 +121,21 @@ struct Store {
     arranged: bool,
     category: usize,
     query: String,
-    /// Groups whose builds are shown, by name.
-    expanded: HashSet<String>,
+    /// The app whose details page is open.
+    detail: Option<usize>,
     /// Row key that last had focus, kept across in-place updates.
     focus_key: Option<usize>,
+    /// The focused button was a row's action (Install/Update/Open/Remove),
+    /// not its Details button.
+    focus_on_action: bool,
+    /// The list row to return to when the details page closes.
+    list_key: Option<usize>,
     busy: bool,
+    /// Download URL of the build being installed or removed: its rows show
+    /// a progress bar instead of buttons.
+    changing: Option<String>,
+    /// Latest download fraction (`None`: pulsing).
+    progress_value: Option<f64>,
     icons_requested: HashSet<String>,
 }
 
@@ -151,6 +164,8 @@ struct Row {
     key: usize,
     widget: *mut c_void,
     primary: *mut c_void,
+    /// The row's first action button (Install/Update/Open/Remove), if any.
+    action: *mut c_void,
     icon: Option<(String, *mut c_void)>,
 }
 
@@ -174,9 +189,10 @@ struct Ui {
     rows: Vec<Row>,
     list_box: *mut c_void,
     count_label: *mut c_void,
-    status_row: *mut c_void,
+    /// The on-screen progress bar and its label in the changing build's row,
+    /// if rendered.
     progress: *mut c_void,
-    progress_shown: bool,
+    progress_label: *mut c_void,
     grants: Vec<GrantInfo>,
     audit: Vec<String>,
     exiting: bool,
@@ -205,9 +221,8 @@ impl Ui {
             rows: Vec::new(),
             list_box: ptr::null_mut(),
             count_label: ptr::null_mut(),
-            status_row: ptr::null_mut(),
             progress: ptr::null_mut(),
-            progress_shown: false,
+            progress_label: ptr::null_mut(),
             grants: Vec::new(),
             audit: Vec::new(),
             exiting: false,
@@ -273,15 +288,7 @@ impl Ui {
                 ptr::without_provenance_mut(2),
             );
 
-            self.status_row = create_row(main);
-            elm_box_pack_end(main, self.status_row);
-            self.status_label = add_to_box(self.status_row, create_label(self.status_row, ""));
-            // Packed into the status row only while a change runs.
-            self.progress = elm_progressbar_add(self.status_row);
-            evas_object_size_hint_min_set(self.progress, 480, 24);
-            evas_object_size_hint_weight_set(self.progress, 0.0, 0.0);
-            evas_object_size_hint_align_set(self.progress, 1.0, 0.5);
-            evas_object_hide(self.progress);
+            self.status_label = add_to_box(main, create_label(main, ""));
 
             self.content_box = elm_box_add(main);
             evas_object_size_hint_weight_set(self.content_box, 1.0, 1.0);
@@ -448,12 +455,14 @@ impl Ui {
                 return false;
             }
             Job::Progress(fraction) => {
-                self.show_progress(fraction);
+                self.store.progress_value = fraction;
+                self.update_progress();
                 return false;
             }
             Job::Finished(result) => {
                 self.store.busy = false;
-                self.hide_progress();
+                self.store.changing = None;
+                self.refresh_rows();
                 self.show();
                 self.set_status(result.unwrap_or_else(|error| error));
                 log_line(&self.status);
@@ -530,11 +539,36 @@ impl Ui {
         true
     }
 
+    /// Mark `app` as changing and swap its rows' buttons for a progress bar.
+    fn begin_change(&mut self, app: &App, fraction: Option<f64>) {
+        self.store.changing = Some(app.url.clone());
+        self.store.progress_value = fraction;
+        self.refresh_rows();
+    }
+
+    /// A filled bar with a short label; the TV theme draws nothing for a
+    /// pulsing (indeterminate) bar, so the waiting phase is a full bar and
+    /// words instead.
+    fn update_progress(&mut self) {
+        if self.progress.is_null() {
+            return;
+        }
+        let (fraction, text) = match self.store.progress_value {
+            Some(fraction) => (
+                fraction.clamp(0.0, 1.0),
+                format!("Downloading {:.0}%", fraction.clamp(0.0, 1.0) * 100.0),
+            ),
+            None => (1.0, "Waiting for approval...".to_owned()),
+        };
+        unsafe { elm_progressbar_value_set(self.progress, fraction) };
+        set_text(self.progress_label, &small(&text, "#c9ccd3"));
+    }
+
     fn install(&mut self, app: App) {
         if !self.start_change() {
             return;
         }
-        self.show_progress(Some(0.0));
+        self.begin_change(&app, Some(0.0));
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             let _ = jobs.send(Job::Finished(install_app(&app, &jobs)));
@@ -546,7 +580,7 @@ impl Ui {
             return;
         }
         self.set_status(format!("Removing {}: approve it on the prompt.", app.name));
-        self.show_progress(None);
+        self.begin_change(&app, None);
         let jobs = self.jobs_tx.clone();
         spawn(move || {
             let request = json!({"version": 2, "id": "store-uninstall", "method": "pkg.uninstall",
@@ -556,39 +590,6 @@ impl Ui {
                 .map(|()| format!("Removed {}.", app.name));
             let _ = jobs.send(Job::Finished(result));
         });
-    }
-
-    fn show_progress(&mut self, fraction: Option<f64>) {
-        unsafe {
-            if !self.progress_shown {
-                self.progress_shown = true;
-                elm_box_pack_end(self.status_row, self.progress);
-                evas_object_show(self.progress);
-            }
-            match fraction {
-                Some(fraction) => {
-                    elm_progressbar_pulse(self.progress, 0);
-                    elm_progressbar_pulse_set(self.progress, 0);
-                    elm_progressbar_value_set(self.progress, fraction.clamp(0.0, 1.0));
-                }
-                None => {
-                    elm_progressbar_pulse_set(self.progress, 1);
-                    elm_progressbar_pulse(self.progress, 1);
-                }
-            }
-        }
-    }
-
-    fn hide_progress(&mut self) {
-        if !self.progress_shown {
-            return;
-        }
-        self.progress_shown = false;
-        unsafe {
-            elm_progressbar_pulse(self.progress, 0);
-            elm_box_unpack(self.status_row, self.progress);
-            evas_object_hide(self.progress);
-        }
     }
 
     fn open(&mut self, app: &App) {
@@ -607,9 +608,12 @@ impl Ui {
             return;
         }
         self.clear_content();
-        let focus = match self.tab {
-            Tab::Store => self.render_store(),
-            Tab::Permissions => self.render_permissions(),
+        self.progress = ptr::null_mut();
+        self.progress_label = ptr::null_mut();
+        let focus = match (self.tab, self.store.detail) {
+            (Tab::Store, Some(group)) => self.render_details(group),
+            (Tab::Store, None) => self.render_store(),
+            (Tab::Permissions, _) => self.render_permissions(),
         };
         self.set_status(self.status.clone());
         if !focus.is_null() {
@@ -718,11 +722,6 @@ impl Ui {
         self.entries.clear();
         for &group in &order {
             self.entries.push(row_key(group, None));
-            if self.store.expanded.contains(&self.store.groups[group].name) {
-                for build in 0..self.store.groups[group].variants.len() {
-                    self.entries.push(row_key(group, Some(build)));
-                }
-            }
         }
         set_text(
             self.count_label,
@@ -741,6 +740,7 @@ impl Ui {
                 key: 0,
                 widget: label,
                 primary: ptr::null_mut(),
+                action: ptr::null_mut(),
                 icon: None,
             });
         }
@@ -760,6 +760,9 @@ impl Ui {
     }
 
     fn row_icon(&self, key: usize) -> Option<(String, String)> {
+        if self.store.detail.is_some() {
+            return None;
+        }
         let (group, build) = split_key(key);
         match build {
             None => self.store.groups[group].icon.clone(),
@@ -824,6 +827,16 @@ impl Ui {
 
         let data = ptr::without_provenance_mut(key);
         let mut buttons = Vec::new();
+        let in_list = build.is_none();
+        // Rows of the build being changed show progress instead of actions.
+        let changing = self
+            .store
+            .changing
+            .as_ref()
+            .is_some_and(|url| match self.row_app(key) {
+                Some(app) => &app.url == url,
+                None => group.variants.iter().any(|app| &app.url == url),
+            });
         match self.row_app(key).cloned() {
             Some(app) => {
                 let state = store::state(&app, &versions);
@@ -842,8 +855,8 @@ impl Ui {
                         &app.variant
                     };
                     format!(
-                        "<font_size=24><b>{}</b></font_size>  {}",
-                        escape(&shorten(title, 60, false)),
+                        "<font_size=26><b>{}</b></font_size><br/>{}",
+                        escape(&shorten(title, 70, false)),
                         small(&facts.join(" \u{00b7} "), "#8a8f99")
                     )
                 } else {
@@ -858,23 +871,29 @@ impl Ui {
                     )
                 };
                 add_to_box(row_box, create_label(row_box, &markup));
-                buttons.push(match state {
-                    State::NotInstalled => {
-                        create_button(row_box, "Install", on_install_clicked, data)
+                if in_list {
+                    buttons.push(create_button(row_box, "Details", on_details_clicked, data));
+                }
+                if !changing {
+                    buttons.push(match state {
+                        State::NotInstalled => {
+                            create_button(row_box, "Install", on_install_clicked, data)
+                        }
+                        State::Upgradable { .. } => {
+                            create_button(row_box, "Update", on_install_clicked, data)
+                        }
+                        State::Installed | State::Newer { .. } => {
+                            create_button(row_box, "Open", on_open_clicked, data)
+                        }
+                    });
+                    if !in_list && !matches!(state, State::NotInstalled) {
+                        buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
                     }
-                    State::Upgradable { .. } => {
-                        create_button(row_box, "Update", on_install_clicked, data)
-                    }
-                    State::Installed | State::Newer { .. } => {
-                        create_button(row_box, "Open", on_open_clicked, data)
-                    }
-                });
-                if !matches!(state, State::NotInstalled) {
-                    buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
                 }
             }
             None => {
-                // An app with several builds: a summary and a toggle.
+                // An app with several builds: a summary; builds are on its
+                // details page.
                 let installed = group
                     .variants
                     .iter()
@@ -898,36 +917,58 @@ impl Ui {
                         ),
                     ),
                 );
-                let expanded = self.store.expanded.contains(&group.name);
-                buttons.push(create_button(
-                    row_box,
-                    if expanded {
-                        "Hide builds"
-                    } else {
-                        "Show builds"
-                    },
-                    on_builds_clicked,
-                    data,
-                ));
-                if installed.is_some() {
+                buttons.push(create_button(row_box, "Details", on_details_clicked, data));
+                if installed.is_some() && !changing {
                     buttons.push(create_button(row_box, "Open", on_open_clicked, data));
                 }
             }
+        };
+        if changing {
+            unsafe {
+                let column = elm_box_add(row_box);
+                elm_box_padding_set(column, 0, 6);
+                evas_object_size_hint_min_set(column, 360, 1);
+                evas_object_size_hint_weight_set(column, 0.0, 0.0);
+                evas_object_size_hint_align_set(column, 0.5, 0.5);
+                let label = create_label(column, "");
+                elm_box_pack_end(column, label);
+                let bar = elm_progressbar_add(column);
+                evas_object_size_hint_min_set(bar, 360, 24);
+                evas_object_size_hint_align_set(bar, EVAS_HINT_FILL, 0.5);
+                elm_box_pack_end(column, bar);
+                evas_object_show(bar);
+                elm_box_pack_end(row_box, column);
+                evas_object_show(column);
+                self.progress = bar;
+                self.progress_label = label;
+            }
+            self.update_progress();
         }
-        for button in &buttons {
+        let has_details = in_list || self.row_app(key).is_none();
+        for (index, button) in buttons.iter().enumerate() {
+            let is_action = !(has_details && index == 0);
             unsafe {
                 evas_object_smart_callback_add(
                     *button,
                     FOCUSED.as_ptr().cast(),
-                    on_row_focused,
+                    if is_action {
+                        on_action_focused
+                    } else {
+                        on_row_focused
+                    },
                     data,
                 );
             }
         }
+        let action = buttons
+            .get(usize::from(has_details))
+            .copied()
+            .unwrap_or(ptr::null_mut());
         Row {
             key,
             widget: row,
-            primary: buttons[0],
+            primary: buttons.first().copied().unwrap_or(ptr::null_mut()),
+            action,
             icon,
         }
     }
@@ -943,58 +984,185 @@ impl Ui {
             let old = self.rows[index].widget;
             let row = self.build_row(old_key, old);
             let focused = self.store.focus_key == Some(old_key);
+            // Focusing below fires the row's focus callback, which would
+            // forget which button the user was on.
+            let on_action = self.store.focus_on_action;
+            // Back onto the button the user pressed (it may have become
+            // Open, or a progress bar; then the row's first button).
+            let target = if self.store.focus_on_action && !row.action.is_null() {
+                row.action
+            } else {
+                row.primary
+            };
             unsafe {
                 evas_object_del(old);
-                if focused {
-                    elm_object_focus_set(row.primary, 1);
+                if focused && !target.is_null() {
+                    elm_object_focus_set(target, 1);
                 }
             }
+            self.store.focus_on_action = on_action;
             self.rows[index] = row;
         }
     }
 
-    /// Show or hide a group's builds right below its row.
-    fn toggle_builds(&mut self, key: usize) {
-        let (group, _) = split_key(key);
-        let Some(position) = self.entries.iter().position(|&entry| entry == key) else {
-            return;
-        };
-        let name = self.store.groups[group].name.clone();
-        let count = self.store.groups[group].variants.len();
-        if self.store.expanded.remove(&name) {
-            self.entries.drain(position + 1..position + 1 + count);
-            let rendered = self.rows.len().min(position + 1 + count);
-            if rendered > position + 1 {
-                for row in self.rows.drain(position + 1..rendered) {
-                    unsafe { evas_object_del(row.widget) };
-                }
+    /// The details page: what the catalog says about one app, and its builds
+    /// with their actions. Returns the widget to focus.
+    fn render_details(&mut self, group_index: usize) -> *mut c_void {
+        let group = self.store.groups[group_index].clone();
+        let versions = self.store.versions();
+        let top = create_row(self.content_box);
+        self.add_content(top);
+        let back = create_button(top, "Back", on_details_back, ptr::null_mut());
+        add_to_box(top, create_label(top, ""));
+
+        let (header, header_box) = panel(self.content_box, COLOR_ROW, 32, 24);
+        self.add_content(header);
+        unsafe {
+            elm_box_horizontal_set(header_box, 1);
+            elm_box_padding_set(header_box, 32, 0);
+            let image = elm_image_add(header_box);
+            evas_object_size_hint_min_set(image, DETAIL_ICON_SIZE, DETAIL_ICON_SIZE);
+            evas_object_show(image);
+            if let Some((_, digest)) = &group.icon {
+                set_image_file(image, &icon_path(digest));
             }
+            elm_box_pack_end(header_box, image);
+        }
+        let installed = group
+            .variants
+            .iter()
+            .find_map(|app| versions.get(&app.package_id).map(|version| (app, version)));
+        let category = CATEGORIES
+            .iter()
+            .find(|(id, _)| *id == group.category)
+            .map_or(group.category.as_str(), |(_, label)| label);
+        let mut facts = vec![category.to_owned()];
+        facts.push(if group.variants.len() == 1 {
+            "1 build".to_owned()
         } else {
-            self.store.expanded.insert(name);
-            let keys: Vec<usize> = (0..count)
-                .map(|build| row_key(group, Some(build)))
+            format!("{} builds", group.variants.len())
+        });
+        if let Some((_, version)) = installed {
+            facts.push(format!("v{version} installed"));
+        }
+        let mut info = Vec::new();
+        let ids: Vec<&str> = {
+            let mut ids: Vec<&str> = group
+                .variants
+                .iter()
+                .map(|app| app.package_id.as_str())
                 .collect();
-            self.entries
-                .splice(position + 1..position + 1, keys.iter().copied());
-            if position < self.rows.len() {
-                let mut after = self.rows[position].widget;
-                for (offset, &build_key) in keys.iter().enumerate() {
-                    let row = self.build_row(build_key, after);
-                    after = row.widget;
-                    self.rows.insert(position + 1 + offset, row);
+            ids.dedup();
+            ids
+        };
+        info.push(format!("Package {}", ids.join(", ")));
+        let repos: Vec<&str> = {
+            let mut repos: Vec<&str> = group
+                .variants
+                .iter()
+                .map(|app| app.repo.as_str())
+                .filter(|repo| !repo.is_empty())
+                .collect();
+            repos.sort_unstable();
+            repos.dedup();
+            repos
+        };
+        if !repos.is_empty() {
+            info.push(format!("Source github.com/{}", repos.join(", github.com/")));
+        }
+        let required = group
+            .variants
+            .iter()
+            .map(|app| app.required_version.as_str())
+            .filter(|version| !version.is_empty())
+            .min_by(|a, b| store::compare_versions(a, b));
+        if let Some(required) = required {
+            info.push(format!("Tizen {required} or newer"));
+        }
+        let mut flags: Vec<&str> = group
+            .variants
+            .iter()
+            .flat_map(|app| app.flags.iter().map(String::as_str))
+            .collect();
+        flags.sort_unstable();
+        flags.dedup();
+        if group.variants.iter().any(|app| app.partner) {
+            flags.push("needs a Partner certificate");
+        }
+        let text = create_label(
+            header_box,
+            &format!(
+                "<font_size=44><b>{}</b></font_size><br/>{}<br/><br/>\
+                 <font_size=24><color=#e8e8e8>{}</color></font_size><br/><br/>{}{}",
+                escape(&group.name),
+                small(&facts.join(" \u{00b7} "), "#8a8f99"),
+                escape(&group.description),
+                info.iter()
+                    .map(|line| small(line, "#b4b9c2"))
+                    .collect::<Vec<_>>()
+                    .join("<br/>"),
+                if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("<br/>{}", small(&flags.join(" \u{00b7} "), "#ffb74d"))
                 }
-            }
+            ),
+        );
+        unsafe { elm_label_wrap_width_set(text, DETAIL_TEXT_WIDTH - DETAIL_ICON_SIZE) };
+        add_to_box(header_box, text);
+
+        self.add_content(create_label(
+            self.content_box,
+            &small(
+                if group.variants.len() == 1 {
+                    "BUILD"
+                } else {
+                    "BUILDS"
+                },
+                "#8a8f99",
+            ),
+        ));
+        unsafe {
+            let scroller = elm_scroller_add(self.content_box);
+            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
+            elm_scroller_bounce_set(scroller, 0, 0);
+            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
+            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
+            self.list_box = elm_box_add(scroller);
+            evas_object_size_hint_weight_set(self.list_box, 1.0, 0.0);
+            evas_object_size_hint_align_set(self.list_box, EVAS_HINT_FILL, 0.0);
+            elm_box_padding_set(self.list_box, 0, 10);
+            elm_object_part_content_set(scroller, ptr::null(), self.list_box);
+            evas_object_show(self.list_box);
+            evas_object_show(scroller);
+            self.add_content(scroller);
         }
-        // The toggle's label changed; rebuild the group row itself.
-        if position < self.rows.len() {
-            let old = self.rows[position].widget;
-            let row = self.build_row(key, old);
-            unsafe {
-                evas_object_del(old);
-                elm_object_focus_set(row.primary, 1);
-            }
-            self.rows[position] = row;
-        }
+        self.rows.clear();
+        self.entries = (0..group.variants.len())
+            .map(|build| row_key(group_index, Some(build)))
+            .collect();
+        self.append_rows(self.entries.len());
+        self.rows
+            .iter()
+            .map(|row| row.primary)
+            .find(|primary| !primary.is_null())
+            .unwrap_or(back)
+    }
+
+    fn open_details(&mut self, key: usize) {
+        let (group, _) = split_key(key);
+        self.store.list_key = Some(row_key(group, None));
+        self.store.focus_key = None;
+        self.store.detail = Some(group);
+        self.render();
+    }
+
+    /// Back to the list, focused on the app whose details were open.
+    fn close_details(&mut self) {
+        self.store.detail = None;
+        self.store.focus_key = self.store.list_key.take();
+        self.store.focus_on_action = false;
+        self.render();
     }
 
     /// Focus moved to a row: remember it, and extend the list before the
@@ -1419,11 +1587,17 @@ unsafe extern "C" fn on_timer(_data: *mut c_void) -> EinaBool {
 
 unsafe extern "C" fn on_back(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     log_line("back key");
-    ui().exit_now();
+    let state = ui();
+    if state.tab == Tab::Store && state.store.detail.is_some() {
+        state.close_details();
+    } else {
+        state.exit_now();
+    }
 }
 
 unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     let state = ui();
+    state.store.detail = None;
     state.tab = if data as usize == 2 {
         Tab::Permissions
     } else {
@@ -1470,18 +1644,36 @@ unsafe extern "C" fn on_search_changed(
 
 unsafe extern "C" fn on_row_focused(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     if data as usize != 0 {
-        ui().row_focused(data as usize);
+        let state = ui();
+        state.store.focus_on_action = false;
+        state.row_focused(data as usize);
     }
 }
 
-unsafe extern "C" fn on_builds_clicked(
+unsafe extern "C" fn on_action_focused(
     data: *mut c_void,
     _object: *mut c_void,
     _info: *mut c_void,
 ) {
     if data as usize != 0 {
-        ui().toggle_builds(data as usize);
+        let state = ui();
+        state.store.focus_on_action = true;
+        state.row_focused(data as usize);
     }
+}
+
+unsafe extern "C" fn on_details_clicked(
+    data: *mut c_void,
+    _object: *mut c_void,
+    _info: *mut c_void,
+) {
+    if data as usize != 0 {
+        ui().open_details(data as usize);
+    }
+}
+
+unsafe extern "C" fn on_details_back(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    ui().close_details();
 }
 
 unsafe extern "C" fn on_reload_clicked(

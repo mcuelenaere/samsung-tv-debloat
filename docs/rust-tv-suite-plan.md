@@ -390,3 +390,8 @@ lines.
   `APP_CONTROL_ERROR_PERMISSION_DENIED` (-13). A scrollable `elm_entry`
   recomputes its own minimum size on every change, so it sits in a table
   cell sized by a fixed rectangle.
+- **Store list, round 3:** a **Details** page per app (description, package
+  ids, source repo, minimum Tizen, flags, all builds with actions) replaces
+  the inline build lists; progress moved into the changing build's rows;
+  focus returns to the pressed button after a change and to the app's row
+  after closing its details.

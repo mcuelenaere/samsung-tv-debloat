@@ -63,8 +63,13 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   than an hour ahead.
 - Lists one row per app (135 today): community entries grouped by their
   `group` (variants become builds), and each release provider's latest
-  release as one app whose assets are its builds. Apps with several builds
-  show "N builds" and a **Show builds** toggle that expands them inline.
+  release as one app whose assets are its builds. Each row has **Details**
+  plus its quick action (Install/Update/Open; apps with several builds show
+  "N builds" and Open when one is installed).
+- **Details** opens a page with the large icon, full description, category,
+  package id(s), source repository, minimum Tizen version, catalog flags
+  (closed-source, self-updating, root, Partner certificate), and every build
+  with Install/Update/Open/Remove. BACK returns to the list on the same app.
   Installed apps sort first, then by name; the order stays put until the
   filter changes. One scrolling list: rows are appended 16 at a time as
   focus nears the end, and the scroller follows focus.
@@ -75,10 +80,12 @@ Two tabs, driven with the remote (arrows, OK, BACK to exit).
   labelled.
 - Matches `package_id`/`package_version` against `pkg.list`: **Install**,
   **Update** (`vX → vY`), or **Open** + **Remove**.
-- A progress bar next to the status line fills while a package downloads
-  and pulses while the prompt and the installer run.
+- While a build is being installed or removed its rows (in the list and on
+  the details page) show "Downloading N%" or "Waiting for approval…" over a
+  progress bar instead of their buttons. (The TV theme draws nothing for a
+  pulsing bar, so the waiting phase is a full bar plus text.)
 - After a change only the visible rows are rebuilt in place, so the
-  selection and scroll position survive.
+  selection, scroll position and the focused button survive.
 - Install: downloads to `/tmp/tv-store/<pkgid>.<wgt|tpk>` on a worker thread,
   keeps it only if size and SHA-256 match the signed catalog, then sends
   `pkg.install`. `tv-authd` stages and re-signs it and asks the user on the

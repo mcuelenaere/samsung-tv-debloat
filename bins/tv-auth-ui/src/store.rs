@@ -56,6 +56,12 @@ pub struct App {
     pub icon: Option<(String, String)>,
     /// Needs a Partner-level signature (`cert_level: partner`).
     pub partner: bool,
+    /// Source repository (`owner/name`), when known.
+    pub repo: String,
+    /// Catalog flags such as `closed-source`, `self-updating`, `root`.
+    pub flags: Vec<String>,
+    /// Minimum Tizen version, as the package declares it.
+    pub required_version: String,
 }
 
 /// Where a catalog app stands against the installed packages.
@@ -117,6 +123,8 @@ struct Catalog {
 struct Provider {
     #[serde(default)]
     id: String,
+    #[serde(default)]
+    url: String,
     #[serde(rename = "displayName", default)]
     display_name: String,
     #[serde(default)]
@@ -179,6 +187,10 @@ struct CommunityApp {
     adult: bool,
     #[serde(default)]
     cert_level: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    flags: Vec<String>,
 }
 
 /// Parse a verified payload into installable apps, sorted by name. Rejects a
@@ -243,6 +255,8 @@ pub fn apps(payload: &[u8], now: i64) -> Result<Vec<App>, String> {
                         |app| App {
                             group,
                             variant,
+                            repo: entry.repo.clone(),
+                            flags: entry.flags.clone(),
                             ..app
                         },
                     ));
@@ -264,6 +278,7 @@ pub fn apps(payload: &[u8], now: i64) -> Result<Vec<App>, String> {
                         app(asset, stem.to_owned(), &description, "media", false).map(|app| App {
                             group: title.clone(),
                             variant: stem.to_owned(),
+                            repo: github_repo(&provider.url),
                             ..app
                         }),
                     );
@@ -311,7 +326,20 @@ fn app(
         sha256,
         icon,
         partner,
+        repo: String::new(),
+        flags: Vec::new(),
+        required_version: asset.required_version.clone(),
     })
+}
+
+/// `https://api.github.com/repos/<owner>/<name>/releases` → `owner/name`.
+fn github_repo(url: &str) -> String {
+    url.strip_prefix("https://api.github.com/repos/")
+        .and_then(|rest| {
+            let mut parts = rest.split('/');
+            Some(format!("{}/{}", parts.next()?, parts.next()?))
+        })
+        .unwrap_or_default()
 }
 
 /// `jellyfin-tizen-builds` → `Jellyfin Tizen Builds`.
@@ -504,12 +532,12 @@ mod tests {
             "schemaVersion": 1,
             "generatedAt": generated,
             "providers": [
-                {"id": "jellyfin", "releases": [
+                {"id": "jellyfin", "url": "https://api.github.com/repos/owner/jelly/releases", "releases": [
                     {"tag_name": "t2", "assets": [asset("Jellyfin-A.wgt", "AprZAARz4r", "0.2.0", "2.3"), asset("notes.txt", "x", "1", "")]},
                     {"tag_name": "t1", "assets": [asset("Old.wgt", "OldOld0000", "0.1.0", "2.3")]}
                 ]},
                 {"id": "tizen-community", "catalog": {"apps": [
-                    {"file": "Zed.wgt", "name": "Zed", "description": "z", "category": "games"},
+                    {"file": "Zed.wgt", "name": "Zed", "description": "z", "category": "games", "repo": "me/zed", "flags": ["closed-source"]},
                     {"file": "Adult.wgt", "name": "Adult", "adult": true},
                     {"file": "New.wgt", "name": "TooNew"},
                     {"file": "Grp.tpk", "name": "x", "group": "Group", "variant": "Tizen 6", "cert_level": "partner"},
@@ -551,6 +579,12 @@ mod tests {
         assert_eq!(jellyfin.sha256, "ab".repeat(32));
         assert_eq!(jellyfin.icon.as_ref().unwrap().1, "cd".repeat(32));
         assert_eq!(apps[2].category, "games");
+        assert_eq!(
+            (apps[2].repo.as_str(), apps[2].flags.as_slice()),
+            ("me/zed", &["closed-source".to_owned()][..])
+        );
+        assert_eq!(apps[2].required_version, "5.5");
+        assert_eq!(jellyfin.repo, "owner/jelly");
     }
 
     fn build(group: &str, variant: &str, package_id: &str, category: &str) -> App {
@@ -568,6 +602,9 @@ mod tests {
             sha256: String::new(),
             icon: None,
             partner: false,
+            repo: String::new(),
+            flags: Vec::new(),
+            required_version: String::new(),
         }
     }
 
