@@ -58,6 +58,7 @@ const AUDIT_SHOWN: usize = 8;
 /// Downloads and icons live in the app's corner of `/tmp`, which `tv-authd`'s
 /// staging accepts as a package source.
 const STORE_DIR: &str = "/tmp/tv-store";
+const BLOCKD_SOCKET: &str = "/run/tv-suite/blockd.sock";
 const CATEGORIES: &[(&str, &str)] = &[
     ("", "All"),
     ("media", "Media"),
@@ -91,6 +92,7 @@ fn ui() -> &'static mut Ui {
 enum Tab {
     Store,
     Permissions,
+    Tweaks,
 }
 
 /// Results from worker threads.
@@ -104,6 +106,8 @@ enum Job {
     Progress(Option<f64>),
     Finished(Result<String, String>),
     Audit(Vec<String>),
+    /// tv-blockd's status; `true` when it answers a change.
+    Tweaks(bool, Result<Value, String>),
 }
 
 #[derive(Clone)]
@@ -205,6 +209,14 @@ struct Ui {
     progress_label: *mut c_void,
     grants: Vec<GrantInfo>,
     audit: Vec<String>,
+    /// tv-blockd's last `status` response.
+    tweaks: Option<Value>,
+    /// Toggle keys (`hosts`, `group:<id>`, `otn_lock`, `telemetry`) and
+    /// their rendered buttons, in screen order.
+    tweak_keys: Vec<String>,
+    tweak_buttons: Vec<*mut c_void>,
+    tweak_summary: *mut c_void,
+    tweak_focus: usize,
     exiting: bool,
     connected: bool,
     app_control_count: u32,
@@ -236,6 +248,11 @@ impl Ui {
             progress_label: ptr::null_mut(),
             grants: Vec::new(),
             audit: Vec::new(),
+            tweaks: None,
+            tweak_keys: Vec::new(),
+            tweak_buttons: Vec::new(),
+            tweak_summary: ptr::null_mut(),
+            tweak_focus: 0,
             exiting: false,
             connected: false,
             app_control_count: 0,
@@ -297,6 +314,12 @@ impl Ui {
                 "Permissions",
                 on_tab_clicked,
                 ptr::without_provenance_mut(2),
+            );
+            create_button(
+                header,
+                "Tweaks",
+                on_tab_clicked,
+                ptr::without_provenance_mut(3),
             );
 
             self.status_label = add_to_box(main, create_label(main, ""));
@@ -485,6 +508,27 @@ impl Ui {
                 self.audit = lines;
                 return self.tab == Tab::Permissions;
             }
+            Job::Tweaks(changed, Ok(status)) => {
+                let first = self.tweaks.is_none();
+                self.tweaks = Some(status);
+                if changed {
+                    self.set_status("Saved and applied.");
+                }
+                if self.tab != Tab::Tweaks {
+                    return false;
+                }
+                if first || self.tweak_buttons.is_empty() {
+                    return true;
+                }
+                // In place, so focus and scroll position stay.
+                self.update_tweaks();
+                return false;
+            }
+            Job::Tweaks(_, Err(error)) => {
+                log_line(&error);
+                self.set_status(error);
+                return false;
+            }
         }
         true
     }
@@ -626,10 +670,13 @@ impl Ui {
         self.clear_content();
         self.progress = ptr::null_mut();
         self.progress_label = ptr::null_mut();
+        self.tweak_buttons.clear();
+        self.tweak_summary = ptr::null_mut();
         let focus = match (self.tab, self.store.detail) {
             (Tab::Store, Some(group)) => self.render_details(group),
             (Tab::Store, None) => self.render_store(),
             (Tab::Permissions, _) => self.render_permissions(),
+            (Tab::Tweaks, _) => self.render_tweaks(),
         };
         self.set_status(self.status.clone());
         if !focus.is_null() {
@@ -1343,6 +1390,111 @@ impl Ui {
         }
     }
 
+    /// Ask tv-blockd for its status, or replace its configuration first.
+    fn load_tweaks(&mut self, config: Option<Value>) {
+        let jobs = self.jobs_tx.clone();
+        spawn(move || {
+            let changed = config.is_some();
+            let request = match config {
+                Some(config) => json!({"method": "set", "config": config}),
+                None => json!({"method": "status"}),
+            };
+            let result = tv_proto::call(BLOCKD_SOCKET, &request)
+                .map_err(|error| format!("Could not reach tv-blockd: {error}"))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Value>(&bytes)
+                        .map_err(|error| format!("tv-blockd sent bad JSON: {error}"))
+                })
+                .and_then(|response| {
+                    if response["status"] == "ok" {
+                        Ok(response)
+                    } else {
+                        Err(format!(
+                            "tv-blockd refused: {}",
+                            response["error"].as_str().unwrap_or("denied")
+                        ))
+                    }
+                });
+            let _ = jobs.send(Job::Tweaks(changed, result));
+        });
+    }
+
+    /// Returns the widget to focus.
+    fn render_tweaks(&mut self) -> *mut c_void {
+        let Some(status) = self.tweaks.clone() else {
+            self.add_content(create_label(
+                self.content_box,
+                &small("Asking tv-blockd...", "#8a8f99"),
+            ));
+            return ptr::null_mut();
+        };
+        self.tweak_summary = create_label(self.content_box, &tweaks_summary(&status));
+        self.add_content(self.tweak_summary);
+        let list = unsafe {
+            let scroller = elm_scroller_add(self.content_box);
+            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
+            elm_scroller_bounce_set(scroller, 0, 0);
+            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
+            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
+            let list = elm_box_add(scroller);
+            evas_object_size_hint_weight_set(list, 1.0, 0.0);
+            evas_object_size_hint_align_set(list, EVAS_HINT_FILL, 0.0);
+            elm_box_padding_set(list, 0, 10);
+            elm_object_part_content_set(scroller, ptr::null(), list);
+            evas_object_show(list);
+            evas_object_show(scroller);
+            self.add_content(scroller);
+            list
+        };
+        self.tweak_keys.clear();
+        for (index, tweak) in tweaks(&status).into_iter().enumerate() {
+            let (row, row_box) = panel(list, COLOR_ROW, 32, 12);
+            unsafe {
+                elm_box_pack_end(list, row);
+                elm_box_horizontal_set(row_box, 1);
+                elm_box_padding_set(row_box, 24, 0);
+            }
+            add_to_box(
+                row_box,
+                create_label(
+                    row_box,
+                    &format!(
+                        "<font_size=26><b>{}</b></font_size><br/>{}",
+                        escape(&tweak.title),
+                        small(&tweak.note, "#8a8f99")
+                    ),
+                ),
+            );
+            let button = create_button(
+                row_box,
+                on_off(tweak.on),
+                on_tweak_clicked,
+                ptr::without_provenance_mut(index + 1),
+            );
+            unsafe { evas_object_size_hint_min_set(button, 180, 72) };
+            self.tweak_keys.push(tweak.key);
+            self.tweak_buttons.push(button);
+        }
+        self.tweak_buttons
+            .get(self.tweak_focus)
+            .or(self.tweak_buttons.first())
+            .copied()
+            .unwrap_or(ptr::null_mut())
+    }
+
+    fn update_tweaks(&mut self) {
+        let Some(status) = &self.tweaks else { return };
+        let tweaks = tweaks(status);
+        if tweaks.len() != self.tweak_buttons.len() {
+            self.render();
+            return;
+        }
+        set_text(self.tweak_summary, &tweaks_summary(status));
+        for (button, tweak) in self.tweak_buttons.iter().zip(&tweaks) {
+            set_text(*button, on_off(tweak.on));
+        }
+    }
+
     fn add_content(&mut self, child: *mut c_void) {
         if child.is_null() {
             return;
@@ -1372,6 +1524,93 @@ fn state_text(app: &App, state: &State) -> String {
         State::Installed => format!("v{} \u{00b7} installed", app.version),
         State::Upgradable { installed } => format!("v{installed} \u{2192} v{}", app.version),
         State::Newer { installed } => format!("v{installed} installed (catalog v{})", app.version),
+    }
+}
+
+struct Tweak {
+    key: String,
+    title: String,
+    note: String,
+    on: bool,
+}
+
+/// The toggles for a tv-blockd `status` response, in screen order.
+fn tweaks(status: &Value) -> Vec<Tweak> {
+    let config = &status["config"];
+    let tweak = |key: &str, title: &str, note: &str| Tweak {
+        key: key.into(),
+        title: title.into(),
+        note: note.into(),
+        on: config[key] == true,
+    };
+    let mut list = vec![tweak(
+        "hosts",
+        "Block tracking hosts",
+        "Points the host groups below at nothing, for every app on the TV.",
+    )];
+    let enabled = config["groups"].as_array().cloned().unwrap_or_default();
+    for group in status["groups"].as_array().into_iter().flatten() {
+        let id = group["id"].as_str().unwrap_or_default();
+        let hosts = group["hosts"].as_array().map_or(0, Vec::len);
+        list.push(Tweak {
+            key: format!("group:{id}"),
+            title: format!("  {}", group["label"].as_str().unwrap_or(id)),
+            note: format!(
+                "{} {hosts} host{}, evidence: {}.",
+                group["note"].as_str().unwrap_or_default(),
+                if hosts == 1 { "" } else { "s" },
+                group["evidence"].as_str().unwrap_or("unknown")
+            ),
+            on: enabled.iter().any(|value| value == id),
+        });
+    }
+    list.push(tweak(
+        "otn_lock",
+        "Keep automatic updates off",
+        "Turns the TV's auto-update setting back off whenever it is switched on.",
+    ));
+    list.push(tweak(
+        "telemetry",
+        "Stop telemetry services",
+        "Stops Samsung's log, crash and analytics services, again after every reboot.",
+    ));
+    list
+}
+
+fn tweaks_summary(status: &Value) -> String {
+    let report = &status["report"];
+    let mut parts = vec![if status["config"]["hosts"] == true {
+        format!("{} hosts blocked", report["blocked_hosts"])
+    } else {
+        "Host blocking off".into()
+    }];
+    parts.push(match report["otn_autoupdate"].as_i64() {
+        Some(0) => "auto-update off".into(),
+        Some(_) => "auto-update on".into(),
+        None => "auto-update unknown".into(),
+    });
+    let running = report["telemetry_active"].as_array().map_or(0, Vec::len);
+    parts.push(format!("{running} telemetry services running"));
+    let failed = report["namespaces_failed"].as_u64().unwrap_or(0);
+    if failed > 0 {
+        parts.push(format!("{failed} namespaces not covered"));
+    }
+    let mut markup = small(&parts.join(" · "), "#8a8f99");
+    if let Some(error) = report["errors"]
+        .as_array()
+        .and_then(|errors| errors.first())
+    {
+        markup.push_str("<br/>");
+        markup.push_str(&small(error.as_str().unwrap_or_default(), "#ffb74d"));
+    }
+    markup
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "On"
+    } else {
+        "Off"
     }
 }
 
@@ -1655,13 +1894,16 @@ unsafe extern "C" fn on_back(_data: *mut c_void, _object: *mut c_void, _info: *m
 unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     let state = ui();
     state.store.detail = None;
-    state.tab = if data as usize == 2 {
-        Tab::Permissions
-    } else {
-        Tab::Store
+    state.status.clear();
+    state.tab = match data as usize {
+        2 => Tab::Permissions,
+        3 => Tab::Tweaks,
+        _ => Tab::Store,
     };
-    if state.tab == Tab::Permissions {
-        state.refresh_grants();
+    match state.tab {
+        Tab::Permissions => state.refresh_grants(),
+        Tab::Tweaks => state.load_tweaks(None),
+        Tab::Store => {}
     }
     state.render();
 }
@@ -1738,6 +1980,33 @@ unsafe extern "C" fn on_reload_clicked(
     state.store.icons_requested.clear();
     state.load_catalog();
     state.set_status(state.status.clone());
+}
+
+unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    let state = ui();
+    let index = (data as usize).wrapping_sub(1);
+    let (Some(key), Some(status)) = (state.tweak_keys.get(index), &state.tweaks) else {
+        return;
+    };
+    let mut config = status["config"].clone();
+    match key.strip_prefix("group:") {
+        Some(id) => {
+            if let Some(groups) = config["groups"].as_array_mut() {
+                if let Some(position) = groups.iter().position(|value| value == id) {
+                    groups.remove(position);
+                } else {
+                    groups.push(json!(id));
+                }
+            }
+        }
+        None => {
+            let on = config[key.as_str()] == true;
+            config[key.as_str()] = json!(!on);
+        }
+    }
+    state.tweak_focus = index;
+    state.set_status("Applying...");
+    state.load_tweaks(Some(config));
 }
 
 fn clicked_app(data: *mut c_void) -> Option<App> {

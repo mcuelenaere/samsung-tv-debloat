@@ -15,7 +15,8 @@ crates/tv-tizen   vconf, read-only pkgmgr DB, app launch, libcurl GET (TV sysroo
 bins/tv-authd     root broker daemon (static musl)
 bins/tv-auth-cli  `tvauth-cli` root-role client (static musl)
 bins/tv-auth-popupd persistent prompt/toast overlay (EFL systemd daemon, gnueabi)
-bins/tv-auth-ui   `org.tvauth.ui` grant manager TPK (EFL, gnueabi)
+bins/tv-auth-ui   `org.tvauth.ui` manager TPK: store, grants, tweaks (EFL, gnueabi)
+bins/tv-blockd    hosts/telemetry/OTN blocker daemon (gnueabi)
 sysroot/          fetch script for the TV libraries the gnueabi crates link
 root-broker/      spikes, probes, and the broker's working notes (AGENTS.md)
 ```
@@ -36,6 +37,7 @@ bins/tv-authd/build-armv7.sh        # musl
 bins/tv-auth-cli/build-armv7.sh     # musl
 bins/tv-auth-popupd/build-armv7.sh  # gnueabi
 bins/tv-auth-ui/build-ui.sh         # gnueabi + unsigned TPK
+bins/tv-blockd/build-armv7.sh       # gnueabi
 ./cross-build.sh gnueabi build --locked --release -p tv-tizen --example probe
 ```
 

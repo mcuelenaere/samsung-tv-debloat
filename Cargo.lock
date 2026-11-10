@@ -408,6 +408,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tv-blockd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tv-proto",
+ "tv-tizen",
+]
+
+[[package]]
 name = "tv-efl"
 version = "0.1.0"
 

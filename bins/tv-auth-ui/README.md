@@ -52,7 +52,7 @@ is re-established on every daemon start.
 
 ## Behavior
 
-Two tabs, driven with the remote (arrows, OK, BACK to exit).
+Three tabs, driven with the remote (arrows, OK, BACK to exit).
 
 ### Store
 
@@ -113,6 +113,15 @@ with their age. The first 5 grants are shown.
 
 The manager never sends `ui.hello`, so it does not take prompts or toasts from
 the popup daemon.
+
+### Tweaks
+
+On/Off toggles for `tv-blockd` (`/run/tv-suite/blockd.sock`): host blocking,
+each built-in host group with its note, host count and evidence, the
+auto-update lock, and telemetry. A summary line shows the blocked host count,
+the auto-update setting, running telemetry services and any reconcile error.
+Each press sends the whole edited config with `set`; the row's button updates
+in place from the answer, so focus stays. See `bins/tv-blockd/README.md`.
 
 ## Files
 

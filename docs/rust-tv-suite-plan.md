@@ -335,7 +335,7 @@ and a cold boot with the new unit.
 
 | Plan | Implemented |
 |---|---|
-| `tv-manager` (`org.tvauth.ui`) | `bins/tv-auth-ui` (package and binary names kept: the daemon's UEP alias and protections key on them) is now the suite manager with **Store** and **Permissions** tabs. The **Tweaks** tab waits for Phases 4–5. |
+| `tv-manager` (`org.tvauth.ui`) | `bins/tv-auth-ui` (package and binary names kept: the daemon's UEP alias and protections key on them) is now the suite manager with **Store** and **Permissions** tabs. The **Tweaks** tab came with Phase 4. |
 | Apps2Samsung store | reads the official signed index `resolved.json.signed` (not the `packages/*.json` sources): TLS via the TV's libcurl, RSA-SHA256 against the pinned Apps2Samsung key via the TV's libcrypto (`tv_tizen::crypto`), 7-day freshness, per-file SHA-256 before install. 234 installable apps today. User-configured repository feeds (`repos.json`) are not implemented. |
 | install via `tv-authd` | the UI identity may now send `pkg.install`/`pkg.uninstall`/`pkg.list`, handled exactly like an ordinary package's (staging, policy, prompt); its own package stays protected. UI connection allowance raised from 2 to 6. |
 | grants + audit | `grants.audit` (UI only) returns recent decision/package lines from the daemon log; the Permissions tab shows them. |
@@ -395,3 +395,21 @@ lines.
   the inline build lists; progress moved into the changing build's rows;
   focus returns to the pressed button after a change and to the app's row
   after closing its details.
+
+### Phase 4 — done (2026-11-10)
+
+| Plan | Implemented |
+|---|---|
+| `bins/tv-blockd` (musl) | gnueabi instead: the OTN lock and list downloads use `tv-tizen` (libvconf, libcurl). Root unit, binary through a `/run` bind mount for UEP. See `bins/tv-blockd/README.md`. |
+| cross-namespace `/etc/hosts` | `/run/tv-suite/hosts` bound over `/etc/hosts` in every mount namespace, re-checked every 60 s. Propagation from PID 1 reaches most namespaces; the rest get a forked `setns` child that binds the source by path (an fd source fails across namespaces). Host groups follow Vetro's evidence-labelled `blocklist.js` plus OTN hosts; essential hosts are never blocked; optional custom hosts and HTTPS lists. |
+| OTN `vconf` lock | `db/menu/support/softwareupdate/autoupdate` kept at 0. |
+| brake files | the `ConditionPathExists=!` files, plus `systemctl stop` and `mask --runtime` of the telemetry units and killing `EdgeScraper`. |
+| bloatware disabler | **dropped**: `pkgcmd -D` hangs as root, and the per-user app disable (`-D -t app --uid 5001`) reports success but changes nothing visible, after which `-A` fails with -999. |
+| toggles in `tv-manager` | **Tweaks** tab: host blocking, each host group, auto-update lock, telemetry. It talks to `/run/tv-suite/blockd.sock`, which accepts root and the manager's uid/SMACK label only. |
+
+Validated on tv-living with Vetro uninstalled: 29 hosts blocked in 59 of 60
+namespaces (the kernel's `kdevtmpfs` has no `/etc/hosts`); blocked names resolve
+to `::` and essential ones normally; auto-update 0; no telemetry unit active.
+From the Tweaks tab, switching Advertising off made `rtb-config.samsungads.com`
+resolve again and switching it on blackholed it, with focus kept on the
+toggle. Not exercised: a cold boot with the new unit, and remote lists.

@@ -1,0 +1,22 @@
+# Install at /opt/tv-units/tv-blockd.service (0600) and the binary at
+# /opt/tv-suite/bin/tv-blockd (0755). The AT-HUB boot hook copies the unit to
+# /run/systemd/system and starts it. Configuration:
+# /opt/tv-suite/etc/blockd.json (created with defaults on first start).
+[Unit]
+Description=tv-blockd ad, tracking, telemetry and firmware-update blocker
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=HOME=/root
+# /opt is on the VDFS, where UEP rejects unsigned ELFs: map only the binary
+# directory through /run (etc/ and var/ stay writable at their real paths).
+BindReadOnlyPaths=/opt/tv-suite/bin:/run/opt/tv-suite/bin
+ExecStart=/run/opt/tv-suite/bin/tv-blockd
+Restart=always
+RestartSec=5
+
+[Install]
+# The systemd unit path is read-only; this section is documentation only.
+WantedBy=multi-user.target

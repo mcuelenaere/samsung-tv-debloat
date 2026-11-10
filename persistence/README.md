@@ -66,6 +66,9 @@ Deployed and live-tested on 2026-11-05:
 | `/opt/tv-units/dropbear.service` | `0600` | Dropbear unit |
 | `/opt/tv-units/tv-authd.service` | `0600` | Root broker unit |
 | `/opt/tv-units/tv-auth-popupd.service` | `0600` | Prompt/toast overlay (uid 5001, `User::Pkg::org.tvauth.ui`) |
+| `/opt/tv-units/tv-blockd.service` | `0600` | Hosts/telemetry/OTN blocker (root) |
+| `/opt/tv-suite/bin/tv-blockd` | `0755` | Blocker binary (run via `/run/opt/tv-suite/bin`) |
+| `/opt/tv-suite/etc/blockd.json` | `0600` | Blocker configuration |
 | `/opt/tv-auth/` | `0711`, root, `System::Shared` | Broker binary, grant state, staging, trust |
 | `/opt/tv-auth/tv-authd` | `0755` | Static ARMv7 broker binary |
 | `/opt/tv-auth/grants.json` | `0600` | Exact package-label grants |

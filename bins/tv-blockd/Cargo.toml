@@ -1,0 +1,22 @@
+[package]
+name = "tv-blockd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# Host-testable policy (`cargo test -p tv-blockd --lib`).
+path = "src/lib.rs"
+
+[[bin]]
+name = "tv-blockd"
+path = "src/main.rs"
+# Links the TV's vconf and libcurl; build with ./build-armv7.sh.
+test = false
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tv-proto.workspace = true
+tv-tizen.workspace = true
