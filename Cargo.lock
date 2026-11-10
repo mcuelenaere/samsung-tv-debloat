@@ -423,6 +423,18 @@ name = "tv-efl"
 version = "0.1.0"
 
 [[package]]
+name = "tv-patchd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tv-proto",
+ "tv-tizen",
+]
+
+[[package]]
 name = "tv-proto"
 version = "0.1.0"
 dependencies = [

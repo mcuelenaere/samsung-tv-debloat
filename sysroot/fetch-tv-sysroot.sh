@@ -59,6 +59,9 @@ copy_as /usr/lib/libcurl.so.4.7.0 libcurl.so \
     6f3dd180cbc10c1a9753bd838eb47b51c04d9ffe76a889b597c8f3f0e075c5c3
 copy_as /usr/lib/libcrypto.so.1.1 libcrypto.so \
     d763b8173e8aacf7e78fee2e20265cd8f199a8eed1522c0e7100324b6fb818a4
+# tv-patchd: TLS for the YouTube proxy.
+copy_as /usr/lib/libssl.so.1.1 libssl.so \
+    ffda6cbac6b90ac18c88e0516b36eb0648d7243c63b43818b3a68e958b32bee6
 
 printf 'Collected minimal sysroot from %s (%s)\n' "$HOST" "$actual_target"
 find "$DEST" -maxdepth 1 -type f -print0 | sort -z | xargs -0 shasum -a 256

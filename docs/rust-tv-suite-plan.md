@@ -430,12 +430,35 @@ the next boot. Validated on tv-living: undo from the remote removed the brake
 files and their directory, unmounted every namespace and unmasked the units;
 auto-update forced 1 → 0 was restored to 1.
 
+### Phase 5 — done (2026-11-10)
+
+| Plan | Implemented |
+|---|---|
+| `cobalt_launcher` bind-mount shim | **not used.** Cobalt takes its flags from the launch bundle (`USERDATA`), which the wrapper `9Ur5IzDKqV.TizenYouTube` fills from one webappservice database row, so a shim has no argument list to extend. tv-patchd edits that row instead (compare-and-swap; Samsung's value comes from the package manifest, so restoring needs nothing saved), as Vetro's YouTube plugin does. |
+| `--content=…/tizentube-content` injection | `--content` only points Cobalt at its fonts and CA store; it injects nothing. TizenTube gets in through a local proxy (`--proxy=127.0.0.2:8102,direct://`) that TLS-terminates `www.youtube.com` with a CA trusted only by a copy of Cobalt's content folder, and adds a script tag to the `/tv` page. |
+| `cobalt-shim` (separate binary) | none: one `tv-patchd` root daemon (proxy threads, setup through the TV's `openssl`, TLS through its `libssl` via `tv_tizen::tls`). |
+| toggle + TizenTube updater in `tv-manager` | **TizenTube in YouTube** and **Update TizenTube** in the Tweaks tab; **Undo all changes** covers tv-patchd too. Pinned TizenTube 1.15.2 (SHA-256 checked); updates come from npm's latest. |
+| `patches.d/*.toml` rules for other apps | not done: no second app needs one. |
+
+Validated on tv-living: from the Home tile, YouTube opened signed in with
+TizenTube running (its blue-key **Playback Speed** panel appeared). Switching
+off from the manager wrote Samsung's flags back and removed the content copy,
+and switching on restored them; **Undo all changes** did the same alongside
+tv-blockd's undo. The first attempt showed YouTube's "network error": the
+proxy refused YouTube's response, which has header lines longer than the 4 KB
+line limit it had; heads are now bounded only as a whole (64 KB). Not exercised: casting, the remote's YouTube key after a cold boot, an
+actual TizenTube update (1.15.2 is the latest), and long playback.
+
 ## 8. Backlog
 
 - **Boot before Samsung's services.** The AT-HUB hook starts our units late in
   boot, so telemetry runs and `/etc/hosts` is unblocked for about a minute
   after every boot, until tv-blockd's first pass. Find an earlier hook, or a
   way to order our units before Samsung's.
+- **Vetro's YouTube leftovers.** `/opt/usr/home/owner/share/vyt` and
+  `…/share/vetro-youtube` (Vetro's CA and content copy) are still on tv-living;
+  delete them once nothing points at them (tv-patchd has replaced Vetro's
+  row value).
 - **Telemetry unit list.** Of the nine units `tv-blockd` masks (Vetro's
   names), only `pisa-service` exists on T-PTMDEUC-1720.7; `canalysis`,
   `dlog_logger`, `ep-agent`, `faultmgr`, `smart_deadlock`, `trace_manager`,

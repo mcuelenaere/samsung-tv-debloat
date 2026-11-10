@@ -1,0 +1,23 @@
+[package]
+name = "tv-patchd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# Host-testable proxy and row logic (`cargo test -p tv-patchd --lib`).
+path = "src/lib.rs"
+
+[[bin]]
+name = "tv-patchd"
+path = "src/main.rs"
+# Links the TV's libssl, libsqlite3 and libcurl; build with ./build-armv7.sh.
+test = false
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tv-proto.workspace = true
+tv-tizen.workspace = true

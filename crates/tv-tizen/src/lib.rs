@@ -6,7 +6,10 @@
 pub mod app;
 pub mod crypto;
 pub mod http;
+#[cfg(target_os = "linux")]
+pub mod peer;
 pub mod pkgdb;
+pub mod tls;
 pub mod vconf;
 
 use std::ffi::{CStr, CString};

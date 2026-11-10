@@ -122,8 +122,12 @@ auto-update lock, and telemetry. A summary line shows the blocked host count,
 the auto-update setting, running telemetry services and any reconcile error.
 Each press sends the whole edited config with `set`; the row's button updates
 in place from the answer, so focus stays. **Undo all changes** at the bottom
-sends `undo`: everything off, and what tv-blockd changed put back. See
-`bins/tv-blockd/README.md`.
+sends `undo` to tv-blockd and tv-patchd: everything off, and what they
+changed put back. See `bins/tv-blockd/README.md`.
+
+**TizenTube in YouTube** switches `tv-patchd` (`/run/tv-suite/patchd.sock`)
+on and off, and **Update TizenTube** installs npm's latest release. See
+`bins/tv-patchd/README.md`.
 
 ## Files
 

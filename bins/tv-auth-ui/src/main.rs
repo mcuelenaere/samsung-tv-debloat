@@ -52,6 +52,8 @@ const ICON_SIZE: i32 = 96;
 const DETAIL_ICON_SIZE: i32 = 200;
 /// Inner width available to wrapped text on the details page.
 const DETAIL_TEXT_WIDTH: i32 = 1500;
+/// A Tweaks row's text, beside its button.
+const TWEAK_TEXT_WIDTH: i32 = 1450;
 const DESCRIPTION_CHARS: usize = 110;
 const AUDIT_SHOWN: usize = 8;
 
@@ -59,6 +61,30 @@ const AUDIT_SHOWN: usize = 8;
 /// staging accepts as a package source.
 const STORE_DIR: &str = "/tmp/tv-store";
 const BLOCKD_SOCKET: &str = "/run/tv-suite/blockd.sock";
+const PATCHD_SOCKET: &str = "/run/tv-suite/patchd.sock";
+
+/// The daemons behind the Tweaks tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Service {
+    Block,
+    Patch,
+}
+
+impl Service {
+    fn socket(self) -> &'static str {
+        match self {
+            Service::Block => BLOCKD_SOCKET,
+            Service::Patch => PATCHD_SOCKET,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Service::Block => "tv-blockd",
+            Service::Patch => "tv-patchd",
+        }
+    }
+}
 const CATEGORIES: &[(&str, &str)] = &[
     ("", "All"),
     ("media", "Media"),
@@ -106,8 +132,8 @@ enum Job {
     Progress(Option<f64>),
     Finished(Result<String, String>),
     Audit(Vec<String>),
-    /// tv-blockd's status, with the message for a change it answers.
-    Tweaks(Option<&'static str>, Result<Value, String>),
+    /// A Tweaks daemon's status, with the message for a change it answers.
+    Tweaks(Service, Option<String>, Result<Value, String>),
 }
 
 #[derive(Clone)]
@@ -211,10 +237,13 @@ struct Ui {
     audit: Vec<String>,
     /// tv-blockd's last `status` response.
     tweaks: Option<Value>,
+    /// tv-patchd's.
+    patch: Option<Value>,
     /// Toggle keys (`hosts`, `group:<id>`, `otn_lock`, `telemetry`) and
     /// their rendered buttons, in screen order.
     tweak_keys: Vec<String>,
     tweak_buttons: Vec<*mut c_void>,
+    tweak_labels: Vec<*mut c_void>,
     tweak_summary: *mut c_void,
     tweak_focus: usize,
     exiting: bool,
@@ -249,8 +278,10 @@ impl Ui {
             grants: Vec::new(),
             audit: Vec::new(),
             tweaks: None,
+            patch: None,
             tweak_keys: Vec::new(),
             tweak_buttons: Vec::new(),
+            tweak_labels: Vec::new(),
             tweak_summary: ptr::null_mut(),
             tweak_focus: 0,
             exiting: false,
@@ -508,9 +539,13 @@ impl Ui {
                 self.audit = lines;
                 return self.tab == Tab::Permissions;
             }
-            Job::Tweaks(message, Ok(status)) => {
-                let first = self.tweaks.is_none();
-                self.tweaks = Some(status);
+            Job::Tweaks(service, message, Ok(status)) => {
+                let first = self.tweaks.is_none() && service == Service::Block;
+                let message = message.or_else(|| status["message"].as_str().map(str::to_owned));
+                match service {
+                    Service::Block => self.tweaks = Some(status),
+                    Service::Patch => self.patch = Some(status),
+                }
                 if let Some(message) = message {
                     self.set_status(message);
                 }
@@ -524,7 +559,7 @@ impl Ui {
                 self.update_tweaks();
                 return false;
             }
-            Job::Tweaks(_, Err(error)) => {
+            Job::Tweaks(_, _, Err(error)) => {
                 log_line(&error);
                 self.set_status(error);
                 return false;
@@ -671,6 +706,7 @@ impl Ui {
         self.progress = ptr::null_mut();
         self.progress_label = ptr::null_mut();
         self.tweak_buttons.clear();
+        self.tweak_labels.clear();
         self.tweak_summary = ptr::null_mut();
         let focus = match (self.tab, self.store.detail) {
             (Tab::Store, Some(group)) => self.render_details(group),
@@ -1392,27 +1428,33 @@ impl Ui {
 
     /// Send tv-blockd a request (`status` by default); `message` is shown
     /// once it succeeds.
-    fn load_tweaks(&mut self, request: Option<Value>, message: Option<&'static str>) {
+    fn load_tweaks(
+        &mut self,
+        service: Service,
+        request: Option<Value>,
+        message: Option<&'static str>,
+    ) {
         let jobs = self.jobs_tx.clone();
         spawn(move || {
+            let name = service.name();
             let request = request.unwrap_or_else(|| json!({"method": "status"}));
-            let result = tv_proto::call(BLOCKD_SOCKET, &request)
-                .map_err(|error| format!("Could not reach tv-blockd: {error}"))
+            let result = tv_proto::call(service.socket(), &request)
+                .map_err(|error| format!("Could not reach {name}: {error}"))
                 .and_then(|bytes| {
                     serde_json::from_slice::<Value>(&bytes)
-                        .map_err(|error| format!("tv-blockd sent bad JSON: {error}"))
+                        .map_err(|error| format!("{name} sent bad JSON: {error}"))
                 })
                 .and_then(|response| {
                     if response["status"] == "ok" {
                         Ok(response)
                     } else {
                         Err(format!(
-                            "tv-blockd refused: {}",
+                            "{name} refused: {}",
                             response["error"].as_str().unwrap_or("denied")
                         ))
                     }
                 });
-            let _ = jobs.send(Job::Tweaks(message, result));
+            let _ = jobs.send(Job::Tweaks(service, message.map(str::to_owned), result));
         });
     }
 
@@ -1444,27 +1486,20 @@ impl Ui {
             list
         };
         self.tweak_keys.clear();
-        for (index, tweak) in tweaks(&status).into_iter().enumerate() {
+        for (index, tweak) in tweaks(&status, self.patch.as_ref()).into_iter().enumerate() {
             let (row, row_box) = panel(list, COLOR_ROW, 32, 12);
             unsafe {
                 elm_box_pack_end(list, row);
                 elm_box_horizontal_set(row_box, 1);
                 elm_box_padding_set(row_box, 24, 0);
             }
-            add_to_box(
-                row_box,
-                create_label(
-                    row_box,
-                    &format!(
-                        "<font_size=26><b>{}</b></font_size><br/>{}",
-                        escape(&tweak.title),
-                        small(&tweak.note, "#8a8f99")
-                    ),
-                ),
-            );
+            let text = add_to_box(row_box, create_label(row_box, &tweak_markup(&tweak)));
+            self.tweak_labels.push(text);
+            // Nested word-wrapped labels otherwise size to their full line.
+            unsafe { elm_label_wrap_width_set(text, TWEAK_TEXT_WIDTH) };
             let button = create_button(
                 row_box,
-                on_off(tweak.on),
+                &tweak.button,
                 on_tweak_clicked,
                 ptr::without_provenance_mut(index + 1),
             );
@@ -1478,20 +1513,22 @@ impl Ui {
             elm_box_horizontal_set(row_box, 1);
             elm_box_padding_set(row_box, 24, 0);
         }
-        add_to_box(
+        let text = add_to_box(
             row_box,
             create_label(
                 row_box,
                 &format!(
                     "<font_size=26><b>Undo all changes</b></font_size><br/>{}",
                     small(
-                        "Switches everything above off and puts back what tv-blockd changed: \
-                         hosts, brake files, masked or stopped services, the auto-update setting.",
+                        "Switches everything above off and puts back what the suite changed: \
+                         hosts, brake files, masked or stopped services, the auto-update setting, \
+                         YouTube's flags.",
                         "#8a8f99"
                     )
                 ),
             ),
         );
+        unsafe { elm_label_wrap_width_set(text, TWEAK_TEXT_WIDTH) };
         let undo = create_button(row_box, "Undo", on_undo_clicked, ptr::null_mut());
         unsafe { evas_object_size_hint_min_set(undo, 180, 72) };
         self.tweak_buttons
@@ -1503,14 +1540,20 @@ impl Ui {
 
     fn update_tweaks(&mut self) {
         let Some(status) = &self.tweaks else { return };
-        let tweaks = tweaks(status);
+        let tweaks = tweaks(status, self.patch.as_ref());
         if tweaks.len() != self.tweak_buttons.len() {
             self.render();
             return;
         }
         set_text(self.tweak_summary, &tweaks_summary(status));
-        for (button, tweak) in self.tweak_buttons.iter().zip(&tweaks) {
-            set_text(*button, on_off(tweak.on));
+        for ((button, label), tweak) in self
+            .tweak_buttons
+            .iter()
+            .zip(&self.tweak_labels)
+            .zip(&tweaks)
+        {
+            set_text(*button, &tweak.button);
+            set_text(*label, &tweak_markup(tweak));
         }
     }
 
@@ -1550,17 +1593,17 @@ struct Tweak {
     key: String,
     title: String,
     note: String,
-    on: bool,
+    button: String,
 }
 
 /// The toggles for a tv-blockd `status` response, in screen order.
-fn tweaks(status: &Value) -> Vec<Tweak> {
+fn tweaks(status: &Value, patch: Option<&Value>) -> Vec<Tweak> {
     let config = &status["config"];
     let tweak = |key: &str, title: &str, note: &str| Tweak {
         key: key.into(),
         title: title.into(),
         note: note.into(),
-        on: config[key] == true,
+        button: on_off(config[key] == true).into(),
     };
     let mut list = vec![tweak(
         "hosts",
@@ -1580,7 +1623,7 @@ fn tweaks(status: &Value) -> Vec<Tweak> {
                 if hosts == 1 { "" } else { "s" },
                 group["evidence"].as_str().unwrap_or("unknown")
             ),
-            on: enabled.iter().any(|value| value == id),
+            button: on_off(enabled.iter().any(|value| value == id)).into(),
         });
     }
     list.push(tweak(
@@ -1593,6 +1636,39 @@ fn tweaks(status: &Value) -> Vec<Tweak> {
         "Stop telemetry services",
         "Stops Samsung's log, crash and analytics services, again after every reboot.",
     ));
+    if let Some(patch) = patch {
+        let report = &patch["report"];
+        let on = patch["config"]["tizentube"] == true;
+        let version = patch["script"]["version"].as_str().unwrap_or("?");
+        let state = match report["errors"]
+            .as_array()
+            .and_then(|errors| errors.first())
+        {
+            Some(error) => format!("Problem: {}", error.as_str().unwrap_or_default()),
+            None if on && report["ready"] == true => {
+                "On: its options are under YouTube's settings, TizenTube Settings.".into()
+            }
+            None => "Switching it off restores Samsung's YouTube.".into(),
+        };
+        list.push(Tweak {
+            key: "patch:tizentube".into(),
+            title: "TizenTube in YouTube".into(),
+            note: format!(
+                "Blocks ads and skips sponsor segments in Samsung's own YouTube app, \
+                 through a local proxy. TizenTube {version}. {state}"
+            ),
+            button: on_off(on).into(),
+        });
+        list.push(Tweak {
+            key: "patch:update".into(),
+            title: "  Update TizenTube".into(),
+            note: format!(
+                "Installs the newest release from npm (this build pins {}).",
+                patch["pinned"].as_str().unwrap_or("?")
+            ),
+            button: "Update".into(),
+        });
+    }
     list
 }
 
@@ -1623,6 +1699,14 @@ fn tweaks_summary(status: &Value) -> String {
         markup.push_str(&small(error.as_str().unwrap_or_default(), "#ffb74d"));
     }
     markup
+}
+
+fn tweak_markup(tweak: &Tweak) -> String {
+    format!(
+        "<font_size=26><b>{}</b></font_size><br/>{}",
+        escape(&tweak.title),
+        small(&tweak.note, "#8a8f99")
+    )
 }
 
 fn on_off(on: bool) -> &'static str {
@@ -1921,7 +2005,10 @@ unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _in
     };
     match state.tab {
         Tab::Permissions => state.refresh_grants(),
-        Tab::Tweaks => state.load_tweaks(None, None),
+        Tab::Tweaks => {
+            state.load_tweaks(Service::Block, None, None);
+            state.load_tweaks(Service::Patch, None, None);
+        }
         Tab::Store => {}
     }
     state.render();
@@ -2004,6 +2091,32 @@ unsafe extern "C" fn on_reload_clicked(
 unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     let state = ui();
     let index = (data as usize).wrapping_sub(1);
+    state.tweak_focus = index;
+    match state.tweak_keys.get(index).map(String::as_str) {
+        Some("patch:update") => {
+            state.set_status("Checking for a TizenTube update...");
+            state.load_tweaks(Service::Patch, Some(json!({"method": "update"})), None);
+            return;
+        }
+        Some("patch:tizentube") => {
+            let on = state
+                .patch
+                .as_ref()
+                .is_some_and(|patch| patch["config"]["tizentube"] == true);
+            state.set_status("Applying...");
+            state.load_tweaks(
+                Service::Patch,
+                Some(json!({"method": "set", "config": {"tizentube": !on}})),
+                Some(if on {
+                    "TizenTube is off; YouTube is back to normal."
+                } else {
+                    "TizenTube is on. Open YouTube to use it."
+                }),
+            );
+            return;
+        }
+        _ => {}
+    }
     let (Some(key), Some(status)) = (state.tweak_keys.get(index), &state.tweaks) else {
         return;
     };
@@ -2023,9 +2136,9 @@ unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _
             config[key.as_str()] = json!(!on);
         }
     }
-    state.tweak_focus = index;
     state.set_status("Applying...");
     state.load_tweaks(
+        Service::Block,
         Some(json!({"method": "set", "config": config})),
         Some("Saved and applied."),
     );
@@ -2034,9 +2147,11 @@ unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _
 unsafe extern "C" fn on_undo_clicked(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
     let state = ui();
     state.set_status("Undoing...");
+    state.load_tweaks(Service::Patch, Some(json!({"method": "undo"})), None);
     state.load_tweaks(
+        Service::Block,
         Some(json!({"method": "undo"})),
-        Some("Everything tv-blockd changed is undone."),
+        Some("Everything the suite changed is undone."),
     );
 }
 

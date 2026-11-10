@@ -283,54 +283,10 @@ fn save_json(path: &str, value: &impl Serialize) -> io::Result<()> {
     fs::rename(temporary, path)
 }
 
-/// uid and SMACK label of the peer (`SO_PEERCRED`, `SO_PEERSEC`).
-// ponytail: tv-authd has the same check (rustix-based); share it if a third
-// daemon needs it.
-fn peer(stream: &UnixStream) -> io::Result<(u32, String)> {
-    let fd = stream.as_raw_fd();
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: u32::MAX,
-        gid: u32::MAX,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut label = [0_u8; 256];
-    let mut length = label.len() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERSEC,
-            label.as_mut_ptr().cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let label = &label[..(length as usize).min(label.len())];
-    let label = String::from_utf8_lossy(label)
-        .trim_end_matches('\0')
-        .to_owned();
-    Ok((credentials.uid, label))
-}
-
 impl Daemon {
     fn serve(&mut self, stream: UnixStream) -> io::Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let (uid, label) = peer(&stream)?;
+        let (uid, label) = tv_tizen::peer::credentials(&stream)?;
         let mut writer = stream.try_clone()?;
         if !(uid == 0 || (uid == UI_UID && label == UI_LABEL)) {
             log(&format!("refused uid={uid} label={label}"));
