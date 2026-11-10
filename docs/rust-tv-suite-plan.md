@@ -241,6 +241,9 @@ sequenceDiagram
 
 ### 5.5 `tv-launcher` — Custom EFL Home Dock Daemon
 
+> Superseded by [`tv-launcher-plan.md`](tv-launcher-plan.md) (2026-11-10), written after
+> studying Vetro's launcher and the TV. The text below is the original sketch.
+
 A native Rust EFL daemon (`/run/tv-suite/bin/tv-launcher`) replacing Vetro's `dock.js` + `tvlauncher-dotnet.dll`:
 
 1. **Lifecycle & Standby Survival:**
