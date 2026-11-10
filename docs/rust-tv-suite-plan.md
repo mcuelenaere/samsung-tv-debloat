@@ -455,10 +455,6 @@ actual TizenTube update (1.15.2 is the latest), and long playback.
   boot, so telemetry runs and `/etc/hosts` is unblocked for about a minute
   after every boot, until tv-blockd's first pass. Find an earlier hook, or a
   way to order our units before Samsung's.
-- **Vetro's YouTube leftovers.** `/opt/usr/home/owner/share/vyt` and
-  `…/share/vetro-youtube` (Vetro's CA and content copy) are still on tv-living;
-  delete them once nothing points at them (tv-patchd has replaced Vetro's
-  row value).
 - **Telemetry unit list.** Of the nine units `tv-blockd` masks (Vetro's
   names), only `pisa-service` exists on T-PTMDEUC-1720.7; `canalysis`,
   `dlog_logger`, `ep-agent`, `faultmgr`, `smart_deadlock`, `trace_manager`,

@@ -59,7 +59,8 @@ working.
 Vetro, uninstalled without its restore, had left the row patched with its own
 proxy. tv-patchd recognises that value (`other-proxy`) and replaces it with its
 own when switched on. Vetro's files (`…/share/vyt`,
-`…/share/vetro-youtube`) are left alone.
+`…/share/vetro-youtube`) are not touched; on tv-living they were deleted by
+hand on 2026-11-10.
 
 ## Configuration and control
 
