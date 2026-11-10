@@ -106,8 +106,8 @@ enum Job {
     Progress(Option<f64>),
     Finished(Result<String, String>),
     Audit(Vec<String>),
-    /// tv-blockd's status; `true` when it answers a change.
-    Tweaks(bool, Result<Value, String>),
+    /// tv-blockd's status, with the message for a change it answers.
+    Tweaks(Option<&'static str>, Result<Value, String>),
 }
 
 #[derive(Clone)]
@@ -508,11 +508,11 @@ impl Ui {
                 self.audit = lines;
                 return self.tab == Tab::Permissions;
             }
-            Job::Tweaks(changed, Ok(status)) => {
+            Job::Tweaks(message, Ok(status)) => {
                 let first = self.tweaks.is_none();
                 self.tweaks = Some(status);
-                if changed {
-                    self.set_status("Saved and applied.");
+                if let Some(message) = message {
+                    self.set_status(message);
                 }
                 if self.tab != Tab::Tweaks {
                     return false;
@@ -1390,15 +1390,12 @@ impl Ui {
         }
     }
 
-    /// Ask tv-blockd for its status, or replace its configuration first.
-    fn load_tweaks(&mut self, config: Option<Value>) {
+    /// Send tv-blockd a request (`status` by default); `message` is shown
+    /// once it succeeds.
+    fn load_tweaks(&mut self, request: Option<Value>, message: Option<&'static str>) {
         let jobs = self.jobs_tx.clone();
         spawn(move || {
-            let changed = config.is_some();
-            let request = match config {
-                Some(config) => json!({"method": "set", "config": config}),
-                None => json!({"method": "status"}),
-            };
+            let request = request.unwrap_or_else(|| json!({"method": "status"}));
             let result = tv_proto::call(BLOCKD_SOCKET, &request)
                 .map_err(|error| format!("Could not reach tv-blockd: {error}"))
                 .and_then(|bytes| {
@@ -1415,7 +1412,7 @@ impl Ui {
                         ))
                     }
                 });
-            let _ = jobs.send(Job::Tweaks(changed, result));
+            let _ = jobs.send(Job::Tweaks(message, result));
         });
     }
 
@@ -1475,6 +1472,28 @@ impl Ui {
             self.tweak_keys.push(tweak.key);
             self.tweak_buttons.push(button);
         }
+        let (row, row_box) = panel(list, COLOR_ROW, 32, 12);
+        unsafe {
+            elm_box_pack_end(list, row);
+            elm_box_horizontal_set(row_box, 1);
+            elm_box_padding_set(row_box, 24, 0);
+        }
+        add_to_box(
+            row_box,
+            create_label(
+                row_box,
+                &format!(
+                    "<font_size=26><b>Undo all changes</b></font_size><br/>{}",
+                    small(
+                        "Switches everything above off and puts back what tv-blockd changed: \
+                         hosts, brake files, masked or stopped services, the auto-update setting.",
+                        "#8a8f99"
+                    )
+                ),
+            ),
+        );
+        let undo = create_button(row_box, "Undo", on_undo_clicked, ptr::null_mut());
+        unsafe { evas_object_size_hint_min_set(undo, 180, 72) };
         self.tweak_buttons
             .get(self.tweak_focus)
             .or(self.tweak_buttons.first())
@@ -1902,7 +1921,7 @@ unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _in
     };
     match state.tab {
         Tab::Permissions => state.refresh_grants(),
-        Tab::Tweaks => state.load_tweaks(None),
+        Tab::Tweaks => state.load_tweaks(None, None),
         Tab::Store => {}
     }
     state.render();
@@ -2006,7 +2025,19 @@ unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _
     }
     state.tweak_focus = index;
     state.set_status("Applying...");
-    state.load_tweaks(Some(config));
+    state.load_tweaks(
+        Some(json!({"method": "set", "config": config})),
+        Some("Saved and applied."),
+    );
+}
+
+unsafe extern "C" fn on_undo_clicked(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    let state = ui();
+    state.set_status("Undoing...");
+    state.load_tweaks(
+        Some(json!({"method": "undo"})),
+        Some("Everything tv-blockd changed is undone."),
+    );
 }
 
 fn clicked_app(data: *mut c_void) -> Option<App> {

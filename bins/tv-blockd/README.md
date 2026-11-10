@@ -19,8 +19,20 @@ Every 60 s, and right after each configuration change, it reconciles:
   ep-agent, faultmgr, smart_deadlock, trace_manager, pisa-service,
   vision-data-recognition-service, elt-daemon), and kills `EdgeScraper`.
 
-Turning an option off undoes it (hosts unmounted, units unmasked), except
-that the OTN lock leaves the auto-update setting where it is.
+Turning an option off undoes exactly what tv-blockd did for it, without a
+reboot:
+- **hosts**: unmounted everywhere;
+- **OTN lock**: puts back the auto-update value it found;
+- **telemetry**: deletes only the brake files and directories it created,
+  unmasks the units, and restarts the ones it stopped.
+
+`undo` (or **Undo all changes** in the manager) switches all three off. The
+record lives in `/opt/tv-suite/var/changes.json`, because brake files and the
+auto-update setting outlive a reboot. `EdgeScraper` has no unit to restart;
+it comes back at the next boot.
+
+Known gap: most telemetry unit names are Vetro's and do not exist on this
+firmware (see the backlog in `docs/rust-tv-suite-plan.md`).
 
 ## Configuration
 
@@ -38,13 +50,15 @@ that the OTN lock leaves the auto-update setting where it is.
 ## Control
 
 `/run/tv-suite/blockd.sock` (`root:users 0660`), newline-delimited JSON:
-`{"method":"status"}` and `{"method":"set","config":{...}}` (replaces the whole
-config; answers with the new status). Callers: root, or uid 5001 with SMACK
+`{"method":"status"}`, `{"method":"set","config":{...}}` (replaces the whole
+config) and `{"method":"undo"}`; each answers with the new status, which
+includes the `changes` record. Callers: root, or uid 5001 with SMACK
 label `User::Pkg::org.tvauth.ui` (the manager's **Tweaks** tab).
 
 ```sh
 /run/opt/tv-suite/bin/tv-blockd status   # from root, inside the unit's namespace
 tv-blockd set '{"hosts":true,"otn_lock":true}'
+tv-blockd undo
 ```
 
 Log: `/run/tv-suite/blockd.log` (one line per pass and per change).

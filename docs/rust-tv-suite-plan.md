@@ -413,3 +413,36 @@ to `::` and essential ones normally; auto-update 0; no telemetry unit active.
 From the Tweaks tab, switching Advertising off made `rtb-config.samsungads.com`
 resolve again and switching it on blackholed it, with focus kept on the
 toggle. Not exercised: a cold boot with the new unit, and remote lists.
+
+### Phase 4 follow-up: undo (2026-11-10)
+
+Everything tv-blockd changes can be undone without a reboot: **Undo all
+changes** in the Tweaks tab (or `tv-blockd undo`) switches host blocking, the
+auto-update lock and telemetry off. Each of those, when off, puts back what
+tv-blockd changed, as recorded in `/opt/tv-suite/var/changes.json`:
+- the auto-update value it found;
+- the brake files and directories it created (and only those);
+- the units it stopped, restarted.
+
+The `/etc/hosts` mounts and runtime masks are removed, and they would not
+survive a reboot anyway. `EdgeScraper` has no unit, so it comes back only at
+the next boot. Validated on tv-living: undo from the remote removed the brake
+files and their directory, unmounted every namespace and unmasked the units;
+auto-update forced 1 → 0 was restored to 1.
+
+## 8. Backlog
+
+- **Boot before Samsung's services.** The AT-HUB hook starts our units late in
+  boot, so telemetry runs and `/etc/hosts` is unblocked for about a minute
+  after every boot, until tv-blockd's first pass. Find an earlier hook, or a
+  way to order our units before Samsung's.
+- **Telemetry unit list.** Of the nine units `tv-blockd` masks (Vetro's
+  names), only `pisa-service` exists on T-PTMDEUC-1720.7; `canalysis`,
+  `dlog_logger`, `ep-agent`, `faultmgr`, `smart_deadlock`, `trace_manager`,
+  `vision-data-recognition-service` and `elt-daemon` are `not-found`.
+  Likewise, only the `pisa-service` and `/tmp/eltlaunch.cond` brake files
+  gate a real unit; `canalysis-daemon` and `vision-data-recognition-service`
+  gate none. Real candidates: `canalysis-service`, `kpi-logging`,
+  `org.tizen.tv.sp-kpi`, `emergency-log-transmitter`, `issue_report_agent`,
+  `smart-deadlock`, `stability-monitor`, `dlogutil` (`/opt/etc/disable_dlogutil`).
+  Each needs checking for side effects before it is stopped.

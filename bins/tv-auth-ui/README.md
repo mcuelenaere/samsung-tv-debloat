@@ -121,7 +121,9 @@ each built-in host group with its note, host count and evidence, the
 auto-update lock, and telemetry. A summary line shows the blocked host count,
 the auto-update setting, running telemetry services and any reconcile error.
 Each press sends the whole edited config with `set`; the row's button updates
-in place from the answer, so focus stays. See `bins/tv-blockd/README.md`.
+in place from the answer, so focus stays. **Undo all changes** at the bottom
+sends `undo`: everything off, and what tv-blockd changed put back. See
+`bins/tv-blockd/README.md`.
 
 ## Files
 

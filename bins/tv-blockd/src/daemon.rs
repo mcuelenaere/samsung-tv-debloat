@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -14,6 +14,7 @@ use tv_blockd::policy::{self, Config, HOSTS_MARKER, HOST_GROUPS};
 
 const CONFIG: &str = "/opt/tv-suite/etc/blockd.json";
 const LIST_CACHE: &str = "/opt/tv-suite/var/lists";
+const CHANGES: &str = "/opt/tv-suite/var/changes.json";
 const RUN_DIR: &str = "/run/tv-suite";
 const HOSTS_FILE: &str = "/run/tv-suite/hosts";
 const HOSTS_ORIGINAL: &str = "/run/tv-suite/hosts.original";
@@ -97,11 +98,58 @@ struct ListReport {
     error: Option<String>,
 }
 
+/// What tv-blockd changed that a reboot does not reset, or that it must put
+/// back: switching an option off (or `undo`) restores exactly this.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Changes {
+    /// The boot `stopped` belongs to.
+    #[serde(default)]
+    boot_id: String,
+    /// The auto-update setting before tv-blockd first turned it off.
+    #[serde(default)]
+    otn_autoupdate: Option<i32>,
+    /// Brake files and the directories made for them, in creation order.
+    #[serde(default)]
+    created: Vec<String>,
+    /// Telemetry units that were running when tv-blockd stopped them.
+    #[serde(default)]
+    stopped: Vec<String>,
+}
+
+impl Changes {
+    fn load() -> Self {
+        let mut changes: Changes = fs::read(CHANGES)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if changes.boot_id != boot_id {
+            // A reboot already restarted them (and dropped the runtime masks).
+            changes.stopped.clear();
+            changes.boot_id = boot_id;
+        }
+        changes
+    }
+
+    fn save(&self) {
+        if let Err(error) = save_json(CHANGES, self) {
+            log(&format!("{CHANGES}: {error}"));
+        }
+    }
+}
+
 struct Daemon {
     config: Config,
     report: Report,
+    changes: Changes,
     written_hosts: Option<String>,
+    /// Telemetry units masked by this process.
     masked: bool,
+    /// Telemetry changes undone since telemetry was last switched off.
+    telemetry_restored: bool,
     list_fetched: BTreeMap<String, Instant>,
     /// Namespaces already reported as failing, so each is logged once.
     reported_failures: std::collections::BTreeSet<String>,
@@ -125,6 +173,7 @@ fn run() -> io::Result<()> {
     {
         [] => {}
         ["status"] => return client(json!({"method": "status"})),
+        ["undo"] => return client(json!({"method": "undo"})),
         ["set", config] => {
             let config: Value = serde_json::from_str(config)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -135,6 +184,7 @@ fn run() -> io::Result<()> {
                 "usage: tv-blockd            run the daemon\n\
                  \x20      tv-blockd status     print config and last reconcile\n\
                  \x20      tv-blockd set JSON   replace the whole config\n\
+                 \x20      tv-blockd undo       switch everything off and restore what it changed\n\
                  config: {CONFIG}; control socket: {SOCKET}"
             );
             return Ok(());
@@ -163,8 +213,10 @@ fn run() -> io::Result<()> {
             Config::default()
         },
         report: Report::default(),
+        changes: Changes::load(),
         written_hosts: None,
         masked: false,
+        telemetry_restored: false,
         list_fetched: BTreeMap::new(),
         reported_failures: std::collections::BTreeSet::new(),
     };
@@ -293,20 +345,34 @@ impl Daemon {
                 Ok(config) => match config.validate() {
                     Ok(()) => {
                         log(&format!("config set by uid={uid} label={label}"));
-                        self.config = config;
-                        if let Err(error) = save_json(CONFIG, &self.config) {
-                            log(&format!("config save: {error}"));
-                        }
-                        self.reconcile();
-                        self.status()
+                        self.apply(config)
                     }
                     Err(error) => json!({"status": "error", "error": error}),
                 },
                 Err(error) => json!({"status": "error", "error": error.to_string()}),
             },
+            Some("undo") => {
+                log(&format!("undo by uid={uid} label={label}"));
+                let config = Config {
+                    hosts: false,
+                    otn_lock: false,
+                    telemetry: false,
+                    ..self.config.clone()
+                };
+                self.apply(config)
+            }
             _ => json!({"status": "error", "error": "unknown method"}),
         };
         tv_proto::write_json(&mut writer, &response)
+    }
+
+    fn apply(&mut self, config: Config) -> Value {
+        self.config = config;
+        if let Err(error) = save_json(CONFIG, &self.config) {
+            log(&format!("config save: {error}"));
+        }
+        self.reconcile();
+        self.status()
     }
 
     fn status(&self) -> Value {
@@ -318,7 +384,7 @@ impl Daemon {
             })
             .collect();
         json!({"status": "ok", "config": self.config, "report": self.report,
-               "groups": groups})
+               "changes": self.changes, "groups": groups})
     }
 
     fn reconcile(&mut self) {
@@ -445,7 +511,13 @@ impl Daemon {
         match tv_tizen::vconf::get_int(AUTOUPDATE_KEY) {
             Ok(value) => {
                 report.otn_autoupdate = Some(value);
-                if self.config.otn_lock && value != 0 {
+                if !self.config.otn_lock {
+                    self.restore_otn(report);
+                } else if value != 0 {
+                    if self.changes.otn_autoupdate.is_none() {
+                        self.changes.otn_autoupdate = Some(value);
+                        self.changes.save();
+                    }
                     match tv_tizen::vconf::set_int(AUTOUPDATE_KEY, 0) {
                         Ok(()) => {
                             report.otn_autoupdate = Some(0);
@@ -459,32 +531,80 @@ impl Daemon {
         }
     }
 
+    /// Put back the auto-update setting tv-blockd found.
+    fn restore_otn(&mut self, report: &mut Report) {
+        let Some(original) = self.changes.otn_autoupdate else {
+            return;
+        };
+        match tv_tizen::vconf::set_int(AUTOUPDATE_KEY, original) {
+            Ok(()) => {
+                report.otn_autoupdate = Some(original);
+                self.changes.otn_autoupdate = None;
+                self.changes.save();
+                log(&format!("otn autoupdate restored to {original}"));
+            }
+            Err(error) => report.errors.push(error),
+        }
+    }
+
+    /// Remove the brake files tv-blockd made, unmask, and restart the units
+    /// it stopped. `EdgeScraper` has no unit; it returns at the next boot.
+    fn restore_telemetry(&mut self, units: &[String]) {
+        for path in self.changes.created.drain(..).rev() {
+            // Directories go only if empty.
+            let _ = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path));
+        }
+        let _ = systemctl(&["unmask", "--runtime"], units);
+        self.masked = false;
+        if !self.changes.stopped.is_empty() {
+            let _ = systemctl(&["start", "--no-block"], &self.changes.stopped);
+            self.changes.stopped.clear();
+        }
+        self.changes.save();
+        log("telemetry restored");
+    }
+
     fn reconcile_telemetry(&mut self, report: &mut Report) {
         let units: Vec<String> = TELEMETRY_UNITS
             .iter()
             .map(|unit| format!("{unit}.service"))
             .collect();
         if !self.config.telemetry {
-            if self.masked {
-                for brake in BRAKES {
-                    let _ = fs::remove_file(brake);
-                }
-                let _ = systemctl(&["unmask", "--runtime"], &units);
-                self.masked = false;
-                log("telemetry brakes removed");
+            if !self.telemetry_restored {
+                self.restore_telemetry(&units);
+                self.telemetry_restored = true;
             }
             report.telemetry_active = active_units(&units);
             return;
         }
+        self.telemetry_restored = false;
         for brake in BRAKES {
-            if !Path::new(brake).exists() {
-                if let Some(parent) = Path::new(brake).parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Err(error) = fs::write(brake, b"") {
-                    report.errors.push(format!("brake {brake}: {error}"));
-                }
+            let path = Path::new(brake);
+            if path.exists() {
+                continue;
             }
+            let mut missing: Vec<&Path> = path
+                .ancestors()
+                .skip(1)
+                .take_while(|dir| !dir.exists())
+                .collect();
+            missing.reverse();
+            missing.push(path);
+            for (index, created) in missing.iter().enumerate() {
+                let result = if index + 1 == missing.len() {
+                    fs::write(created, b"")
+                } else {
+                    fs::create_dir(created)
+                };
+                if let Err(error) = result {
+                    report
+                        .errors
+                        .push(format!("brake {}: {error}", created.display()));
+                    break;
+                }
+                self.changes.created.push(created.display().to_string());
+            }
+            self.changes.save();
         }
         if !self.masked {
             // Runtime masks live in /run: re-applied on every boot.
@@ -496,6 +616,12 @@ impl Daemon {
         let active = active_units(&units);
         if !active.is_empty() {
             let _ = systemctl(&["stop", "--no-block"], &active);
+            for unit in &active {
+                if !self.changes.stopped.contains(unit) {
+                    self.changes.stopped.push(unit.clone());
+                }
+            }
+            self.changes.save();
         }
         report.telemetry_active = active;
         for pid in processes_named(TELEMETRY_PROCESSES) {
