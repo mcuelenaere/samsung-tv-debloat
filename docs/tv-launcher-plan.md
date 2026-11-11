@@ -309,6 +309,19 @@ No daemon, no evdev, no root at run time.
    - Focus scrolling is instant (Elementary autoscroll SHOW) in the dock and
      the manager, after the user found scrolling slow once items had to come
      into view. Not yet confirmed by the user.
+   **Redesign 2026-11-11**: the user found the Elementary dock not smooth
+   and the UX weak next to Vetro's. After an interactive mockup the dock was
+   rebuilt Vetro's way: plain evas objects, an ecore animator, a floating
+   bar; apps in the bar, inputs behind Up, Samsung Home, Settings and TV
+   suite behind Down (`bins/tv-auth-ui/README.md`, *Dock*). On tv-living:
+   - all three rows, names, the current-input start, OK on an app, an
+     input row entry and TV suite;
+   - own work per frame at most 3.1 ms; the first frames after showing,
+     and one frame in a long run while the test spawned a key-injection
+     process every 120 ms, took 32–38 ms;
+   - the first Home press after an install or boot builds the dock (about
+     2 s for 28 icons); keys pressed meanwhile are lost. Later presses
+     reuse the resident dock.
 4. **Samsung Home, Settings, TV suite tiles**. Check: Samsung Home opens with
    its sidebar 20 times out of 20; the next Home press shows the dock.
 5. **Tweaks toggle and Undo**. Check: off returns stock Home behaviour at

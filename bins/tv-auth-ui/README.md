@@ -133,28 +133,34 @@ on and off, and **Update TizenTube** installs npm's latest release. See
 
 The same executable, started under the package's second app id (`main`
 checks `AUL_APPID`). When tv-patchd's `custom_home` is on, it is the Home
-key's target:
-- each Home press arrives as `app_control` and shows the dock, or hides it if
-  it is already shown;
-- it is a `NOTIFICATION_HIGH` window across the bottom of the screen;
-- BACK or 20 s idle also hides it;
-- tiles: **Samsung Home** (`com.samsung.tv.csfs`), **Settings**
-  (`org.tizen.menu`), the inputs, the apps, **TV suite**. The focused tile's
-  name shows above the row; the row scrolls with focus.
+key's target: each Home press arrives as `app_control` and shows the dock,
+or hides it if it is already shown.
 
-The inputs are the HDMI sources in Home's row, in that order, then TV, from
-Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
-- name: `EditName`, else `DetectedName`, else the source id;
-- icon: `LauncherUnfocusedIconPath` (Samsung's launcher art, e.g. Xbox and
-  Nintendo), else `IconPath`. PNGs load directly. Samsung's SVGs (gamepad,
-  TV, the Settings gear) are rasterised with thorvg (`tv_tizen::svg`) onto a
-  light backdrop, because evas has no SVG loader here and the icons are dark;
-- OK sends tv-viewer Samsung's own source-change request (`change_source`,
-  `sourceType`, `sourceName`, `sourceIcon`, `mbrIndex`,
-  `__K_EX_LAUNCH_REQUESTOR=user`).
+A rounded bar at the bottom of the screen (`NOTIFICATION_HIGH`, alpha, as
+small as the widest row), over whatever is playing, with three rows:
+- **apps**, with **Inputs ^** above and **Settings ⌄** below;
+- **Up**: the inputs, opened on the current input (`memory/system/source_type`,
+  marked with a blue dot); Down or BACK returns;
+- **Down**: Samsung Home (`com.samsung.tv.csfs`), Settings (`org.tizen.menu`)
+  and TV suite; Up or BACK returns.
 
-Both UIs set Elementary's focus autoscroll to SHOW: a scroller jumps to the
-focused widget instead of animating there, which lagged behind key repeat.
+The selection glides between icons in 0.3 s at constant speed. The focused
+icon grows from 92 to 112 px and rises 4 px, a white ring and a glow in the
+icon's own colour follow the selection, and its name fades in underneath.
+The row scrolls to keep the selection centred. Rows fade and slide in from
+the side their arrow points to. OK opens the entry once the bar has faded
+out; BACK on the apps or 20 s idle hides it.
+
+No Elementary widgets (`src/dock.rs`): plain evas images and text placed by
+hand. An ecore animator runs only while something moves, and each frame
+calls into EFL only for values that changed. Geometry, motion and keys are
+in `src/dock_core.rs`; the pictures (bar, shadow, ring, glow, chevrons,
+finished icons) are drawn in memory by `src/pixels.rs` (both host-tested).
+Icons get rounded corners and are fitted whole onto a square tile;
+Samsung's SVGs are rasterised with thorvg (`tv_tizen::svg`) onto a light
+tile when they are dark, a dark one when light. An animation that drops
+frames (a gap over 25 ms) is logged with its longest gap and longest own
+work.
 
 The apps are Samsung Home's own catalog (`src/catalog.rs`):
 - webappservice's `widgetinfo` rows with `is_hidden = 0` (sideloaded apps
@@ -164,17 +170,25 @@ The apps are Samsung Home's own catalog (`src/catalog.rs`):
   which tv-patchd mirrors because only Home's label may read the original),
   then the rest by title.
 
+The inputs are the HDMI sources in Home's row, in that order, then TV, from
+Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
+- name: `EditName`, else `DetectedName`, else the source id;
+- icon: `LauncherUnfocusedIconPath` (Samsung's launcher art, e.g. Xbox and
+  Nintendo), else `IconPath`;
+- OK sends tv-viewer Samsung's own source-change request (`change_source`,
+  `sourceType`, `sourceName`, `sourceIcon`, `mbrIndex`,
+  `__K_EX_LAUNCH_REQUESTOR=user`).
+
 A thread watches `/opt/dbspace` (`.webappservice.db*`) and `/run/tv-suite`
 (`home-row`, `home-sources`) with inotify and reads the catalog again 300 ms
 after the last change. Only when apps or inputs differ (webappservice writes
-on every launch too) does it wake the main loop through an `ecore_pipe`. The
-tiles are rebuilt and focus stays on the same tile. An install or uninstall shows within about
-2–3 s of its start, before `tvauth-cli` returns.
+on every launch too) does it wake the main loop through an `ecore_pipe`; the
+rows are rebuilt and each keeps its selection. An install or uninstall shows
+within about 2–3 s of its start, before `tvauth-cli` returns.
 
-The TV's button theme has no icon part, draws its focus above any content and
-has a minimum larger than a tile. An icon tile is therefore an invisible
-button (it still takes focus and OK) under the icon, with a white frame of
-ours shown on focus.
+The manager sets Elementary's focus autoscroll to SHOW: its scroller jumps
+to the focused widget instead of animating there, which lagged behind key
+repeat.
 
 See `docs/tv-launcher-plan.md`.
 
@@ -186,6 +200,8 @@ See `docs/tv-launcher-plan.md`.
 | `src/store.rs` | catalog envelope, freshness, flattening, version states (host-tested) |
 | `src/dock.rs` | the dock (`org.tvauth.home`) |
 | `src/catalog.rs` | the dock's app list and order (host-tested) |
+| `src/dock_core.rs` | the dock's geometry, motion and keys (host-tested) |
+| `src/pixels.rs` | the dock's pictures, drawn in memory (host-tested) |
 | `../../crates/tv-proto` | broker client (`client`), markup (`markup`), message types (`ui`) |
 | `../../crates/tv-efl` | EFL FFI, widgets, bounded `/tmp/tvauth-ui.log` writer (`log`) |
 | `tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |

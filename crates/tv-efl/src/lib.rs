@@ -53,6 +53,18 @@ pub type AppControlCb = unsafe extern "C" fn(app_control: *mut c_void, user_data
 pub type EvasSmartCb =
     unsafe extern "C" fn(data: *mut c_void, object: *mut c_void, event_info: *mut c_void);
 pub type EcoreTimerCb = unsafe extern "C" fn(data: *mut c_void) -> EinaBool;
+pub type EvasObjectEventCb = unsafe extern "C" fn(
+    data: *mut c_void,
+    evas: *mut c_void,
+    object: *mut c_void,
+    event_info: *mut c_void,
+);
+
+/// `Evas_Callback_Type` `EVAS_CALLBACK_KEY_DOWN`; the event info starts with
+/// `const char *keyname`.
+pub const EVAS_CALLBACK_KEY_DOWN: c_int = 10;
+/// `Evas_Text_Style_Type` soft shadow.
+pub const EVAS_TEXT_STYLE_SOFT_SHADOW: c_int = 8;
 
 #[link(name = "capi-appfw-application")]
 extern "C" {
@@ -175,6 +187,44 @@ extern "C" {
     pub fn evas_object_evas_get(object: *mut c_void) -> *mut c_void;
     pub fn evas_object_rectangle_add(evas: *mut c_void) -> *mut c_void;
     pub fn evas_object_image_filled_add(evas: *mut c_void) -> *mut c_void;
+    pub fn evas_object_image_file_set(object: *mut c_void, file: *const c_char, key: *const c_char);
+    /// `EVAS_LOAD_ERROR_NONE` is 0.
+    pub fn evas_object_image_load_error_get(object: *const c_void) -> c_int;
+    pub fn evas_object_image_size_get(object: *const c_void, width: *mut c_int, height: *mut c_int);
+    /// Row stride in bytes.
+    pub fn evas_object_image_stride_get(object: *const c_void) -> c_int;
+    pub fn evas_object_image_data_get(object: *const c_void, for_writing: EinaBool) -> *mut c_void;
+    pub fn evas_object_image_data_set(object: *mut c_void, data: *mut c_void);
+    pub fn evas_object_image_smooth_scale_set(object: *mut c_void, smooth: EinaBool);
+    /// Nine-slice: these edges keep their size when the image is scaled.
+    pub fn evas_object_image_border_set(
+        object: *mut c_void,
+        left: c_int,
+        right: c_int,
+        top: c_int,
+        bottom: c_int,
+    );
+    pub fn evas_object_clip_set(object: *mut c_void, clip: *mut c_void);
+    pub fn evas_object_focus_set(object: *mut c_void, focus: EinaBool);
+    pub fn evas_object_event_callback_add(
+        object: *mut c_void,
+        kind: c_int,
+        callback: EvasObjectEventCb,
+        data: *const c_void,
+    );
+    pub fn evas_object_text_add(evas: *mut c_void) -> *mut c_void;
+    pub fn evas_object_text_font_set(object: *mut c_void, font: *const c_char, size: c_int);
+    pub fn evas_object_text_text_set(object: *mut c_void, text: *const c_char);
+    pub fn evas_object_text_horiz_advance_get(object: *const c_void) -> c_int;
+    pub fn evas_object_text_vert_advance_get(object: *const c_void) -> c_int;
+    pub fn evas_object_text_style_set(object: *mut c_void, style: c_int);
+    pub fn evas_object_text_shadow_color_set(
+        object: *mut c_void,
+        r: c_int,
+        g: c_int,
+        b: c_int,
+        a: c_int,
+    );
     pub fn evas_object_image_size_set(object: *mut c_void, width: c_int, height: c_int);
     pub fn evas_object_image_alpha_set(object: *mut c_void, alpha: EinaBool);
     /// Copies premultiplied ARGB pixels of the image's size.
@@ -233,6 +283,10 @@ extern "C" {
     pub fn ecore_pipe_add(handler: EcorePipeCb, data: *const c_void) -> *mut c_void;
     pub fn ecore_pipe_write(pipe: *mut c_void, buffer: *const c_void, bytes: u32) -> EinaBool;
     pub fn ecore_timer_del(timer: *mut c_void) -> *mut c_void;
+    pub fn ecore_timer_reset(timer: *mut c_void);
+    /// Runs `callback` once per display frame while it returns 1.
+    pub fn ecore_animator_add(callback: EcoreTimerCb, data: *const c_void) -> *mut c_void;
+    pub fn ecore_time_get() -> c_double;
     pub fn ecore_timer_add(
         interval: c_double,
         callback: EcoreTimerCb,
