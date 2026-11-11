@@ -10,8 +10,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tv_patchd::http::{self, Script};
@@ -31,6 +31,13 @@ const CA_BUNDLE: &str = "/etc/ssl/ca-bundle.pem";
 const COBALT_APP: &str = "com.samsung.tv.cobalt-yt";
 /// The suite's dock, `org.tvauth.ui`'s second app.
 const DOCK_APP: &str = "org.tvauth.home";
+/// Samsung Home's row and source caches. Only Home's own SMACK label may read
+/// them, so while Custom Home is on they are mirrored for the dock as
+/// `/run/tv-suite/home-row` and `home-sources`.
+const HOME_DATA: &str = "/opt/usr/home/owner/apps_rw/com.samsung.tv.home.media/data";
+const MIRRORS: &[&str] = &["/run/tv-suite/home-row", "/run/tv-suite/home-sources"];
+const SHARED_LABEL: &str = "User::App::Shared";
+static MIRROR_LOCK: Mutex<()> = Mutex::new(());
 
 const UI_LABEL: &str = "User::Pkg::org.tvauth.ui";
 const UI_UID: u32 = 5001;
@@ -146,6 +153,8 @@ struct Report {
 
 struct Daemon {
     config: Config,
+    /// `config.custom_home`, for the mirror thread.
+    mirroring: Arc<AtomicBool>,
     script: ScriptInfo,
     shared: Arc<Shared>,
     report: Report,
@@ -241,8 +250,13 @@ fn run() -> io::Result<()> {
     let proxy = shared.clone();
     thread::spawn(move || serve_proxy(proxy));
 
+    let mirroring = Arc::new(AtomicBool::new(false));
+    let watching = mirroring.clone();
+    thread::spawn(move || mirror_changes(&watching));
+
     let mut daemon = Daemon {
         config: load_json(CONFIG),
+        mirroring,
         script: load_json(SCRIPT_INFO),
         shared,
         report: Report::default(),
@@ -385,6 +399,11 @@ impl Daemon {
             self.setup_at = None;
         }
         report.row = self.reconcile_row(report.ready, &mut report).to_owned();
+        self.mirroring
+            .store(self.config.custom_home, Ordering::Relaxed);
+        if let Err(error) = mirror_home(self.config.custom_home) {
+            report.errors.push(format!("mirror Home's caches: {error}"));
+        }
         report.home = self.reconcile_home(&mut report);
         if !self.config.tizentube {
             remove_content(&mut report);
@@ -657,6 +676,73 @@ fn write_row(from: &str, to: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("the row changed while it was being written".into())
+    }
+}
+
+/// Copies Samsung Home's caches to [`MIRRORS`] (readable by every app label),
+/// or removes the copies when `on` is false.
+fn mirror_home(on: bool) -> io::Result<()> {
+    let _guard = MIRROR_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !on {
+        for mirror in MIRRORS {
+            let _ = fs::remove_file(mirror);
+        }
+        return Ok(());
+    }
+    // Home writes `.appLayerCache.1` and `.2` in turn; the newer is current.
+    let row = [".appLayerCache.1", ".appLayerCache.2"]
+        .iter()
+        .map(|name| format!("{HOME_DATA}/{name}"))
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max()
+        .map(|(_, path)| path);
+    let sources = format!("{HOME_DATA}/.sourceCache");
+    for (from, to) in [row.as_deref(), Some(sources.as_str())]
+        .into_iter()
+        .zip(MIRRORS)
+    {
+        let Some(from) = from else { continue };
+        let bytes = fs::read(from)?;
+        if fs::read(to).is_ok_and(|current| current == bytes) {
+            continue;
+        }
+        let temporary = format!("{to}.tmp");
+        fs::write(&temporary, &bytes)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))?;
+        let path = CString::new(temporary.as_str()).unwrap();
+        unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                c"security.SMACK64".as_ptr(),
+                SHARED_LABEL.as_ptr().cast(),
+                SHARED_LABEL.len(),
+                0,
+            )
+        };
+        fs::rename(&temporary, to)?;
+    }
+    Ok(())
+}
+
+/// Thread: mirror again whenever Home rewrites a cache.
+fn mirror_changes(on: &AtomicBool) {
+    let watch = match tv_tizen::watch::Watch::new(&[HOME_DATA]) {
+        Ok(watch) => watch,
+        Err(error) => return log(&format!("mirror: {error}; mirroring once a minute only")),
+    };
+    let wanted = |name: &str| name.starts_with(".appLayerCache.") || name == ".sourceCache";
+    loop {
+        if let Err(error) = watch.wait(wanted, Duration::from_millis(300)) {
+            log(&format!("mirror watch: {error}"));
+            thread::sleep(TICK);
+        }
+        if on.load(Ordering::Relaxed) {
+            if let Err(error) = mirror_home(true) {
+                log(&format!("mirror Home's caches: {error}"));
+            }
+        }
     }
 }
 

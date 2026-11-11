@@ -107,6 +107,8 @@ extern "C" {
     pub fn elm_box_horizontal_set(object: *mut c_void, horizontal: EinaBool);
     pub fn elm_box_padding_set(object: *mut c_void, horizontal: EvasCoord, vertical: EvasCoord);
     pub fn elm_box_pack_end(object: *mut c_void, child: *mut c_void);
+    /// Deletes every child.
+    pub fn elm_box_clear(object: *mut c_void);
 
     pub fn elm_label_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_label_line_wrap_set(object: *mut c_void, wrap: c_int);
@@ -131,6 +133,9 @@ extern "C" {
     pub fn elm_scroller_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_scroller_policy_set(scroller: *mut c_void, horizontal: c_int, vertical: c_int);
     pub fn elm_scroller_bounce_set(scroller: *mut c_void, horizontal: EinaBool, vertical: EinaBool);
+    /// Take the content's minimum size in that direction (a scroller
+    /// otherwise computes its own and ignores size hints).
+    pub fn elm_scroller_content_min_limit(scroller: *mut c_void, width: EinaBool, height: EinaBool);
     pub fn elm_hoversel_add(parent: *mut c_void) -> *mut c_void;
     pub fn elm_hoversel_hover_parent_set(hoversel: *mut c_void, parent: *mut c_void);
     pub fn elm_hoversel_item_add(
@@ -148,6 +153,7 @@ extern "C" {
     ) -> EinaBool;
     pub fn elm_object_part_text_set(object: *mut c_void, part: *const c_char, text: *const c_char);
     pub fn elm_object_focus_set(object: *mut c_void, focus: EinaBool);
+    pub fn elm_object_scale_set(object: *mut c_void, scale: c_double);
 }
 
 #[link(name = "evas")]

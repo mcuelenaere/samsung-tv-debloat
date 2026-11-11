@@ -11,6 +11,8 @@ pub mod peer;
 pub mod pkgdb;
 pub mod tls;
 pub mod vconf;
+#[cfg(target_os = "linux")]
+pub mod watch;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;

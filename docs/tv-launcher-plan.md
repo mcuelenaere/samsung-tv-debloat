@@ -142,24 +142,24 @@ No daemon, no evdev, no root at run time.
 
 ### Apps, refreshed at once
 
-- **Catalog**:
-  - every launchable UI app from `.pkgmgr_parser.db` (`package_app_info`,
-    `app_nodisplay = false`, enabled), which includes sideloaded store
-    installs;
-  - titles from `package_app_localized_info`, and from `widgetinfo` for WGTs
-    (the wrapper ids Samsung's Home uses);
-  - icons from `/opt/share/webappservice/apps_icon/all/<id>/`, else the
-    package icon.
-- **Order**: Home's row (`.appLayerCache.1` of home.media, else csfs) first,
-  then the rest by title; a small exclude list for system "apps" that are
-  marked displayable.
-- **Refresh**: inotify on `/opt/dbspace` for `.pkgmgr_parser.db` and
-  `.webappservice.db`, plus Home's `data/` dirs for `.appLayerCache.*` and
-  `.sourceCache`. Re-query 300 ms after the last change; tiles update in
-  place and keep focus.
-  - inotify catches pkgmgr and the WAS row write that follows a WGT install,
-    with no D-Bus or glib.
-  - The pkgmgr signals stay a fallback if inotify proves too coarse.
+- **Catalog** (as built in step 2): webappservice's `widgetinfo`, the list
+  Samsung's Home itself shows.
+  - Rows with `is_hidden = 0`: 21 apps on tv-living, sideloads (Kodi,
+    RetroArch, OmegaTube, Steam Link) included, no system "apps", so no
+    exclude list.
+  - `id` is the id Home's row uses, `title` the name, `tizen_id` the app to
+    launch (the wrapper ids, e.g. `9Ur5IzDKqV.TizenYouTube`), `icon_path` a
+    folder of PNG sizes.
+  - pkgmgr's database is not needed.
+- **Order**: Home's row (`.appLayerCache.1` or `.2` of home.media, the newer)
+  first, then the rest by title.
+  - Only Home's label may read Home's `data/`, so tv-patchd mirrors the row
+    and `.sourceCache` to `/run/tv-suite/home-row` and `home-sources`
+    (`User::App::Shared`) while Custom Home is on.
+- **Refresh**: the dock watches `/opt/dbspace` (`.webappservice.db*`) and
+  `/run/tv-suite` (`home-row`) with inotify, re-queries 300 ms after the last
+  change and rebuilds the tiles, keeping focus on the same app. tv-patchd
+  watches Home's `data/` the same way for the mirror. No D-Bus or glib.
 - Target: an install or uninstall shows in the dock **within 1 s of pkgmgr's
   `end ok`**, including with the dock open.
 
@@ -253,6 +253,31 @@ No daemon, no evdev, no root at run time.
 2. **Catalog and refresh**. Check: install and uninstall from the store, a
    WGT and a TPK, with the dock open and closed; each appears or disappears
    within 1 s.
+
+   **Done 2026-11-11** on tv-living (TPK only so far):
+   - 23 tiles: Samsung Home, the 21 apps in Home's order (Netflix, Prime
+     Video, Disney+, Apple TV, Rakuten TV, YouTube, TV VLAANDEREN, VTM GO, RTL
+     play, Browser, Xbox), then the rest by title, then TV suite. Samsung's
+     icons; the row scrolls with focus.
+   - A visible throwaway TPK (`org.tvauth.probe`) through `tvauth-cli` with
+     the dock open:
+     - install: tile in the dock 2.1 s after the command started, 2.0 s
+       before `tvauth-cli` returned (it re-signs and installs through
+       webappservice);
+     - uninstall: tile gone 2.9 s after the start, 0.7 s before the command
+       returned;
+     - focus stayed on the focused app across the rebuild.
+     The webappservice row is written as part of the install, so the 1 s
+     target relative to pkgmgr's `end ok` holds in practice. It was not
+     measured against the D-Bus signal itself.
+   - A store install and a WGT were not tested.
+   - Found while testing: webappservice gives a multi-app TPK's row to an app
+     of its own choosing, and for `org.tvauth.ui` that is now the dock
+     (`tizen_id=org.tvauth.home`, `is_hidden=1`). Since step 1, **TV suite
+     is therefore missing from Samsung's own Home**. The pkgmgr main app is
+     still `org.tvauth.ui`. Listing the dock first with `main="true"` on the
+     manager does not help: this pkgmgr ignores `main`, so the dock became
+     the main app and still got the row. Not fixed yet.
 3. **Sources**. Check: XBOX SeriesX|S, PlayStation 5, Nintendo Switch with
    Samsung's art; switching to each; renaming a source in Samsung's source
    menu updates the tile.

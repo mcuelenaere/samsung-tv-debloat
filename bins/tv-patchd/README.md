@@ -76,7 +76,15 @@ the `org.tvauth.ui` package) the Home key's target:
 - `custom_home: false` or `undo` resets it with
   `app_operation_reset_current_app`.
 
-Uninstalling the package resets it to Samsung's Home as well. See
+Uninstalling the package resets it to Samsung's Home as well.
+
+While Custom Home is on, tv-patchd also mirrors Samsung Home's row
+(`.appLayerCache.1` or `.2`, whichever is newer) and source cache
+(`.sourceCache`) from `com.samsung.tv.home.media/data` to
+`/run/tv-suite/home-row` and `home-sources` (`0644`, SMACK
+`User::App::Shared`). Only Home's own label may read the originals; the dock
+reads the copies. A thread re-copies them 300 ms after Home rewrites one
+(inotify), and every pass checks them. Off or `undo` deletes them. See
 `docs/tv-launcher-plan.md`.
 
 ## Configuration and control

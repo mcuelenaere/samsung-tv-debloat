@@ -138,7 +138,27 @@ key's target:
   it is already shown;
 - it is a `NOTIFICATION_HIGH` window across the bottom of the screen;
 - BACK or 20 s idle also hides it;
-- tiles so far: **Samsung Home** (`com.samsung.tv.csfs`) and **TV suite**.
+- tiles: **Samsung Home** (`com.samsung.tv.csfs`), the apps, **TV suite**.
+  The focused tile's name shows above the row; the row scrolls with focus.
+
+The apps are Samsung Home's own catalog (`src/catalog.rs`):
+- webappservice's `widgetinfo` rows with `is_hidden = 0` (sideloaded apps
+  included): title, the app id to launch (`tizen_id`) and the icon folder
+  (`152x152.png`, else `224x224.png`, `icon.png`, `104x104.png`);
+- in Home's row order (`d/webapp@<id>` lines of `/run/tv-suite/home-row`,
+  which tv-patchd mirrors because only Home's label may read the original),
+  then the rest by title.
+
+A thread watches `/opt/dbspace` (`.webappservice.db*`) and `/run/tv-suite`
+(`home-row`) with inotify, reads the catalog again 300 ms after the last
+change and wakes the main loop through an `ecore_pipe`. The tiles are rebuilt
+and focus stays on the same app. An install or uninstall shows within about
+2–3 s of its start, before `tvauth-cli` returns.
+
+The TV's button theme has no icon part, draws its focus above any content and
+has a minimum larger than a tile. An icon tile is therefore an invisible
+button (it still takes focus and OK) under the icon, with a white frame of
+ours shown on focus.
 
 See `docs/tv-launcher-plan.md`.
 
@@ -148,6 +168,8 @@ See `docs/tv-launcher-plan.md`.
 |---|---|
 | `src/main.rs` | EFL window, Store/Permissions views, worker jobs |
 | `src/store.rs` | catalog envelope, freshness, flattening, version states (host-tested) |
+| `src/dock.rs` | the dock (`org.tvauth.home`) |
+| `src/catalog.rs` | the dock's app list and order (host-tested) |
 | `../../crates/tv-proto` | broker client (`client`), markup (`markup`), message types (`ui`) |
 | `../../crates/tv-efl` | EFL FFI, widgets, bounded `/tmp/tvauth-ui.log` writer (`log`) |
 | `tizen-manifest.xml` | `org.tvauth.ui`, `exec="tv-auth-ui"`, `type="capp"` |
