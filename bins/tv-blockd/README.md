@@ -98,7 +98,14 @@ but which can go without breaking the remote's microphone is untested.
 `/run/tv-suite/blockd.sock` (`root:users 0660`), newline-delimited JSON:
 `{"method":"status"}`, `{"method":"set","config":{...}}` (replaces the whole
 config) and `{"method":"undo"}`; each answers with the new status, which
-includes the `changes` record. Callers: root, or uid 5001 with SMACK
+includes the `changes` record. `{"method":"system"}` answers the manager's
+System tab: CPU, memory, swap, GPU and IO rates since the previous call (or
+over half a second), the top processes by CPU and by memory, and per option
+the processes it covers (its units' cgroups under
+`/sys/fs/cgroup/systemd/system.slice`, its apps from `app_launcher -S`, its
+process names) with their memory and CPU. Just before an option first stops
+its processes, tv-blockd records what they used in `changes.json`
+(`freed`). Callers: root, or uid 5001 with SMACK
 label `User::Pkg::org.tvauth.ui` (the manager's **Tweaks** tab).
 
 ```sh

@@ -80,6 +80,8 @@ impl Service {
         }
     }
 }
+/// Seconds between `system` snapshots while the System tab is open.
+const SYSTEM_REFRESH: f64 = 3.0;
 const CATEGORIES: &[(&str, &str)] = &[
     ("", "All"),
     ("media", "Media"),
@@ -149,6 +151,8 @@ enum Job {
     Audit(Vec<String>),
     /// A Tweaks daemon's status, with the message for a change it answers.
     Tweaks(Service, Option<String>, Result<Value, String>),
+    /// tv-blockd's `system` snapshot.
+    System(Result<Value, String>),
 }
 
 #[derive(Clone)]
@@ -211,6 +215,9 @@ struct Ui {
     tweaks: Option<Value>,
     /// tv-patchd's.
     patch: Option<Value>,
+    /// tv-blockd's last `system` snapshot, and when the next was asked for.
+    system: Option<Value>,
+    system_asked: Option<Instant>,
     exiting: bool,
     connected: bool,
     app_control_count: u32,
@@ -235,6 +242,8 @@ impl Ui {
             audit: Vec::new(),
             tweaks: None,
             patch: None,
+            system: None,
+            system_asked: None,
             exiting: false,
             connected: false,
             app_control_count: 0,
@@ -321,6 +330,23 @@ impl Ui {
         }
         while let Ok(job) = self.jobs_rx.try_recv() {
             dirty |= self.on_job(job);
+        }
+        if self.tab == Tab::System
+            && self
+                .system_asked
+                .is_none_or(|asked| asked.elapsed().as_secs_f64() >= SYSTEM_REFRESH)
+        {
+            self.system_asked = Some(Instant::now());
+            let jobs = self.jobs_tx.clone();
+            spawn(move || {
+                let result = tv_proto::call(BLOCKD_SOCKET, &json!({"method": "system"}))
+                    .map_err(|error| format!("Could not reach tv-blockd: {error}"))
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<Value>(&bytes)
+                            .map_err(|error| format!("tv-blockd sent bad JSON: {error}"))
+                    });
+                let _ = jobs.send(Job::System(result));
+            });
         }
         if dirty {
             self.render();
@@ -448,6 +474,14 @@ impl Ui {
                 }
                 // Re-rendered in place: focus and scroll position stay.
                 return matches!(self.tab, Tab::Tweaks | Tab::System);
+            }
+            Job::System(Ok(response)) => {
+                self.system = Some(response["system"].clone());
+                return self.tab == Tab::System;
+            }
+            Job::System(Err(error)) => {
+                log_line(&error);
+                return false;
             }
             Job::Tweaks(_, _, Err(error)) => {
                 log_line(&error);
@@ -903,7 +937,7 @@ impl Ui {
 
     fn system_page(&mut self) -> Vec<Block<Action>> {
         match &self.tweaks {
-            Some(status) => system_page(status),
+            Some(status) => system_page(status, self.system.as_ref()),
             None => vec![Block::Paragraph {
                 markup: "<muted>Asking tv-blockd...</muted>".into(),
                 size: 24,
@@ -1406,32 +1440,171 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
 }
 
 /// The System tab from tv-blockd's `status`.
-fn system_page(status: &Value) -> Vec<Block<Action>> {
+/// The System tab from tv-blockd's `status` and `system` snapshot.
+fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
     let config = &status["config"];
-    let running = status["report"]["services"]["sdb_off"]
-        .as_array()
-        .is_some_and(|units| !units.is_empty());
+    let mb = |kb: &Value| format!("{} MB", (kb.as_u64().unwrap_or(0) + 512) / 1024);
+    let mut blocks = Vec::new();
+    let options = system.map_or(&Value::Null, |system| &system["options"]);
+    let usage = |key: &str| {
+        let option = &options[key];
+        if option["processes"].as_u64().unwrap_or(0) > 0 {
+            format!(
+                "{} running: {} + {} swap, {}% CPU",
+                option["processes"],
+                mb(&option["rss_kb"]),
+                mb(&option["swap_kb"]),
+                option["cpu"]
+            )
+        } else if option["freed"].is_object() {
+            let freed = &option["freed"];
+            format!(
+                "stopped; freed {} + {} swap {}",
+                mb(&freed["rss_kb"]),
+                mb(&freed["swap_kb"]),
+                ago(freed["at"].as_i64().unwrap_or(0))
+            )
+        } else if system.is_some() && config[key] == true {
+            "stopped (not measured yet)".into()
+        } else if system.is_some() {
+            "nothing running".into()
+        } else {
+            "measuring...".into()
+        }
+    };
+    match system {
+        Some(system) => {
+            let used = |total: &str, free: &str| {
+                system[total]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(system[free].as_u64().unwrap_or(0))
+            };
+            let gb = |kb: u64| format!("{:.1}", kb as f64 / 1_048_576.0);
+            let kbs = |key: &str| format!("{:.0}", system[key].as_f64().unwrap_or(0.0));
+            blocks.push(Block::Tiles(vec![
+                (
+                    format!("{}%", system["cpu"]),
+                    format!(
+                        "CPU \u{00b7} load {}",
+                        system["load"].as_str().unwrap_or("?")
+                    ),
+                ),
+                (
+                    format!(
+                        "{} / {} GB",
+                        gb(used("mem_total_kb", "mem_available_kb")),
+                        gb(system["mem_total_kb"].as_u64().unwrap_or(0))
+                    ),
+                    "memory in use".into(),
+                ),
+                (
+                    format!(
+                        "{} / {} MB",
+                        used("swap_total_kb", "swap_free_kb") / 1024,
+                        system["swap_total_kb"].as_u64().unwrap_or(0) / 1024
+                    ),
+                    "swap in use".into(),
+                ),
+                (
+                    system["gpu"]
+                        .as_u64()
+                        .map_or("?".into(), |gpu| format!("{gpu}%")),
+                    "GPU".into(),
+                ),
+            ]));
+            blocks.push(Block::Paragraph {
+                markup: format!(
+                    "<muted>{} cores \u{00b7} storage {} KB/s read, {} KB/s written \u{00b7} swap {} KB/s in, {} KB/s out \u{00b7} {} processes</muted>",
+                    system["cores"],
+                    kbs("disk_read_kbs"),
+                    kbs("disk_write_kbs"),
+                    kbs("swap_in_kbs"),
+                    kbs("swap_out_kbs"),
+                    system["processes"]
+                ),
+                size: 22,
+            });
+        }
+        None => blocks.push(Block::Paragraph {
+            markup: "<muted>Measuring...</muted>".into(),
+            size: 24,
+        }),
+    }
+    let switch = |key: &str, title: &str| {
+        let mut row = Row::text(title, usage(key));
+        row.controls.push(Control::Switch {
+            on: config[key] == true,
+            action: Action::Tweak(key.into()),
+        });
+        row
+    };
+    blocks.push(Block::Section("What the tweaks save".into()));
+    blocks.push(Block::Rows(vec![
+        switch("telemetry", "Stop telemetry services"),
+        switch("airplay", "Turn off the AirPlay receiver"),
+        switch("multiview_preload", "Don't preload Multi View"),
+        switch("disable_hbbtv", "Disable HbbTV (permanent)"),
+        switch("disable_acr", "Disable ACR (permanent)"),
+        switch("disable_ads", "Disable targeted ads (permanent)"),
+    ]));
+    if let Some(system) = system {
+        let list = |key: &str| {
+            let lines: Vec<String> = system[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|process| {
+                    format!(
+                        "<b>{}</b>  <muted>{}% CPU \u{00b7} {} + {} swap \u{00b7} pid {}</muted>",
+                        escape(&shorten(process["name"].as_str().unwrap_or("?"), 48, false)),
+                        process["cpu"],
+                        mb(&process["rss_kb"]),
+                        mb(&process["swap_kb"]),
+                        process["pid"]
+                    )
+                })
+                .collect();
+            Block::Paragraph {
+                markup: lines.join("<br/>"),
+                size: 22,
+            }
+        };
+        blocks.push(Block::Section("Busiest now".into()));
+        blocks.push(list("top_cpu"));
+        blocks.push(Block::Section("Largest in memory".into()));
+        blocks.push(list("top_memory"));
+    }
     let mut sdb = Row::text(
         "SDB",
         format!(
             "Samsung's developer bridge, port 26101 \u{00b7} {}",
-            if running { "running" } else { "not running" }
+            usage("sdb_off")
         ),
     );
     sdb.controls.push(Control::Switch {
         on: config["sdb_off"] != true,
         action: Action::Tweak("sdb_off".into()),
     });
-    vec![
-        Block::Section("Developer access".into()),
-        Block::Rows(vec![sdb]),
-        Block::Paragraph {
-            markup: "<muted>SDB runs only while Samsung's developer mode is on. Off lasts until \
-                     you switch it back on here; a reboot without TV suite turns it back on.</muted>"
-                .into(),
-            size: 22,
-        },
-    ]
+    blocks.push(Block::Section("Developer access".into()));
+    blocks.push(Block::Rows(vec![sdb]));
+    blocks.push(Block::Paragraph {
+        markup: "<muted>SDB runs only while Samsung's developer mode is on. Off lasts until \
+                 you switch it back on here; a reboot without TV suite turns it back on.</muted>"
+            .into(),
+        size: 22,
+    });
+    blocks
+}
+
+/// "3 min ago" for a unix time.
+fn ago(at: i64) -> String {
+    match (unix_now() - at).max(0) {
+        0..60 => "just now".into(),
+        seconds @ 60..3600 => format!("{} min ago", seconds / 60),
+        seconds @ 3600..86_400 => format!("{} h ago", seconds / 3600),
+        seconds => format!("{} d ago", seconds / 86_400),
+    }
 }
 
 fn or_unknown(error: &str) -> &str {

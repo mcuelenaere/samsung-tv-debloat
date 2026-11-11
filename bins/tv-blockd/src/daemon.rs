@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tv_blockd::policy::{self, Config, HOSTS_MARKER, HOST_GROUPS};
+use tv_blockd::sysinfo;
 
 const CONFIG: &str = "/opt/tv-suite/etc/blockd.json";
 const LIST_CACHE: &str = "/opt/tv-suite/var/lists";
@@ -215,6 +216,17 @@ struct Changes {
     /// Apps tv-blockd disabled in pkgmgr's database (permanent options).
     #[serde(default)]
     disabled: Vec<String>,
+    /// What each option's processes used when tv-blockd last stopped them.
+    #[serde(default)]
+    freed: BTreeMap<String, Freed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Freed {
+    processes: usize,
+    rss_kb: u64,
+    swap_kb: u64,
+    at: u64,
 }
 
 impl Changes {
@@ -255,6 +267,8 @@ struct Daemon {
     list_fetched: BTreeMap<String, Instant>,
     /// Namespaces already reported as failing, so each is logged once.
     reported_failures: std::collections::BTreeSet<String>,
+    /// The System tab's previous reading, for rates.
+    sampled: Option<Sample>,
 }
 
 pub fn main() {
@@ -321,6 +335,7 @@ fn run() -> io::Result<()> {
         restored: Default::default(),
         list_fetched: BTreeMap::new(),
         reported_failures: std::collections::BTreeSet::new(),
+        sampled: None,
     };
 
     let _ = fs::remove_file(SOCKET);
@@ -399,6 +414,7 @@ impl Daemon {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let response = match request["method"].as_str() {
             Some("status") => self.status(),
+            Some("system") => self.system(),
             Some("set") => match serde_json::from_value::<Config>(request["config"].clone()) {
                 Ok(config) => match config.validate() {
                     Ok(()) => {
@@ -689,6 +705,7 @@ impl Daemon {
             // the unit must still be recorded to be started again on restore.
             let active = active_units(&units);
             if self.masked.insert(services.key) {
+                self.measure(services.key);
                 // Runtime masks live in /run: re-applied after every boot.
                 if let Err(error) = systemctl(&["mask", "--runtime"], &units) {
                     report
@@ -745,6 +762,9 @@ impl Daemon {
                 let disabled = states[app];
                 let ours = self.changes.disabled.iter().any(|known| known == app);
                 if wanted && !disabled {
+                    if !closed {
+                        self.measure(disable.key);
+                    }
                     match pkgcmd("-D", app) {
                         Ok(()) => {
                             states.insert(app.to_owned(), true);
@@ -785,6 +805,263 @@ impl Daemon {
                 .collect();
             report.disabled.insert(disable.key.to_owned(), disabled);
         }
+    }
+}
+
+/// One reading of the counters behind the System tab.
+struct Sample {
+    at: Instant,
+    /// `/proc/stat`: all ticks, idle ticks.
+    cpu: (u64, u64),
+    ticks: BTreeMap<i32, u64>,
+    /// Sectors read and written.
+    disk: (u64, u64),
+    /// Pages swapped in and out.
+    swap: (u64, u64),
+}
+
+struct Process {
+    pid: i32,
+    comm: String,
+    ticks: u64,
+    rss_kb: u64,
+    swap_kb: u64,
+}
+
+fn processes() -> Vec<Process> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let (comm, ticks) =
+                sysinfo::process_ticks(&fs::read_to_string(entry.path().join("stat")).ok()?)?;
+            let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+            Some(Process {
+                pid,
+                comm,
+                ticks,
+                rss_kb: sysinfo::kb(&status, "VmRSS"),
+                swap_kb: sysinfo::kb(&status, "VmSwap"),
+            })
+        })
+        .collect()
+}
+
+fn counters() -> ((u64, u64), (u64, u64), (u64, u64)) {
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    let vmstat = read("/proc/vmstat");
+    (
+        sysinfo::cpu_ticks(&read("/proc/stat")).unwrap_or((0, 0)),
+        sysinfo::disk_sectors(&read("/proc/diskstats")),
+        (
+            sysinfo::vmstat(&vmstat, "pswpin"),
+            sysinfo::vmstat(&vmstat, "pswpout"),
+        ),
+    )
+}
+
+fn running_apps() -> Vec<(String, i32)> {
+    Command::new("/usr/bin/app_launcher")
+        .arg("-S")
+        .output()
+        .map(|output| sysinfo::running_apps(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+/// What makes up an option: units, apps and process names.
+struct Parts {
+    key: &'static str,
+    units: &'static [&'static str],
+    apps: Vec<&'static str>,
+    names: &'static [&'static str],
+}
+
+fn option_parts() -> Vec<Parts> {
+    let services = SERVICES.iter().map(|services| Parts {
+        key: services.key,
+        units: services.units,
+        apps: services.apps.to_vec(),
+        names: services.processes,
+    });
+    let disables = DISABLES.iter().map(|disable| Parts {
+        key: disable.key,
+        units: &[],
+        apps: disable.apps.iter().chain(disable.close).copied().collect(),
+        names: &[],
+    });
+    services.chain(disables).collect()
+}
+
+/// The pids of an option: its units' cgroups, its apps, its process names.
+fn option_pids(
+    parts: &Parts,
+    running: &[(String, i32)],
+    processes: &[Process],
+) -> std::collections::BTreeSet<i32> {
+    let mut pids = std::collections::BTreeSet::new();
+    for unit in parts.units {
+        let path = format!("/sys/fs/cgroup/systemd/system.slice/{unit}/cgroup.procs");
+        if let Ok(text) = fs::read_to_string(path) {
+            pids.extend(
+                text.lines()
+                    .filter_map(|line| line.trim().parse::<i32>().ok()),
+            );
+        }
+    }
+    pids.extend(
+        running
+            .iter()
+            .filter(|(app, _)| parts.apps.contains(&app.as_str()))
+            .map(|(_, pid)| *pid),
+    );
+    pids.extend(
+        processes
+            .iter()
+            .filter(|process| parts.names.contains(&process.comm.as_str()))
+            .map(|process| process.pid),
+    );
+    pids
+}
+
+impl Daemon {
+    /// Records what an option's processes use, just before they are
+    /// stopped; nothing running keeps the previous record.
+    fn measure(&mut self, key: &str) {
+        let Some(parts) = option_parts().into_iter().find(|parts| parts.key == key) else {
+            return;
+        };
+        let processes = processes();
+        let pids = option_pids(&parts, &running_apps(), &processes);
+        let mine = processes
+            .iter()
+            .filter(|process| pids.contains(&process.pid));
+        let (rss_kb, swap_kb) = mine.fold((0, 0), |(rss, swap), process| {
+            (rss + process.rss_kb, swap + process.swap_kb)
+        });
+        if rss_kb + swap_kb == 0 {
+            return;
+        }
+        log(&format!(
+            "{key}: {} processes used {rss_kb} kB + {swap_kb} kB swap",
+            pids.len()
+        ));
+        self.changes.freed.insert(
+            key.to_owned(),
+            Freed {
+                processes: pids.len(),
+                rss_kb,
+                swap_kb,
+                at: unix_now(),
+            },
+        );
+        self.changes.save();
+    }
+
+    /// The System tab's snapshot: CPU, memory, GPU and IO, the busiest and
+    /// largest processes, and what each option's processes use now (or
+    /// freed when stopped). Rates are since the previous call, or over
+    /// half a second when that is stale.
+    fn system(&mut self) -> Value {
+        let take = |processes: &[Process]| {
+            let (cpu, disk, swap) = counters();
+            Sample {
+                at: Instant::now(),
+                cpu,
+                ticks: processes.iter().map(|p| (p.pid, p.ticks)).collect(),
+                disk,
+                swap,
+            }
+        };
+        let before = match self.sampled.take() {
+            Some(sample) if sample.at.elapsed() < Duration::from_secs(30) => sample,
+            _ => {
+                let sample = take(&processes());
+                std::thread::sleep(Duration::from_millis(500));
+                sample
+            }
+        };
+        let processes = processes();
+        let now = take(&processes);
+        let seconds = now.at.duration_since(before.at).as_secs_f64().max(0.1);
+        let total = now.cpu.0.saturating_sub(before.cpu.0).max(1) as f64;
+        let idle = now.cpu.1.saturating_sub(before.cpu.1) as f64;
+        let share = |process: &Process| {
+            let was = before
+                .ticks
+                .get(&process.pid)
+                .copied()
+                .unwrap_or(process.ticks);
+            100.0 * process.ticks.saturating_sub(was) as f64 / total
+        };
+        let rate = |now: u64, was: u64, kb_per_unit: f64| {
+            (now.saturating_sub(was) as f64 * kb_per_unit / seconds).round()
+        };
+        let running = running_apps();
+        let names: BTreeMap<i32, &str> = running
+            .iter()
+            .map(|(app, pid)| (*pid, app.as_str()))
+            .collect();
+        let entry = |process: &Process| {
+            json!({"pid": process.pid,
+                   "name": names.get(&process.pid).copied().unwrap_or(&process.comm),
+                   "cpu": (share(process) * 10.0).round() / 10.0,
+                   "rss_kb": process.rss_kb, "swap_kb": process.swap_kb})
+        };
+        let mut by_cpu: Vec<&Process> = processes.iter().collect();
+        by_cpu.sort_by(|a, b| share(b).total_cmp(&share(a)));
+        let mut by_memory: Vec<&Process> = processes.iter().collect();
+        by_memory.sort_by_key(|p| std::cmp::Reverse(p.rss_kb + p.swap_kb));
+        let options: serde_json::Map<String, Value> = option_parts()
+            .iter()
+            .map(|parts| {
+                let pids = option_pids(parts, &running, &processes);
+                let mine: Vec<&Process> = processes
+                    .iter()
+                    .filter(|process| pids.contains(&process.pid))
+                    .collect();
+                let cpu: f64 = mine.iter().map(|process| share(process)).sum();
+                (
+                    parts.key.to_owned(),
+                    json!({"on": self.config.service(parts.key),
+                           "processes": mine.len(),
+                           "cpu": (cpu * 10.0).round() / 10.0,
+                           "rss_kb": mine.iter().map(|p| p.rss_kb).sum::<u64>(),
+                           "swap_kb": mine.iter().map(|p| p.swap_kb).sum::<u64>(),
+                           "freed": self.changes.freed.get(parts.key)}),
+                )
+            })
+            .collect();
+        let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let gpu = fs::read_to_string("/sys/class/misc/mali0/device/dvfs_usage")
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        let system = json!({
+            "cores": fs::read_to_string("/proc/cpuinfo")
+                .map(|text| text.lines().filter(|line| line.starts_with("processor")).count())
+                .unwrap_or(0),
+            "cpu": (1000.0 * (1.0 - idle / total)).round() / 10.0,
+            "load": fs::read_to_string("/proc/loadavg")
+                .map(|text| text.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+            "mem_total_kb": sysinfo::kb(&meminfo, "MemTotal"),
+            "mem_available_kb": sysinfo::kb(&meminfo, "MemAvailable"),
+            "swap_total_kb": sysinfo::kb(&meminfo, "SwapTotal"),
+            "swap_free_kb": sysinfo::kb(&meminfo, "SwapFree"),
+            "gpu": gpu,
+            "disk_read_kbs": rate(now.disk.0, before.disk.0, 0.5),
+            "disk_write_kbs": rate(now.disk.1, before.disk.1, 0.5),
+            "swap_in_kbs": rate(now.swap.0, before.swap.0, 4.0),
+            "swap_out_kbs": rate(now.swap.1, before.swap.1, 4.0),
+            "processes": processes.len(),
+            "top_cpu": by_cpu.iter().take(8).map(|p| entry(p)).collect::<Vec<_>>(),
+            "top_memory": by_memory.iter().take(8).map(|p| entry(p)).collect::<Vec<_>>(),
+            "options": options,
+        });
+        self.sampled = Some(now);
+        json!({"status": "ok", "system": system})
     }
 }
 

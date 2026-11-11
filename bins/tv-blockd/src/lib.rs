@@ -2,3 +2,5 @@
 //! touch. The daemon (`main.rs`) applies it on the TV.
 
 pub mod policy;
+
+pub mod sysinfo;
