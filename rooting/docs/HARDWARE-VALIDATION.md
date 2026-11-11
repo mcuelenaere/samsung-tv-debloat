@@ -51,20 +51,22 @@ Target: `T-PTMDEUC-REL-202602250226`, Linux `5.4.77`, `armv7l`,
   client.
 - Plain `0 appinstall tpk nonexistent.tpk` reaches pkgcmd and reports
   `Package not found [-5]`.
-- The package-name foothold is blocked on this TV now: both the native client
-  and Samsung's `sdb` send `shell:0 appinstall tpk a\`id\`.tpk`, and sdbd
-  closes the channel. Backtick, `$`, `$(...)`, pipe and redirection variants
-  are refused; a bare `;` is accepted by the validator but did not produce
-  observable execution.
-- Consequently `tv root --check` fails closed before the compatibility
-  fingerprint callback, and `tv root --command` cannot run. `tv-root` now
-  probes the foothold explicitly and reports
-  `package-name shell injection is blocked by this TV's sdbd plugin` instead of
-  waiting for the callback deadline. The validator and conversion evidence is
-  in [`sdb-foothold-blockers.md`](sdb-foothold-blockers.md).
-- Restarting `sdbd.service` on 2026-11-11 did not change the result; the
-  validator is part of the installed plugin binary, not transient daemon
-  state. A cold boot has not been tried.
+- **The reference `samsung-tv-root` rooting method still works on this TV.**
+  Its `qn90b root --command 'id'` completed the compatibility preflight,
+  auto-selected the .NET Core 3.1 payload, reached `uid_after=0`,
+  `euid_after=0`, `gid_after=0`, `egid_after=0`, and ran:
+  `uid=0(root) gid=0(root) ... context="User"` with `[exit:0]`.
+- The same reference call initially failed once with `self credential not
+  found`; a retry succeeded. This matches the reference note about occasional
+  lost injections.
+- Our native `tv-sdb` client still gets `TV refused service` for the exact
+  command that Samsung's `sdb` executes successfully. The frame sequence and
+  service bytes appear equivalent; this is a native-client/session
+  compatibility issue, not a TV-side block. See
+  [`sdb-foothold-blockers.md`](sdb-foothold-blockers.md).
+- Consequently `tv root --check` and `tv setup` still fail closed with the
+  native client, while the reference method validates the rooting phase.
+- Restarting `sdbd.service` did not change the native result.
 - `tv ssh-key add` validated the existing public key, pushed it to
   `/home/owner/share/tmp/sdk_tools/ssh-key.pub` and tv-authd logged
   `approval_queued label=sdb-push ... kind=ssh_key`. The prompt timed out, the
@@ -82,4 +84,6 @@ Target: `T-PTMDEUC-REL-202602250226`, Linux `5.4.77`, `armv7l`,
   `tv-patchd`, `tv-pkg` and `tvauth-cli` all report `ok`.
 
 No setup, package install, persistence change or reboot was performed. The
-bundle was not pushed to the TV because the SDB foothold above is blocked.
+reference tool's staged payloads and temporary scripts were removed after the
+root test. The setup bundle was not pushed to the TV because setup was out of
+scope for this run.

