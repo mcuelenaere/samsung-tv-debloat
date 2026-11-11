@@ -44,3 +44,10 @@ bins/tv-patchd/build-armv7.sh       # gnueabi
 ```
 
 Unsigned ELFs only execute from `/run` (UEP); see `docs/samsung-tv-uep.md`.
+
+## License and attribution
+
+Original code in this repository is licensed under the [MIT License](LICENSE).
+Adapted third-party material remains under its original license; upstream
+sources, revisions, and license notices are tracked in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
