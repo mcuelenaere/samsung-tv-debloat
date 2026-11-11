@@ -7,3 +7,4 @@ sysroot/tv-6.5/
 /target/
 bins/*/out/
 bins/*/test-clients/out/
+persistence/backups/

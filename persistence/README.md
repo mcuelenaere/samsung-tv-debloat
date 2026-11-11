@@ -26,6 +26,29 @@ Only the unit *text* is copied into `/run`. The **executables are not copied**;
 they stay on `/opt` and each unit exposes them under `/run/opt/<service>` with a
 private read-only bind mount. See the next section.
 
+## Why this is not the TU7092 DeviceTracker method
+
+[PR #49](https://github.com/chris-ritsen/samsung-tv-root/pull/49) documents a
+one-TV, exact-build TU7092 boot hook: the normal `init.wrapper` branch backgrounds
+`/opt/data/DeviceTracker/Dlog_buffer.sh`, and that writable script is replaced by
+an awk carrier that runs optional work and then preserves the vendor body.
+
+The technique is sound, but **the boot trigger does not exist on this S95B**. A
+read-only check of `tv-living` on 2026-11-11 found:
+
+- firmware `T-PTMDEUC-REL-202602250226`, not the PR's
+  `T-KTSU2DEUC-REL-202607022000`;
+- `/opt/data/DeviceTracker` exists, but there is no `Dlog_buffer.sh`;
+- neither `init.wrapper` path references DeviceTracker or `Dlog_buffer`;
+- `devicetracker.service` directly executes `/bin/devicetracker`; it is not a
+  shell-script hook.
+
+Creating `Dlog_buffer.sh` therefore would not create a boot hook. No
+DeviceTracker installer or compatibility abstraction is provided here. The
+AT-HUB route above remains the deployed one because it also gives the native
+broker, SSH, blocker, proxy, and popup processes PID 1 supervision, restart
+policy, dependencies, and private `/run` bind mounts.
+
 ## Executables: bind mount, not copy
 
 `/opt` is a writable VDFS mount, and the kernel **UEP** gate rejects execution of
@@ -63,6 +86,7 @@ Deployed and live-tested on 2026-11-05:
 |---|---|---|
 | `/opt/etc/parseinfo.sh` | `0755`, root, SMACK `_` (`gawk` script) | Stock behavior + dynamic unit staging |
 | `/opt/tv-units/` | `0700`, root, `System::Shared` | Root-owned unit sources |
+| `/opt/tv-units/disabled` | optional `0600`, root, `System::Shared` | Suppress optional services on subsequent boots |
 | `/opt/tv-units/dropbear.service` | `0600` | Dropbear unit |
 | `/opt/tv-units/tv-authd.service` | `0600` | Root broker unit |
 | `/opt/tv-units/tv-auth-popupd.service` | `0600` | Prompt/toast overlay (uid 5001, `User::Pkg::org.tvauth.ui`) |
@@ -102,15 +126,27 @@ executable is bind-mounted at `/run/opt/tv-auth/tv-authd`, not copied here.
 The hook:
 
 1. writes the stock `__<BUILD>__<MODEL>` value to `/proc/target_version`;
-2. enumerates `/opt/tv-units/*.service`;
-3. copies each unit to `/run/systemd/system/`;
-4. starts each unit independently with `systemctl start`;
-5. falls back to `daemon-reload` and one retry if on-demand loading fails;
-6. continues after individual unit failures and logs failures to
+2. checks the root-only `/opt/tv-units/disabled` stop file;
+3. when enabled, enumerates `/opt/tv-units/*.service`;
+4. copies each unit to `/run/systemd/system/`;
+5. starts each unit independently with `systemctl start`;
+6. falls back to `daemon-reload` and one retry if on-demand loading fails;
+7. continues after individual unit failures and logs failures to
    `/run/at-hub-boot.log`.
 
 It intentionally does **not** restart an already-active unit on a repeated hook
 run. New units are loaded on demand by systemd 244 without a full reload.
+
+### Stop file
+
+`/opt/tv-units/disabled` is an opt-in, root-owned (`0600`, `System::Shared`)
+regular file inside the root-only `0700` unit directory. When present, the hook
+still performs the stock `target_version` write, logs
+`optional services disabled`, and exits before staging or starting any service.
+It never stops services that are already running; the effect begins on the next
+boot. Use the guarded commands below rather than creating the file by hand.
+`disable` refuses if the live hook does not contain the stop check, and `check`
+reports `stop_control=not-in-live-hook` in that state.
 
 ## Live validation
 
@@ -134,6 +170,12 @@ recorded `start units rc=0`, Dropbear and `tv-authd` were automatically active
 from `/opt/tv-units`, and the broker recreated its socket with empty grants.
 The updated root-only Dropbear source path was used successfully.
 
+The guarded deployment preflight was run read-only on 2026-11-11 against the
+same TV. It accepted the exact build, known previous hook, all five unit files,
+and reported the new stop file absent. The new hook/stop-file changes have not
+yet been installed or cold-boot tested; the existing deployed hook remains the
+last cold-boot-validated state until that run is done.
+
 Note: `systemctl reboot` fails on this firmware with
 `Unit reboot.target not found`; `/usr/sbin/reboot` works.
 
@@ -141,33 +183,91 @@ Note: `systemctl reboot` fails on this firmware with
 
 | File | Deploys to | Purpose |
 |---|---|---|
-| `parseinfo.sh` | `/opt/etc/parseinfo.sh` | Dynamic boot hook |
+| `parseinfo.sh` | `/opt/etc/parseinfo.sh` | Dynamic boot hook with the stop-file check |
 | `dropbear.service` | `/opt/tv-units/dropbear.service` | Dropbear from root-only source |
+| `deploy.sh` | host | Guarded check, install, rollback, disable, and enable |
+| `tv-apply.sh` | `sh -s` on the TV | Exact-build, hash-guarded atomic file replacement |
+| `~/.local/state/neon-lagoon/persistence-backups/<timestamp>-<hash>/` | host only | Private pre-deployment snapshot; override with `PERSISTENCE_BACKUP_ROOT` |
 
-The broker unit and payload are maintained under `bins/tv-authd/`.
+The broker, popup, blocker, and proxy units remain with their packages under
+`bins/*/systemd/`; the deployment flow includes those source files directly.
 
-## Deployment and recovery
+## Guarded deployment and recovery
 
-Before this deployment the previous `/opt/etc/parseinfo.sh`,
-`/opt/systemd/dropbear.service`, and Dropbear binary were backed up off-box.
-The rollback procedure is:
+`deploy.sh` refuses to guess its target: set `TV_HOST` to the root SSH endpoint.
+It also requires an operator-held, byte-exact pristine vendor hook for every
+upgrade where the live hook is no longer pristine:
 
 ```sh
-# Stop the extra services and restore the previous hook.
-systemctl stop tv-authd.service
-systemctl stop dropbear.service
-cp -p /opt/etc/parseinfo.sh.pre-tv-units /opt/etc/parseinfo.sh
-# Restore the old unit source/payload if rolling the whole deployment back.
-# Then reboot, or run the restored hook and re-stage the old unit manually.
+export TV_HOST=root@tv-living.home
+export PRISTINE_HOOK=/secure/off-box/parseinfo.sh.original
+
+./persistence/deploy.sh check "$PRISTINE_HOOK"
+./persistence/deploy.sh install "$PRISTINE_HOOK"
 ```
 
-Do not remove the root-only Dropbear copy while its unit is active. Keep the
-existing alternate recovery channels available until the cold boot is verified.
+The pristine file is not stored in this repository. It must be a regular
+805-byte file with SHA-256
+`c6369e7dec69408e176daa252d436acf6f8e265f560504d8bd831c8023c71d61`.
+If the live hook is already pristine, `install` can snapshot it and does not
+need an external copy.
+
+`install` performs these steps:
+
+1. validates the exact S95B build, UID 0, all five unit sources, the live hook
+   metadata (`root:root`, `0755`, SMACK `_`), the unit directory
+   (`root:root`, `0700`, `System::Shared`), unit ownership/mode/label, and the
+   stop file if present;
+2. accepts only the known pristine hook, the known previous hardening hook, or
+   the exact source target hash;
+3. writes a private off-device snapshot containing the previous hook, pristine
+   hook, all five previous unit files, and a hash manifest;
+4. creates a root-only `/opt/tv-deploy/<id>` staging directory and uploads the
+   hook and units there;
+5. rechecks every live hash and metadata immediately before mutation, verifies
+   the staged hashes, atomically replaces the units first and the hook last,
+   then verifies the result;
+6. restores the previous files from its private transaction copy if an ordinary
+   failure occurs after mutation begins.
+
+The snapshot is deliberately outside the TV and, by default, outside the Git
+checkout because it contains Samsung's writable vendor script. A path supplied
+through `PERSISTENCE_BACKUP_ROOT` inside the repository is ignored by Git, but
+`git clean -xdf` would still remove it. Keep the snapshot private and backed up.
+
+Stop and resume optional services for the next boot:
+
+```sh
+./persistence/deploy.sh disable
+./persistence/deploy.sh enable
+```
+
+Rollback restores every file in a snapshot, not just the hook:
+
+```sh
+./persistence/deploy.sh rollback \
+  "$HOME/.local/state/neon-lagoon/persistence-backups/<timestamp>-<hash>"
+```
+
+The rollback accepts only the exact hook and unit hashes recorded as installed
+by that snapshot. It refuses an unknown newer hook. Running services are not
+stopped over the current Dropbear session: stopping the unit would tear down
+its cgroup and the SSH session. Reboot after the restore to leave the previous
+set stopped. All five units are covered:
+`dropbear.service`, `tv-authd.service`, `tv-auth-popupd.service`,
+`tv-blockd.service`, and `tv-patchd.service`.
+
+Do not remove the root-only Dropbear copy while its unit is active. Keep an
+alternate recovery channel and the snapshot available until the cold boot is
+verified.
 
 ## Caveats
 
 - The hook executes as root on every normal graphical boot; a malformed hook can
   damage writable state.
+- The stop file suppresses optional unit startup but does not stop services,
+  remove `/run/systemd/system` unit copies, uninstall payloads, or alter the
+  stock `target_version` write.
 - Units in `/opt/tv-units` are trusted root configuration. Never relax its
   ownership or mode.
 - `systemd-journald` is inactive; unit stdout/stderr are discarded. Use

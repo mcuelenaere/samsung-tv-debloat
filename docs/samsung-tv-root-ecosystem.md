@@ -1,8 +1,8 @@
 # The `chris-ritsen/samsung-tv-root` Ecosystem — Research Notes
 
-*Research compiled 2026-10-25, updated 2026-10-31 and 2026-11-04 from the GitHub
-API, project READMEs, r/Tizen, and local clone state. Numbers are point-in-time
-snapshots; links point at the primary evidence.*
+*Research compiled 2026-10-25, updated 2026-10-31, 2026-11-04, and 2026-11-11
+from the GitHub API, project READMEs, r/Tizen, and local clone state. Numbers are
+point-in-time snapshots; links point at the primary evidence.*
 
 ---
 
@@ -189,10 +189,29 @@ community built several TV-side persistence routes:
 | Boot-time .NET agent (replaced IL of an installed `dotnet-inhouse` app + on-boot flag; boot IL is **not** signature-checked; trigger lives on writable storage) + token-gated sdb bridge (Host PC IP stays `127.0.0.1`) + module manager | levkropp/samsung-tv-root-untethered (from #1) | Proven Q60B; deployed by others (#12, #34); proven on Tizen 9 with net6.0 retarget (#16). Manager v5.13 + telemetry module 1.2.3 + "immortal bridge" shipped |
 | `ghservice` startup-slot stub TPK re-running archive-root at boot + token relay | #29 supersharp (QN95A); fork `samsung-tv-root-and-debloat` | second independent untethered chain |
 | Gaming Hub startup slot boot agent + authenticated headless SDB bridge, .NET 3.1 + 6 builds | **PR #42** (kninetimmy) offered upstream; verified QN90B + U8000 | untethered work migrating into upstream |
-| Vendor `AT-HUB.service` → `/opt/etc/parseinfo.sh` boot hook (writable VDFS, no `User=`), `#!/usr/bin/gawk -f` UEP bypass, `pkgcmd` WGT signature bypass | #17 danielyc (Tizen 6.0, NIKEL) | boot-persistent root + unsigned app install through the normal package manager |
+| Vendor `AT-HUB.service` → `/opt/etc/parseinfo.sh` boot hook (writable VDFS, no `User=`), `#!/usr/bin/gawk -f` UEP bypass, `pkgcmd` WGT signature bypass | #17 danielyc (Tizen 6.0, NIKEL); deployed here on the S95B | boot-persistent root + unsigned app install through the normal package manager |
+| Vendor normal `init.wrapper` → writable `/opt/data/DeviceTracker/Dlog_buffer.sh`, replaced by an awk carrier that runs optional work then the byte-exact vendor body through signed Bash | [PR #49](https://github.com/chris-ritsen/samsung-tv-root/pull/49) (Rekk137), `UE55TU7092UXXH` / `T-KTSU2DEUC-2743.0` | one-TV exact-build report; marker at ~1 s uptime, then a detached self-relabelling worker and Vetro agent. Not applicable to this repo's S95B (see below) |
 | `tizen-system-env.service` sourcing a same-size-patched `/etc/profile.d` script | #13 cfloinc (NIKEM) | boot+0.74 s, no USB stick |
 | Host-side watchdog reacquiring volatile root per boot | PR #45 (`archive-root-watchdog.py`); Vetro's TV-local reacquire | semi-persistent via host/TV-local watchdog |
 | USB exFAT kernel LPE (Luminger) | Luminger/samsung-tv-usb-root; Q90T/Q70T adaptations | separate route for pre-dotnet platforms |
+
+### PR #49 DeviceTracker route: checked against our S95B
+
+PR #49 uses a real early-boot trigger on its TU7092: the normal branch of
+`init.wrapper` backgrounds `/opt/data/DeviceTracker/Dlog_buffer.sh` before
+systemd. Its awk carrier preserves the 2,844-byte vendor body as base64,
+executes it through signed Bash, and uses a separate authenticated worker for
+the persistent agent. It is an exact-build, one-physical-TV reproduction; it
+does not claim arbitrary unsigned ELF execution or stock-toolkit support.
+
+A read-only check of `tv-living` (S95B, build
+`T-PTMDEUC-REL-202602250226`) on 2026-11-11 found `/opt/data/DeviceTracker`
+present but no `Dlog_buffer.sh`, no DeviceTracker/`Dlog_buffer` reference in
+`init.wrapper`, and `devicetracker.service` executing `/bin/devicetracker`
+directly. The PR's boot trigger is therefore absent on this firmware, and its
+hardcoded original hash/firmware guard correctly rejects the S95B. This repo
+keeps the AT-HUB/systemd route; the useful deployment-safety ideas from the PR
+are documented in [`persistence/README.md`](../persistence/README.md).
 
 ---
 

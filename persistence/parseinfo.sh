@@ -9,7 +9,9 @@
 # WHAT IT DOES
 #   1. Reproduces the stock behaviour exactly (writes __<BUILD>__<MODEL> to
 #      /proc/target_version) so nothing downstream notices the swap.
-#   2. Copies every *.service file from the root-only /opt/tv-units directory
+#   2. If the root-only stop file exists, logs that optional services are
+#      disabled and exits without touching systemd.
+#   3. Copies every *.service file from the root-only /opt/tv-units directory
 #      into the runtime systemd unit path (/run/systemd/system) and starts each
 #      one independently. systemd resolves newly written units on demand over
 #      D-Bus (StartUnit/LoadUnit), so NO full daemon-reload is needed.
@@ -30,6 +32,7 @@
 BEGIN {
     LOG = "/run/at-hub-boot.log"
     UNIT_DIR = "/opt/tv-units"
+    STOP = "/opt/tv-units/disabled"
     ts = strftime("%Y-%m-%dT%H:%M:%S%z")
 
     system("mkdir -p /run/systemd/system")
@@ -51,7 +54,16 @@ BEGIN {
     printf "%s parseinfo: target_version=__%s__%s\n", ts, repo, model >> LOG
     close(LOG)
 
-    # ── (2) STAGE AND START ALL ROOT-OWNED EXTRA UNITS ───────────────────────
+    # ── (2) OBEY THE ROOT-ONLY OPTIONAL-SERVICE STOP FILE ────────────────────
+    # Stock target_version behaviour above always runs. The stop file can only
+    # be created inside the root-owned 0700 /opt/tv-units directory.
+    if (system("test -e " STOP) == 0) {
+        printf "%s parseinfo: optional services disabled by %s\n", ts, STOP >> LOG
+        close(LOG)
+        exit 0
+    }
+
+    # ── (3) STAGE AND START ALL ROOT-OWNED EXTRA UNITS ───────────────────────
     cmd = "rc=0; " \
           "for unit in " UNIT_DIR "/*.service; do " \
           "  [ -f \"$unit\" ] && [ ! -L \"$unit\" ] || continue; " \
