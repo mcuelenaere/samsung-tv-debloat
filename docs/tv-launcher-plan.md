@@ -61,6 +61,23 @@ Source: a read of Vetro's `dock/` and `app/service/dock*.js`.
 - The live source data sits behind Samsung's proprietary TVService
   (`com.samsung.TVService.*` on D-Bus). We use the cache instead.
 
+## Spike results (2026-11-11)
+
+Probe `crates/tv-tizen/examples/home-spike.rs`, run on tv-living through
+`systemd-run --uid=5001 -p SmackProcessLabel=User::Pkg::org.tvauth.ui`.
+
+| Question | Answer |
+|---|---|
+| Can uid 5001 with the manager's label close csfs, home.sidebar and home.media? | **No.** `app_manager_terminate_app` and `app_manager_request_terminate_bg_app` return -13 (permission denied); `aul_terminate_pid` returns -8 (illegal access). `/usr/bin/app_launcher` cannot even be executed under that label (exit 126). Root `app_launcher -k` works. → a root guard is needed. |
+| Do app-launch events reach an EFL loop? | **Yes**, for uid 5001 and root alike: `ecore_main_loop_glib_integrate()` plus `aul_listen_app_launch_signal_v2` / `aul_listen_app_dead_signal`. After a Home press: csfs launch event at about +40 ms, home.sidebar at +1.25 s, home.media at +1.65 s. |
+| Which launch opens Samsung's Home fully? | From uid 5001, app_control with operation `http://tizen.org/appcontrol/operation/main` and no app id, or app id `com.samsung.tv.csfs`, with or without that operation. All three start csfs, home.sidebar and home.media, and Home is visible with its sidebar within 5 s. `com.samsung.tv.coba.newhome` returns 0 and starts nothing (as Vetro saw). |
+| Does tv-viewer switch inputs from uid 5001? | The request is accepted (0) with the extras below. The TV was already on HDMI2, so the visible switch is still to be confirmed (step 3). |
+| SVG source icons? | Evas has no SVG loader on this firmware (image loaders: bmp, generic without helpers, gif, ico, pmaps, psd, tga, tgv, tiff, wbmp, webp, xpm; PNG/JPEG built in). `libthorvg.so.0` (0.6.99) renders them: `tvg_engine_init(2 = SW)`, `tvg_swcanvas_set_target(…, 1 = ARGB8888)`, `tvg_picture_load`, draw, sync; the gamepad icon drew at 96×96. |
+| Settings from uid 5001? | app_control for `org.tizen.menu` opens the settings menu over the current input. |
+
+Also seen: Vetro's `wrt-service` (pid 3984) is still running two days after
+Vetro was uninstalled, retrying `/home/owner`. It ends at the next reboot.
+
 ## Design
 
 ### Process
@@ -72,8 +89,14 @@ Source: a read of Vetro's `dock/` and `app/service/dock*.js`.
   (`appmanager.launch`);
 - resident; hiding only unmaps the window.
 
-Things that need root (stopping Samsung's Home if uid 5001 cannot; Autorun
-Smart Hub) are requests to an existing root daemon, decided by spike 0.
+Closing Samsung's Home needs root (spike). The same binary therefore runs
+twice:
+- `tv-launcher` (uid 5001, manager label): the dock;
+- `tv-launcher guard` (root, its own unit): listens to AUL launch events and
+  terminates csfs, home.sidebar and home.media while armed. It also owns
+  Autorun Smart Hub. The dock arms and disarms it over
+  `/run/tv-suite/launcher-guard.sock` (peer check: uid 5001 with the
+  manager's label, as in the other daemons).
 
 ### Home key
 
@@ -81,13 +104,12 @@ Smart Hub) are requests to an existing root daemon, decided by spike 0.
    `/proc/bus/input/devices` for hot-plugged remotes; never `EVIOCGRAB`, so
    nothing is lost if tv-launcher dies).
 2. Press → show the dock.
-3. **Event-driven suppression instead of timed kills.** Subscribe to app
-   launch status (`aul_listen_app_status` / `app_manager` context events,
-   spike 0). When csfs, home.sidebar or home.media start while suppression is
-   armed, terminate them at once. Suppression arms on our Home press and
-   disarms after about 5 s or when the user picks Samsung Home. If events
-   are not available, fall back to Vetro's timed kills, but driven by one
-   state machine, not detached shells.
+3. **Event-driven suppression instead of timed kills.** The guard listens with
+   `aul_listen_app_launch_signal_v2`. When csfs, home.sidebar or home.media
+   start while it is armed, it terminates them at once: csfs about 40 ms after
+   the press, before Home has drawn. The dock arms the guard on our Home press,
+   which disarms after 5 s (home.media arrives at +1.65 s) or when the user
+   picks Samsung Home.
 4. Samsung's Home is never disabled (the Q80A boot script waits for csfs).
 
 ### Samsung Home that works
@@ -96,12 +118,9 @@ Smart Hub) are requests to an existing root daemon, decided by spike 0.
   until the next Home press.
 - It then opens Home **the way the Home key does**: an app_control launch
   with operation `http://tizen.org/appcontrol/operation/main` and no app id,
-  resolved by the system's own Home routing, from the owner session.
-- Spike 0 tests the alternatives in order, on this firmware:
-  1. that launch;
-  2. app_control for `com.samsung.tv.csfs` (with home.sidebar and
-     home.media);
-  3. injecting `XF86Home` (uinput or `input_keyevent`) while passed through.
+  from the owner session. The spike showed this starts csfs, home.sidebar and
+  home.media, and Home is visible with its sidebar. App id
+  `com.samsung.tv.csfs` is the fallback.
 - Acceptance: Home is fully visible (sidebar included) in under 3 s, every
   time, and the next Home press brings our dock back.
 
@@ -135,9 +154,11 @@ Smart Hub) are requests to an existing root daemon, decided by spike 0.
   (`ConnectionState`), then TV.
 - **Name**: `EditName`, else `DetectedName`, else `HDMI n`, always drawn.
 - **Icon**: `LauncherUnfocusedIconPath`/`LauncherFocusedIconPath` (Samsung's
-  2K branded launcher art), else `IconPath`, else a generic HDMI icon. SVG
-  through evas's SVG loader if the TV has it (spike 0), else the PNG
-  `source_icon_*`.
+  2K branded launcher art, e.g. Xbox Series and Nintendo), else `IconPath`,
+  else a generic HDMI icon.
+  - PNGs load directly.
+  - SVGs (e.g. the PlayStation's gamepad icon) are rasterised with thorvg
+    into an evas image buffer, once per path and size.
 - **Switch**: app_control to `org.tizen.tv-viewer` with Samsung's
   `SourceChangeViaTVViewer` extras: `change_source` and `sourceType` (the
   cache's `SourceType`), `sourceName`, `sourceIcon` (an existing file;
@@ -173,20 +194,9 @@ Smart Hub) are requests to an existing root daemon, decided by spike 0.
 
 ## Steps
 
-0. **Spike on tv-living** (throwaway probes in `bins/tv-launcher/examples`).
-   Each answer is recorded here before the design is final.
-   - Can uid 5001 with the manager's label terminate csfs, home.sidebar and
-     home.media (`aul_terminate_app`, `app_manager_request_terminate_bg_app`),
-     or does this need root?
-   - Do app-status events reach an EFL loop (`aul_listen_app_status`, or
-     `app_manager_set_app_context_event_cb` with ecore's glib integration)?
-     How quickly after a Home press?
-   - Which launch opens Samsung's Home fully (see above)?
-   - Does tv-viewer switch sources from uid 5001 with the extras above?
-   - Does evas load the theme's SVG icons?
-   - Does `org.tizen.menu` open Settings by app_control from uid 5001?
-1. **Skeleton**: unit, window, evdev Home, show/hide, suppression. Check:
-   100 Home presses with Samsung Home never visible.
+0. **Spike**: done, see *Spike results*.
+1. **Skeleton**: both units, the window, evdev Home, show and hide, the guard
+   and its socket. Check: 100 Home presses with Samsung's Home never visible.
 2. **Catalog and refresh**. Check: install and uninstall from the store, a
    WGT and a TPK, with the dock open and closed; each appears or disappears
    within 1 s.

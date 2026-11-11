@@ -59,6 +59,11 @@ copy_as /usr/lib/libcurl.so.4.7.0 libcurl.so \
     6f3dd180cbc10c1a9753bd838eb47b51c04d9ffe76a889b597c8f3f0e075c5c3
 copy_as /usr/lib/libcrypto.so.1.1 libcrypto.so \
     d763b8173e8aacf7e78fee2e20265cd8f199a8eed1522c0e7100324b6fb818a4
+# tv-launcher: app status events and termination; SVG source icons.
+copy_as /usr/lib/libcapi-appfw-app-manager.so.0.12.1 libcapi-appfw-app-manager.so \
+    4526b5a9d8f51c30e518e65b52d7ec8e7d5c8a9b6450813dc7ca574e66887cf7
+copy_as /usr/lib/libthorvg.so.0.6.99 libthorvg.so \
+    4d390a02c047e9429308b44fe8ff785e89085ec0bfa9d44571337fd0f0a63483
 # tv-patchd: TLS for the YouTube proxy.
 copy_as /usr/lib/libssl.so.1.1 libssl.so \
     ffda6cbac6b90ac18c88e0516b36eb0648d7243c63b43818b3a68e958b32bee6
