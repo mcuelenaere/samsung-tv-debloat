@@ -2,8 +2,8 @@
 //! `dock.rs` maps this state onto evas objects every animation frame.
 //!
 //! Three rows share one bar: the apps; Up opens the inputs, Down the
-//! settings row (Samsung Home, Settings, TV suite). Up/Down or BACK go back
-//! to the apps. The selection glides between icons at constant speed; the
+//! settings row (Samsung Home, Settings, TV suite). Down or Up goes back to
+//! the apps; BACK always closes the dock. The selection glides between icons at constant speed; the
 //! focused icon grows and rises, and a ring and a glow mark it.
 
 // ---- Geometry, in pixels at 1920x1080 ----
@@ -401,7 +401,7 @@ impl Controller {
             "Return" | "KP_Enter" | "Select" if self.counts[row.index()] > 0 => {
                 Action::Activate(row, focus.target)
             }
-            "XF86Back" | "Escape" | "BackSpace" if row != Row::Apps => Action::Open(Row::Apps),
+            // BACK always closes the dock, from any row.
             "XF86Back" | "Escape" | "BackSpace" | "XF86Exit" => Action::Hide,
             _ => Action::None,
         }
@@ -500,7 +500,8 @@ mod tests {
         assert_eq!(controller.focus[1].target, 1);
         assert_eq!(controller.fade[1].direction, -1.0);
         assert_eq!(controller.key("Up"), Action::None);
-        assert_eq!(controller.key("XF86Back"), Action::Open(Row::Apps));
+        assert_eq!(controller.key("XF86Back"), Action::Hide);
+        assert_eq!(controller.key("Down"), Action::Open(Row::Apps));
         controller.open(Row::Apps, controller.focus[0].target);
         assert_eq!(controller.key("Down"), Action::Open(Row::Settings));
         controller.open(Row::Settings, 0);

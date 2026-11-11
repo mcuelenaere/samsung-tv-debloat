@@ -16,11 +16,12 @@
 //! database or Home's row or source cache change.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tv_auth_ui::catalog::{self, App, Source};
 use tv_auth_ui::dock_core::{self as core, Action, Controller, Rect, Row, Strip, Window};
 use tv_auth_ui::pixels;
@@ -257,6 +258,9 @@ impl Art {
     }
 }
 
+/// An icon file and its modification time.
+type IconKey = (String, Option<SystemTime>);
+
 struct Dock {
     window: *mut c_void,
     evas: *mut c_void,
@@ -274,6 +278,9 @@ struct Dock {
     /// Index of the current input in the inputs row.
     current_input: Option<usize>,
     updates: Option<Receiver<Catalog>>,
+    /// Finished icons by path and modification time: a reorder or refresh
+    /// only creates objects.
+    icons: HashMap<IconKey, Option<(Vec<u32>, u32)>>,
     /// This animation run: frames, longest gap between frames and longest
     /// own work per frame, in seconds.
     run: (u32, f64, f64),
@@ -351,9 +358,9 @@ fn side_of(pixels: &[u32]) -> i32 {
     (pixels.len() as f64).sqrt().round() as i32
 }
 
-/// A finished icon: rounded, on a tile, at most [`ICON_SIDE`]; and its glow
-/// colour.
-unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(*mut c_void, u32)> {
+/// A finished icon's pixels (a square, at most [`ICON_SIDE`]): rounded, on a
+/// tile; and its glow colour.
+unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(Vec<u32>, u32)> {
     if path.ends_with(".svg") {
         let art = match tv_tizen::svg::rasterize(path, SVG_SIDE) {
             Ok(art) => art,
@@ -372,7 +379,7 @@ unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(*mut c_void, u32)>
         let offset = (side - SVG_SIDE as usize) / 2;
         pixels::over(&mut tile, side, &art, SVG_SIDE as usize, offset, offset);
         pixels::round_corners(&mut tile, side, side as f32 * pixels::RADIUS_SHARE);
-        return Some((picture(evas, &tile, side as i32, side as i32), COLOR_GLOW));
+        return Some((tile, COLOR_GLOW));
     }
     let image = evas_object_image_filled_add(evas);
     let file = c_string(path);
@@ -400,7 +407,7 @@ unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(*mut c_void, u32)>
     let side = pixels::icon_side(width, height, ICON_SIDE);
     let finished = pixels::icon(&source, width, height, side, COLOR_TILE);
     evas_object_del(image);
-    Some((picture(evas, &finished, side as i32, side as i32), glow))
+    Some((finished, glow))
 }
 
 unsafe fn text(evas: *mut c_void, size: i32, value: &str) -> *mut c_void {
@@ -481,6 +488,7 @@ impl Dock {
 
     /// (Re)creates every row's objects for `catalog`.
     fn build(&mut self, catalog: &Catalog) {
+        let started = unsafe { ecore_time_get() };
         // Keep each row's focus on the same entry.
         let keys: Vec<Option<String>> = Row::ALL
             .iter()
@@ -519,14 +527,20 @@ impl Dock {
         self.current_input = self.find_current_input();
         self.apply();
         log_line(&format!(
-            "dock: {} apps, {} inputs, window {}x{} at {}",
-            counts[0], counts[1], rect.w, rect.h, rect.y
+            "dock: {} apps, {} inputs, window {}x{} at {}, built in {:.0} ms",
+            counts[0],
+            counts[1],
+            rect.w,
+            rect.h,
+            rect.y,
+            (unsafe { ecore_time_get() } - started) * 1000.0
         ));
     }
 
     fn build_row(&mut self, row: Row) -> RowView {
         let evas = self.evas;
         let art = &self.art;
+        let cache = &mut self.icons;
         let strip = self
             .win
             .strip(self.entries[row.index()].len(), self.screen.0);
@@ -565,9 +579,21 @@ impl Dock {
             let icons = self.entries[row.index()]
                 .iter()
                 .map(|entry| {
-                    let loaded = entry.icon.as_deref().and_then(|path| load_icon(evas, path));
+                    let loaded = entry.icon.as_deref().and_then(|path| {
+                        // Keyed by modification time too, so an updated icon is reloaded.
+                        let modified = std::fs::metadata(path)
+                            .and_then(|meta| meta.modified())
+                            .ok();
+                        cache
+                            .entry((path.to_owned(), modified))
+                            .or_insert_with(|| load_icon(evas, path))
+                            .clone()
+                    });
                     let (image, glow, initials) = match loaded {
-                        Some((image, glow)) => (image, glow, None),
+                        Some((pixels, glow)) => {
+                            let side = side_of(&pixels);
+                            (picture(evas, &pixels, side, side), glow, None)
+                        }
                         None => {
                             let tile = pixels::icon(
                                 &[pixels::premultiply(COLOR_TILE, 1.0)],
@@ -1011,6 +1037,7 @@ pub fn run(mut argv: Vec<*mut c_char>) -> i32 {
         current_input: None,
         updates: None,
         run: (0, 0.0, 0.0),
+        icons: HashMap::new(),
     }));
     DOCK.with(|cell| cell.set(state));
     let argc = i32::try_from(argv.len().saturating_sub(1)).unwrap_or(1);

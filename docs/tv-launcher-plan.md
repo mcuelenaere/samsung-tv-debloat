@@ -322,6 +322,10 @@ No daemon, no evdev, no root at run time.
    - the first Home press after an install or boot builds the dock (about
      2 s for 28 icons); keys pressed meanwhile are lost. Later presses
      reuse the resident dock.
+   - Then, on user feedback: apps are ordered by launches (webappservice's
+     `use_count`, counted wherever an app is opened), then Home's row, then
+     title; finished icons are cached, so the rebuild after a launch takes
+     67 ms instead of 1.8 s. BACK closes the dock from any row.
 4. **Samsung Home, Settings, TV suite tiles**. Check: Samsung Home opens with
    its sidebar 20 times out of 20; the next Home press shows the dock.
 5. **Tweaks toggle and Undo**. Check: off returns stock Home behaviour at

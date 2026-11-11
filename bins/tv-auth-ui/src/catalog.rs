@@ -1,5 +1,6 @@
 //! The dock's app list: webappservice's catalog (the one Samsung's Home
-//! shows, sideloaded apps included), in Home's row order, then by title.
+//! shows, sideloaded apps included), most launched first, then in Home's row
+//! order, then by title.
 //! And its inputs: the sources in Home's row, named as Home names them.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ pub const SOURCES: &str = "/run/tv-suite/home-sources";
 
 /// One row per app Home shows; fields joined with U+001F.
 pub const SQL: &str = "SELECT id || char(31) || title || char(31) || tizen_id || char(31) || \
-     icon_path FROM widgetinfo WHERE is_hidden = 0 AND tizen_id != '' \
+     icon_path || char(31) || use_count FROM widgetinfo WHERE is_hidden = 0 AND tizen_id != '' \
      AND tizen_id NOT IN ('org.tvauth.ui', 'org.tvauth.home')";
 
 /// Sizes in webappservice's icon folders, best fit for a dock tile first.
@@ -26,6 +27,9 @@ pub struct App {
     /// What to launch.
     pub app_id: String,
     pub icon: Option<PathBuf>,
+    /// webappservice's `use_count`: launches from anywhere (Samsung's Home,
+    /// the remote's app keys, the dock).
+    pub launches: u32,
 }
 
 pub fn parse(rows: &[String]) -> Vec<App> {
@@ -38,6 +42,10 @@ pub fn parse(rows: &[String]) -> Vec<App> {
                 fields.next()?,
                 fields.next()?,
             );
+            let launches = fields
+                .next()
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(0);
             let icon = ICONS
                 .iter()
                 .map(|name| Path::new(icons).join(name))
@@ -47,6 +55,7 @@ pub fn parse(rows: &[String]) -> Vec<App> {
                 title: title.to_owned(),
                 app_id: app_id.to_owned(),
                 icon,
+                launches,
             })
         })
         .collect()
@@ -103,14 +112,19 @@ pub fn sources(cache: &str, row: &str) -> Vec<Source> {
     .collect()
 }
 
-/// Home's row first, then the rest by title.
+/// Most launched first; equal counts (most often never launched) in Home's
+/// row order, then the rest by title.
 pub fn order(mut apps: Vec<App>, row: &[&str]) -> Vec<App> {
     apps.sort_by_cached_key(|app| {
         let position = row
             .iter()
             .position(|id| *id == app.id)
             .unwrap_or(usize::MAX);
-        (position, app.title.to_lowercase())
+        (
+            std::cmp::Reverse(app.launches),
+            position,
+            app.title.to_lowercase(),
+        )
     });
     apps
 }
@@ -125,6 +139,7 @@ mod tests {
             title: title.into(),
             app_id: format!("{id}.app"),
             icon: None,
+            launches: 0,
         }
     }
 
@@ -142,6 +157,18 @@ mod tests {
         ];
         let titles: Vec<_> = order(apps, &ids).into_iter().map(|app| app.title).collect();
         assert_eq!(titles, ["YouTube", "Netflix", "Apple TV", "kodi"]);
+    }
+
+    #[test]
+    fn most_launched_first() {
+        let ids = ["3", "1"];
+        let mut kodi = app("2", "kodi");
+        kodi.launches = 9;
+        let mut netflix = app("1", "Netflix");
+        netflix.launches = 2;
+        let apps = vec![netflix, kodi, app("3", "YouTube"), app("4", "Apple TV")];
+        let titles: Vec<_> = order(apps, &ids).into_iter().map(|app| app.title).collect();
+        assert_eq!(titles, ["kodi", "Netflix", "YouTube", "Apple TV"]);
     }
 
     #[test]
@@ -169,12 +196,14 @@ mod tests {
     #[test]
     fn parses_rows() {
         let rows = vec![
-            "111299001912\u{1f}YouTube\u{1f}9Ur5IzDKqV.TizenYouTube\u{1f}/nonexistent/".to_owned(),
+            "111299001912\u{1f}YouTube\u{1f}9Ur5IzDKqV.TizenYouTube\u{1f}/nonexistent/\u{1f}483"
+                .to_owned(),
             "broken".to_owned(),
         ];
         let apps = parse(&rows);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].app_id, "9Ur5IzDKqV.TizenYouTube");
         assert_eq!(apps[0].icon, None);
+        assert_eq!(apps[0].launches, 483);
     }
 }

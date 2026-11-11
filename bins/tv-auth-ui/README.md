@@ -140,16 +140,16 @@ A rounded bar at the bottom of the screen (`NOTIFICATION_HIGH`, alpha, as
 small as the widest row), over whatever is playing, with three rows:
 - **apps**, with **Inputs ^** above and **Settings ⌄** below;
 - **Up**: the inputs, opened on the current input (`memory/system/source_type`,
-  marked with a blue dot); Down or BACK returns;
+  marked with a blue dot); Down returns;
 - **Down**: Samsung Home (`com.samsung.tv.csfs`), Settings (`org.tizen.menu`)
-  and TV suite; Up or BACK returns.
+  and TV suite; Up returns.
 
 The selection glides between icons in 0.3 s at constant speed. The focused
 icon grows from 92 to 112 px and rises 4 px, a white ring and a glow in the
 icon's own colour follow the selection, and its name fades in underneath.
 The row scrolls to keep the selection centred. Rows fade and slide in from
 the side their arrow points to. OK opens the entry once the bar has faded
-out; BACK on the apps or 20 s idle hides it.
+out; BACK (from any row) or 20 s idle hides it.
 
 No Elementary widgets (`src/dock.rs`): plain evas images and text placed by
 hand. An ecore animator runs only while something moves, and each frame
@@ -162,13 +162,18 @@ tile when they are dark, a dark one when light. An animation that drops
 frames (a gap over 25 ms) is logged with its longest gap and longest own
 work.
 
-The apps are Samsung Home's own catalog (`src/catalog.rs`):
+The apps are Samsung Home's own catalog (`src/catalog.rs`), most launched
+first (webappservice's `use_count`, which counts launches from anywhere:
+Samsung's Home, the remote's app keys, the dock), then in Home's row order,
+then by title. A launch changes the count, so the row is rebuilt after it;
+finished icons are cached by path and modification time, so that only
+creates objects.
 - webappservice's `widgetinfo` rows with `is_hidden = 0` (sideloaded apps
   included): title, the app id to launch (`tizen_id`) and the icon folder
   (`152x152.png`, else `224x224.png`, `icon.png`, `104x104.png`);
-- in Home's row order (`d/webapp@<id>` lines of `/run/tv-suite/home-row`,
-  which tv-patchd mirrors because only Home's label may read the original),
-  then the rest by title.
+- Home's row order comes from the `d/webapp@<id>` lines of
+  `/run/tv-suite/home-row`, which tv-patchd mirrors because only Home's
+  label may read the original.
 
 The inputs are the HDMI sources in Home's row, in that order, then TV, from
 Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
