@@ -61,6 +61,7 @@ const SETTINGS_ICON: &str =
 const MANAGER: &str = "org.tvauth.ui";
 const MANAGER_ICON: &str = "/opt/usr/apps/org.tvauth.ui/shared/res/org.tvauth.ui.png";
 const TV_VIEWER: &str = "org.tizen.tv-viewer";
+const MEDIA_BROWSER: &str = "com.samsung.tv.mycontents";
 const SOURCE_TYPE: &str = "memory/system/source_type";
 
 /// What the dock shows besides its fixed entries.
@@ -96,7 +97,10 @@ impl Entry {
     fn key(&self) -> String {
         match &self.target {
             Target::App(app_id) => app_id.clone(),
-            Target::Source(source) => format!("source:{}", source.kind),
+            Target::Source(source) => match &source.dlna {
+                Some((key, _)) => format!("dlna:{key}"),
+                None => format!("source:{}", source.kind),
+            },
         }
     }
 }
@@ -794,7 +798,8 @@ impl Dock {
     fn find_current_input(&self) -> Option<usize> {
         let kind = tv_tizen::vconf::get_int(SOURCE_TYPE).ok()?;
         self.entries[Row::Inputs.index()].iter().position(|entry| {
-            matches!(&entry.target, Target::Source(source) if source.kind == i64::from(kind))
+            matches!(&entry.target, Target::Source(source)
+                if source.dlna.is_none() && source.kind == i64::from(kind))
         })
     }
 
@@ -908,6 +913,22 @@ impl RowView {
 fn open(target: &Target) {
     let result = match target {
         Target::App(app_id) => tv_tizen::app::launch(app_id),
+        // A media server opens in Samsung's media browser, as from Samsung's
+        // source panel. It needs at least three extras and a device type, or
+        // it only preloads, hidden.
+        Target::Source(Source {
+            dlna: Some((key, name)),
+            ..
+        }) => tv_tizen::app::launch_with(
+            MEDIA_BROWSER,
+            &[
+                ("launch_type", "mycontents"),
+                ("called_app", SAMSUNG_HOME),
+                ("device_type", "DLNA"),
+                ("device_id", key),
+                ("device_name", name),
+            ],
+        ),
         // tv-viewer's own source-change request, as Samsung's Home sends it.
         Target::Source(source) => {
             let kind = source.kind.to_string();

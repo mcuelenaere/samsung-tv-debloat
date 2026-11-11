@@ -326,6 +326,11 @@ No daemon, no evdev, no root at run time.
      `use_count`, counted wherever an app is opened), then Home's row, then
      title; finished icons are cached, so the rebuild after a launch takes
      67 ms instead of 1.8 s. BACK closes the dock from any row.
+   - DLNA media servers join the inputs row and open in Samsung's media
+     browser. The request was read from the browser's own code
+     (`MCLaunchParamters`, decompiled for reading only), since its .NET
+     launcher hides the launch arguments; checked on tv-living with a Sonos
+     server.
 4. **Samsung Home, Settings, TV suite tiles**. Check: Samsung Home opens with
    its sidebar 20 times out of 20; the next Home press shows the dock.
 5. **Tweaks toggle and Undo**. Check: off returns stock Home behaviour at

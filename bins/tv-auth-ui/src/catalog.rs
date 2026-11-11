@@ -80,10 +80,26 @@ pub struct Source {
     pub icon: Option<String>,
     /// `IconPath`, which tv-viewer wants as `sourceIcon`.
     pub source_icon: String,
+    /// A DLNA media server: its `UniqueKey` and full name, which Samsung's
+    /// media browser opens.
+    pub dlna: Option<(String, String)>,
+}
+
+/// `"172.17.2.219 - Sonos Play:3 Media Server - RINCON_…"` becomes
+/// `"Sonos Play:3 (172.17.2.219)"`; other names stay as they are.
+fn short_dlna_name(name: &str) -> String {
+    let parts: Vec<&str> = name.split(" - ").collect();
+    match parts.as_slice() {
+        [address, model, ..] if address.parse::<std::net::Ipv4Addr>().is_ok() => {
+            format!("{} ({address})", model.trim_end_matches(" Media Server"))
+        }
+        _ => name.to_owned(),
+    }
 }
 
 /// The sources in Home's row (`s/source.layer.hdmi@<key>` lines), in order,
-/// then TV. `cache` is Home's `.sourceCache` JSON.
+/// then TV, then the connected DLNA media servers by name. `cache` is Home's
+/// `.sourceCache` JSON.
 pub fn sources(cache: &str, row: &str) -> Vec<Source> {
     let Ok(Value::Object(cache)) = serde_json::from_str::<Value>(cache) else {
         return Vec::new();
@@ -92,24 +108,45 @@ pub fn sources(cache: &str, row: &str) -> Vec<Source> {
         .lines()
         .filter_map(|line| line.trim().strip_prefix("s/source.layer.hdmi@"))
         .chain(["TV"]);
-    keys.filter_map(|key| {
-        let entry = cache.get(key)?;
-        let text = |field: &str| entry[field].as_str().filter(|text| !text.is_empty());
-        let name = text("EditName")
-            .or(text("DetectedName"))
-            .map(str::to_owned)
-            .unwrap_or_else(|| key.split('/').next().unwrap_or(key).to_owned());
-        Some(Source {
-            name,
-            kind: entry["SourceType"].as_i64()?,
-            mbr: entry["MbrActivityIndex"].as_i64().unwrap_or(-2),
-            icon: text("LauncherUnfocusedIconPath")
-                .or(text("IconPath"))
-                .map(str::to_owned),
-            source_icon: text("IconPath").unwrap_or_default().to_owned(),
+    let mut servers: Vec<&str> = cache
+        .iter()
+        .filter(|(key, entry)| key.starts_with("DLNA/") && entry["ConnectionState"] == true)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    servers.sort_by_key(|key| {
+        cache[*key]["EditName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+    });
+    keys.chain(servers)
+        .filter_map(|key| {
+            let entry = cache.get(key)?;
+            let text = |field: &str| entry[field].as_str().filter(|text| !text.is_empty());
+            let name = text("EditName")
+                .or(text("DetectedName"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| key.split('/').next().unwrap_or(key).to_owned());
+            let dlna = key
+                .starts_with("DLNA/")
+                .then(|| Some((text("UniqueKey")?.to_owned(), name.clone())))
+                .flatten();
+            Some(Source {
+                name: if dlna.is_some() {
+                    short_dlna_name(&name)
+                } else {
+                    name
+                },
+                dlna,
+                kind: entry["SourceType"].as_i64()?,
+                mbr: entry["MbrActivityIndex"].as_i64().unwrap_or(-2),
+                icon: text("LauncherUnfocusedIconPath")
+                    .or(text("IconPath"))
+                    .map(str::to_owned),
+                source_icon: text("IconPath").unwrap_or_default().to_owned(),
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 /// Most launched first; equal counts (most often never launched) in Home's
@@ -180,13 +217,40 @@ mod tests {
             "HDMI2": {"EditName": "", "DetectedName": "PlayStation 5", "SourceType": 14,
                       "MbrActivityIndex": -2, "IconPath": "/i/pad.svg"},
             "HDMI3": {"EditName": "HW-Q930B", "SourceType": 15},
-            "HDMI4": {"SourceType": 16}
+            "HDMI4": {"SourceType": 16},
+            "DLNA/uuid:B+eth0": {"EditName": "172.17.2.219 - Sonos Play:3 Media Server - RINCON_B",
+                                 "SourceType": 56, "UniqueKey": "uuid:B+eth0", "ConnectionState": true},
+            "DLNA/uuid:A+eth0": {"EditName": "Plex: NAS", "SourceType": 56,
+                                 "UniqueKey": "uuid:A+eth0", "ConnectionState": true},
+            "DLNA/uuid:C+eth0": {"EditName": "Gone", "SourceType": 56, "UniqueKey": "uuid:C",
+                                 "ConnectionState": false}
         }"#;
         let row = "s/livetv@TVPLUS\nd/webapp@1\ns/source.layer.hdmi@HDMI1/0\n\
                    s/source.layer.hdmi@HDMI4\ns/source.layer.hdmi@HDMI2\nEOFCOBA";
         let found = sources(cache, row);
         let names: Vec<_> = found.iter().map(|source| source.name.as_str()).collect();
-        assert_eq!(names, ["XBOX SeriesX|S", "HDMI4", "PlayStation 5", "TV"]);
+        assert_eq!(
+            names,
+            [
+                "XBOX SeriesX|S",
+                "HDMI4",
+                "PlayStation 5",
+                "TV",
+                "Sonos Play:3 (172.17.2.219)",
+                "Plex: NAS"
+            ]
+        );
+        assert_eq!(
+            found[4].dlna.as_ref().map(|(key, _)| key.as_str()),
+            Some("uuid:B+eth0")
+        );
+        assert!(found[4]
+            .dlna
+            .as_ref()
+            .unwrap()
+            .1
+            .starts_with("172.17.2.219 - Sonos"));
+        assert_eq!(found[0].dlna, None);
         assert_eq!(found[0].icon.as_deref(), Some("/i/x_n.png"));
         assert_eq!((found[0].kind, found[0].mbr), (13, 0));
         assert_eq!(found[2].icon.as_deref(), Some("/i/pad.svg"));

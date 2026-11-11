@@ -184,6 +184,16 @@ Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
   `sourceType`, `sourceName`, `sourceIcon`, `mbrIndex`,
   `__K_EX_LAUNCH_REQUESTOR=user`).
 
+Then the connected DLNA media servers (`DLNA/<UniqueKey>` entries with
+`ConnectionState`), by name. `"172.17.2.219 - Sonos Play:3 Media Server -
+RINCON_…"` is shown as `Sonos Play:3 (172.17.2.219)`. OK opens the server in
+Samsung's media browser, `com.samsung.tv.mycontents`, the way Samsung's
+source panel does: extras `launch_type=mycontents`,
+`called_app=com.samsung.tv.csfs`, `device_type=DLNA`, `device_id` (the
+`UniqueKey`) and `device_name` (the full name). With fewer than three extras
+or no device type the browser only preloads, hidden (its
+`OnAppControlReceived`).
+
 A thread watches `/opt/dbspace` (`.webappservice.db*`) and `/run/tv-suite`
 (`home-row`, `home-sources`) with inotify and reads the catalog again 300 ms
 after the last change. Only when apps or inputs differ (webappservice writes
