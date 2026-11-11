@@ -48,13 +48,15 @@ impl Transport for SdbTransport {
     }
 
     fn require_shell_injection(&mut self) -> Result<()> {
-        inject::require_shell_injection(&self.target, &self.options)
+        let timeout = self.options.timeout;
+        inject::require_shell_injection_on(self.device()?, timeout)
     }
 
     fn capture(&mut self, command: &str, timeout: Duration) -> Result<Capture> {
-        inject::capture(
-            &self.target,
-            &self.options,
+        let target = self.target.clone();
+        inject::capture_on(
+            self.device()?,
+            &target,
             command,
             &CaptureConfig {
                 timeout,

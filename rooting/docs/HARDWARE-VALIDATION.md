@@ -59,14 +59,16 @@ Target: `T-PTMDEUC-REL-202602250226`, Linux `5.4.77`, `armv7l`,
 - The same reference call initially failed once with `self credential not
   found`; a retry succeeded. This matches the reference note about occasional
   lost injections.
-- Our native `tv-sdb` client still gets `TV refused service` for the exact
-  command that Samsung's `sdb` executes successfully. The frame sequence and
-  service bytes appear equivalent; this is a native-client/session
-  compatibility issue, not a TV-side block. See
-  [`sdb-foothold-blockers.md`](sdb-foothold-blockers.md).
-- Consequently `tv root --check` and `tv setup` still fail closed with the
-  native client, while the reference method validates the rooting phase.
-- Restarting `sdbd.service` did not change the native result.
+- The native `tv-sdb` path is now fixed and matches the reference:
+  `tv root 172.17.2.110 --check` passes, and
+  `tv root 172.17.2.110 --command 'id'` returns UID/GID 0 with `exec_begin`.
+  The three native fixes are recorded in
+  [`sdb-foothold-blockers.md`](sdb-foothold-blockers.md): the bash callback
+  URL must use `host/port`, an early shell CLSE is a normal redirected-output
+  close rather than a refusal, and the FDET task tag must use the
+  reference-compatible 14-character `qnroot…` form.
+- Little Snitch/firewall was not the cause; the reference Python listener and
+  the native listener both received callbacks once the URL syntax was fixed.
 - `tv ssh-key add` validated the existing public key, pushed it to
   `/home/owner/share/tmp/sdk_tools/ssh-key.pub` and tv-authd logged
   `approval_queued label=sdb-push ... kind=ssh_key`. The prompt timed out, the

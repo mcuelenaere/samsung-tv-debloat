@@ -177,7 +177,7 @@ impl RootEvidence {
 /// Runs one command through the managed FDET payload and requires both root
 /// evidence and exit status zero.
 pub fn invocation(remote_probe: &str, command: &str) -> Result<String> {
-    let tag = format!("qnr{}", inject::random_hex(4)?);
+    let tag = format!("qnroot{}", inject::random_hex(4)?);
     Ok([
         "/usr/bin/dotnet".to_owned(),
         remote_probe.to_owned(),
@@ -242,6 +242,17 @@ mod tests {
         );
         assert_eq!(runtime_from_output("3.1.x\n"), Runtime::Net6);
         assert_eq!(runtime_from_output(""), Runtime::Net6);
+    }
+
+    #[test]
+    fn invocation_uses_the_reference_compatible_task_tag() {
+        let invocation = invocation("/home/owner/share/tmp/sdk_tools/FdetProbe.dll", "id").unwrap();
+        let tag = invocation
+            .split_whitespace()
+            .find(|field| field.starts_with("qnroot"))
+            .expect("qnroot tag");
+        assert!(tag.len() >= 13 && tag.len() <= 15, "{tag}");
+        assert!(invocation.contains(" srs 0x20000000 0x4a000000 "));
     }
 
     #[test]

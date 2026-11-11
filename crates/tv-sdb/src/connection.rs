@@ -162,6 +162,15 @@ impl Device {
     /// Opens a service such as `shell:<command>` or `sync:`. One channel at a
     /// time: the returned borrow keeps the device busy until it is dropped.
     pub fn open(&mut self, service: &str) -> io::Result<Channel<'_>> {
+        self.open_or_closed(service)?
+            .ok_or_else(|| other(format!("TV refused service {service:?}")))
+    }
+
+    /// Like [`Device::open`], but a `CLSE` before `OKAY` returns `None` instead
+    /// of an error. sdbd uses that shape for shell commands whose output is
+    /// redirected elsewhere (the command still ran); treating it as a refusal
+    /// loses the completed command. Other services should use [`Device::open`].
+    pub fn open_or_closed(&mut self, service: &str) -> io::Result<Option<Channel<'_>>> {
         let local = self.next_id;
         self.next_id += 1;
         let mut payload = service.as_bytes().to_vec();
@@ -174,16 +183,16 @@ impl Device {
             }
             match frame.command {
                 OKAY if frame.arg0 != 0 => {
-                    return Ok(Channel {
+                    return Ok(Some(Channel {
                         device: self,
                         local,
                         remote: frame.arg0,
                         closed: false,
                         buf: Vec::new(),
                         pos: 0,
-                    })
+                    }))
                 }
-                CLSE => return Err(other(format!("TV refused service {service:?}"))),
+                CLSE => return Ok(None),
                 _ => {
                     return Err(other(format!(
                         "unexpected {} while opening {service:?}",

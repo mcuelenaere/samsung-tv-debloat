@@ -49,7 +49,8 @@ fn main() -> ExitCode {
 fn run() -> Result<u8, String> {
     let args = parse()?;
     let mut transport = SdbTransport::new(&args.target, args.options.clone());
-    inject::require_shell_injection(&args.target, &args.options)
+    transport
+        .require_shell_injection()
         .map_err(|error| error.to_string())?;
 
     let capture = transport
@@ -97,7 +98,15 @@ fn run() -> Result<u8, String> {
         let (body, status) = inject::validate_exit(&capture, &capture.marker_token)
             .map_err(|error| error.to_string())?;
         if status != 0 {
-            return Err(format!("remote command exited {status}"));
+            let tail: String = body
+                .chars()
+                .rev()
+                .take(2000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return Err(format!("remote command exited {status}: {tail}"));
         }
         RootEvidence::validate(&body).map_err(|error| error.to_string())?;
         Ok(body)

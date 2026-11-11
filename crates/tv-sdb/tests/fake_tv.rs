@@ -173,7 +173,7 @@ fn end_to_end_against_fake_tv() {
     tv.shell("0 vd_applist", &mut out).unwrap();
     assert_eq!(out, "ran 0 vd_applist\n".repeat(200).into_bytes());
 
-    assert!(tv.shell("refuse", &mut Vec::new()).is_err());
+    assert!(tv.shell("refuse", &mut Vec::new()).unwrap().is_empty());
 
     let dir = std::env::temp_dir().join(format!("tv-sdb-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

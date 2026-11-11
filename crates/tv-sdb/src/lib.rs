@@ -77,7 +77,12 @@ impl Device {
     /// until the TV closes the channel, and returns a copy of that output.
     /// sdbd reports no exit status.
     pub fn shell(&mut self, command: &str, out: &mut dyn Write) -> io::Result<Vec<u8>> {
-        let mut ch = self.open(&format!("shell:{command}"))?;
+        // A shell command can close the channel without an OKAY when its
+        // output is redirected (the FDET capture path). The command still ran;
+        // return an empty result rather than a spurious refusal.
+        let Some(mut ch) = self.open_or_closed(&format!("shell:{command}"))? else {
+            return Ok(Vec::new());
+        };
         let (mut all, mut buf) = (Vec::new(), [0u8; 16 * 1024]);
         loop {
             let n = ch.read(&mut buf)?;
