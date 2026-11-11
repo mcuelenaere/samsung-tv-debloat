@@ -435,6 +435,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tv-pkg"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tv-proto",
+ "zip",
+]
+
+[[package]]
 name = "tv-proto"
 version = "0.1.0"
 dependencies = [

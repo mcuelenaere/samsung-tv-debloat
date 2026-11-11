@@ -1,0 +1,18 @@
+[package]
+name = "tv-pkg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Same pure-Rust deflate setup as tv-authd (see its Cargo.toml).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tv-proto.workspace = true
+zip = { version = "2.4", default-features = false, features = ["flate2", "deflate-flate2"] }
+
+[dev-dependencies]
+tempfile = "3"
