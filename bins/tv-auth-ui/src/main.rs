@@ -346,14 +346,22 @@ impl Ui {
         while let Ok(job) = self.jobs_rx.try_recv() {
             dirty |= self.on_job(job);
         }
-        if self.tab == Tab::System
+        if matches!(self.tab, Tab::System | Tab::Permissions)
             && self
                 .system_asked
                 .is_none_or(|asked| asked.elapsed().as_secs_f64() >= SYSTEM_REFRESH)
         {
             self.system_asked = Some(Instant::now());
             let jobs = self.jobs_tx.clone();
+            let with_system = self.tab == Tab::System;
             spawn(move || {
+                let _ = jobs.send(Job::Access(
+                    None,
+                    access_call(json!({"method": "access.status"})),
+                ));
+                if !with_system {
+                    return;
+                }
                 let result = tv_proto::call(BLOCKD_SOCKET, &json!({"method": "system"}))
                     .map_err(|error| format!("Could not reach tv-blockd: {error}"))
                     .and_then(|bytes| {
@@ -361,10 +369,6 @@ impl Ui {
                             .map_err(|error| format!("tv-blockd sent bad JSON: {error}"))
                     });
                 let _ = jobs.send(Job::System(result));
-                let _ = jobs.send(Job::Access(
-                    None,
-                    access_call(json!({"method": "access.status"})),
-                ));
             });
         }
         if dirty {
@@ -499,11 +503,16 @@ impl Ui {
                 return self.tab == Tab::System;
             }
             Job::Access(message, Ok(view)) => {
+                // Repaint only when something changed: polls come every 3 s.
+                let changed = self.access.as_ref() != Some(&view);
                 self.access = Some(view);
                 if let Some(message) = message {
                     self.set_status(message);
+                    // The change is in the audit log now.
+                    self.refresh_grants();
+                    return self.tab == Tab::Permissions;
                 }
-                return self.tab == Tab::System;
+                return changed && self.tab == Tab::Permissions;
             }
             Job::Access(message, Err(error)) => {
                 log_line(&error);
@@ -941,6 +950,16 @@ impl Ui {
                 .collect()
         };
         blocks.push(Block::Rows(rows));
+        match &self.access {
+            Some(access) => {
+                let address = tv_address().unwrap_or_else(|| "<TV address>".into());
+                blocks.extend(access_blocks(access, &address));
+            }
+            None => blocks.push(Block::Paragraph {
+                markup: "<muted>Asking tv-authd about SSH and SDB...</muted>".into(),
+                size: 22,
+            }),
+        }
         blocks.push(Block::Section("Recent activity".into()));
         let mut header = Row::text("Root decisions", "Newest first, from tv-authd's audit log");
         header.controls.push(Control::Button {
@@ -970,7 +989,7 @@ impl Ui {
 
     fn system_page(&mut self) -> Vec<Block<Action>> {
         match &self.tweaks {
-            Some(status) => system_page(status, self.system.as_ref(), self.access.as_ref()),
+            Some(status) => system_page(status, self.system.as_ref()),
             None => vec![Block::Paragraph {
                 markup: "<muted>Asking tv-blockd...</muted>".into(),
                 size: 24,
@@ -1528,11 +1547,7 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
 
 /// The System tab from tv-blockd's `status`.
 /// The System tab from tv-blockd's `status` and `system` snapshot.
-fn system_page(
-    status: &Value,
-    system: Option<&Value>,
-    access: Option<&Value>,
-) -> Vec<Block<Action>> {
+fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
     let config = &status["config"];
     let mb = |kb: &Value| format!("{} MB", (kb.as_u64().unwrap_or(0) + 512) / 1024);
     let mut blocks = Vec::new();
@@ -1671,9 +1686,13 @@ fn system_page(
         blocks.push(Block::Section("Largest in memory".into()));
         blocks.push(list("top_memory"));
     }
-    let Some(access) = access else {
-        return blocks;
-    };
+    blocks
+}
+
+/// The Permissions tab's SSH and SDB sections, from tv-authd's `access`
+/// view; `address` is the TV's own, for the `tv-sdb` command.
+fn access_blocks(access: &Value, address: &str) -> Vec<Block<Action>> {
+    let mut blocks = Vec::new();
     let keys = access["keys"].as_array().cloned().unwrap_or_default();
     let running = |key: &str| {
         if access[key] == true {
@@ -1723,7 +1742,8 @@ fn system_page(
     blocks.push(Block::Paragraph {
         markup: format!(
             "<muted>To add a key, push it from your computer; the TV then asks you to allow \
-             it:</muted><br/>tv-sdb -s &lt;TV address&gt; push ~/.ssh/id_ed25519.pub {}",
+             it:</muted><br/>tv-sdb -s {} push ~/.ssh/id_ed25519.pub {}",
+            escape(address),
             escape(access["key_drop"].as_str().unwrap_or("?"))
         ),
         size: 22,
@@ -1751,7 +1771,7 @@ fn system_page(
     blocks.push(Block::Paragraph {
         markup: "<muted>SDB runs only while Samsung's developer mode is on, and accepts only \
                  the host shown. tv-authd keeps SSH and SDB off once switched off, and every \
-                 change is in the Permissions tab's log; without tv-authd a reboot turns them \
+                 change is under Recent activity below; without tv-authd a reboot turns them \
                  back on.</muted>"
             .into(),
         size: 22,
@@ -1816,6 +1836,15 @@ fn icon_path(digest: &str) -> PathBuf {
     Path::new(STORE_DIR)
         .join("icons")
         .join(format!("{digest}.png"))
+}
+
+/// The TV's own address on the network it routes through: the source
+/// address the kernel picks for a public destination. Connecting a UDP
+/// socket only looks the route up; nothing is sent.
+fn tv_address() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:53").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 /// One `access.*` request to tv-authd (blocks; worker threads): the

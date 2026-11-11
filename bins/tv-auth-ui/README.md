@@ -111,10 +111,18 @@ same action and the scroll position is kept.
 
 ### Permissions
 
-The persistent-grant list: per app its toast mode button, which cycles
-**Toast: every** → **Toast: first use** → **Toast: never**, and **Revoke**.
-Below it, **Recent activity** shows the newest `grants.audit` lines with
-their age, and **Refresh**.
+Who can get root on the TV, top to bottom:
+- the persistent-grant list: per app its toast mode button, which cycles
+  **Toast: every** → **Toast: first use** → **Toast: never**, and **Revoke**;
+- **SSH** and **Developer access**, from tv-authd (`access.status`, polled
+  every 3 s while the tab is open; changes with `access.set` and
+  `access.ssh_remove`): the SSH switch, each key with its fingerprint and
+  **Remove**, and the `tv-sdb push` command for adding one, with the TV's own
+  address (the source address of its default route; tv-authd's popup then
+  asks); the SDB switch and, while SDB is on, **Host**: the one address
+  Samsung's developer mode lets connect, edited with the TV keyboard;
+- **Recent activity**: the newest `grants.audit` lines with their age, and
+  **Refresh** (refreshed after each SSH or SDB change too).
 
 The manager never sends `ui.hello`, so it does not take prompts or toasts from
 the popup daemon.
@@ -152,14 +160,7 @@ tab is open:
   switch, and what its processes use now (memory, swap, CPU), or, once
   stopped, what they used when tv-blockd stopped them;
 - **Busiest now** and **Largest in memory**: the top eight processes, named
-  by app id where they are apps;
-- **SSH** and **Developer access**, from tv-authd (`access.status`, polled
-  with the snapshot; changes with `access.set` and `access.ssh_remove`, all
-  in the Permissions tab's log): the SSH switch, each key with its
-  fingerprint and **Remove**, and the `tv-sdb push` command for adding one
-  (tv-authd's popup then asks); the SDB switch and, while SDB is on, **Host**:
-  the one address Samsung's developer mode lets connect, edited with the TV
-  keyboard.
+  by app id where they are apps.
 
 ### Dock (`org.tvauth.home`)
 
