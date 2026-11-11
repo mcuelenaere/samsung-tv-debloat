@@ -468,3 +468,17 @@ actual TizenTube update (1.15.2 is the latest), and long playback.
   `org.tizen.tv.sp-kpi`, `emergency-log-transmitter`, `issue_report_agent`,
   `smart-deadlock`, `stability-monitor`, `dlogutil` (`/opt/etc/disable_dlogutil`).
   Each needs checking for side effects before it is stopped.
+  **Partly done 2026-11-11:** the list keeps every name (other models may
+  have them) and adds the units tv-living runs (`canalysis-service`,
+  `adagent-service`, `emergency-log-transmitter`,
+  `contents-recognition-service`, `contents-ui-detector-service`,
+  `mirroring-recognition-manager`, `kpi-logging`, `devicetracker`,
+  `pisa-service.path`); the `/opt` brake files are gone in favour of runtime
+  masks; AirPlay and the Multi View preload are new opt-in options
+  (`bins/tv-blockd/README.md`). Still open: `org.tizen.tv.sp-kpi`,
+  `screen-analysis-service-manager`, context-aware and activity-inference
+  services (some are D-Bus activated); `issue_report_agent`,
+  `stability-monitor`, `dlogutil`. Vetro left `org.tizen.hbbtv-service`
+  globally disabled on tv-living (it fails at every boot); re-enabling it
+  (`pkgcmd -A -t app -n org.tizen.hbbtv-service --global`) is the user's
+  call.

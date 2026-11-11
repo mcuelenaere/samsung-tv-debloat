@@ -14,27 +14,54 @@ Every 60 s, and right after each configuration change, it reconciles:
   namespaces are picked up on the next pass. Essential hosts (connectivity
   check, clock, developer certificate) are never blocked.
 - **OTN lock**: `vconf db/menu/support/softwareupdate/autoupdate` stays 0.
-- **telemetry**: creates the units' `ConditionPathExists=!` brake files, stops
-  and `systemctl mask --runtime`s the telemetry units (canalysis, dlog_logger,
-  ep-agent, faultmgr, smart_deadlock, trace_manager, pisa-service,
-  vision-data-recognition-service, elt-daemon), and kills `EdgeScraper`.
+- **service options** (`SERVICES` in `src/daemon.rs`): while an option is
+  on, its units are `systemctl mask --runtime`d and stopped, its processes
+  killed and its apps closed (when it is switched on, and once after each
+  start of tv-blockd). Runtime masks live in `/run`, so a reboot without
+  tv-blockd brings every service back. The lists cover several models: a
+  unit or app a TV does not have is skipped harmlessly.
+  - **telemetry** (on by default): `canalysis`, `canalysis-service`,
+    `adagent-service`, `dlog_logger`, `ep-agent`, `faultmgr`,
+    `smart_deadlock`, `trace_manager`, `pisa-service` (and `.path`),
+    `vision-data-recognition-service`, `elt-daemon`,
+    `emergency-log-transmitter`, `contents-recognition-service`,
+    `contents-ui-detector-service`, `mirroring-recognition-manager`,
+    `kpi-logging`, `devicetracker`; kills `EdgeScraper` and
+    `contents-ott-detector`; the `/tmp/eltlaunch.cond` brake.
+  - **airplay** (off): `com.samsung.tv.airplay-service(-2)` `.service` and
+    `.path`; closes `com.samsung.tv.airplay-app(-2)`. iPhones and Macs can no
+    longer cast to the TV.
+  - **multiview_preload** (off): `com.samsung.tv.multiscreen.service`;
+    closes `com.samsung.tv.multiscreen`. Multi View then starts cold. The
+    unit does not start while Samsung's own `/tmp/multiview_low_memory`
+    exists, which the firmware creates when memory runs low; it is Samsung's
+    and left alone.
+
+  On tv-living the services the defaults stop took about 23 MB of RSS and
+  27 MB of swap; AirPlay and the Multi View preload about 17 + 28 and
+  25 + 27 MB, with swap full. Measured in a read-only survey, 2026-11-11.
 
 Turning an option off undoes exactly what tv-blockd did for it, without a
 reboot:
 - **hosts**: unmounted everywhere;
 - **OTN lock**: puts back the auto-update value it found;
-- **telemetry**: deletes only the brake files and directories it created,
-  unmasks the units, and restarts the ones it stopped.
+- **service options**: deletes the brake file it created, unmasks the units,
+  and starts the ones it stopped (recorded before its apps are closed).
 
-`undo` (or **Undo all changes** in the manager) switches all three off. The
-record lives in `/opt/tv-suite/var/changes.json`, because brake files and the
-auto-update setting outlive a reboot. `EdgeScraper` has no unit to restart;
-it comes back at the next boot.
+`undo` (or **Undo all changes** in the manager) switches them all off. The
+record lives in `/opt/tv-suite/var/changes.json`, because the auto-update
+setting outlives a reboot. Killed processes have no unit to restart; they
+come back at the next boot.
 
-Known gap: most telemetry unit names do not exist on this firmware. Only the
-brake-file paths come from Vetro; Vetro stops other units
-(`adagent-service`, `contents-recognition-service`, `kpi-logging`, ...). See
-the backlog in `docs/rust-tv-suite-plan.md`.
+Older builds braked telemetry with files under `/opt/usr/share/systemd/system`,
+which outlived a reboot without tv-blockd. Every pass removes any such file
+or directory that `changes.json` records as tv-blockd's (on tv-living: four,
+on 2026-11-11).
+
+Not done (would be permanent): ACR, analytics and voice apps are amd service
+apps that restart when closed; only `pkgcmd -D --global` or editing
+pkgmgr's database stops them, and both outlive a reboot. HbbTV runs Samsung
+TV Plus on this firmware.
 
 ## Configuration
 
@@ -48,6 +75,8 @@ the backlog in `docs/rust-tv-suite-plan.md`.
 | `lists` | `[]` | HTTPS hosts-format or domain-per-line lists (max 8), fetched daily, cached in `/opt/tv-suite/var/lists` |
 | `otn_lock` | `true` | keep automatic updates off |
 | `telemetry` | `true` | stop telemetry services |
+| `airplay` | `false` | turn off the AirPlay receiver |
+| `multiview_preload` | `false` | don't preload Multi View |
 
 ## Control
 

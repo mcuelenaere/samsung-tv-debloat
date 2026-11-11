@@ -31,25 +31,75 @@ const UI_UID: u32 = 5001;
 const USERS_GID: u32 = 100;
 
 const AUTOUPDATE_KEY: &str = "db/menu/support/softwareupdate/autoupdate";
-/// `ConditionPathExists=!` files of Samsung's telemetry units.
-const BRAKES: &[&str] = &[
-    "/opt/usr/share/systemd/system/canalysis-daemon",
-    "/opt/usr/share/systemd/system/pisa-service",
-    "/opt/usr/share/systemd/system/vision-data-recognition-service",
-    "/tmp/eltlaunch.cond",
+/// Samsung services an option stops, for as long as it is on: their units
+/// are runtime-masked (gone at the next boot) and stopped, their processes
+/// killed and their apps closed. Switching the option off unmasks the units
+/// and starts the ones it stopped. Units and apps that do not exist on a TV
+/// are harmless: the lists cover several models.
+struct Services {
+    /// The option in [`Config`] and the key in the report.
+    key: &'static str,
+    units: &'static [&'static str],
+    processes: &'static [&'static str],
+    /// Closed when the option is switched on (and once after each start of
+    /// tv-blockd); they are not restarted, their services start them again.
+    apps: &'static [&'static str],
+    /// `ConditionPathExists=!` files under /tmp (gone at reboot) that keep
+    /// units from starting.
+    brakes: &'static [&'static str],
+}
+
+const SERVICES: &[Services] = &[
+    Services {
+        key: "telemetry",
+        units: &[
+            "canalysis.service",
+            "canalysis-service.service",
+            "adagent-service.service",
+            "dlog_logger.service",
+            "ep-agent.service",
+            "faultmgr.service",
+            "smart_deadlock.service",
+            "trace_manager.service",
+            "pisa-service.service",
+            "pisa-service.path",
+            "vision-data-recognition-service.service",
+            "elt-daemon.service",
+            "emergency-log-transmitter.service",
+            "contents-recognition-service.service",
+            "contents-ui-detector-service.service",
+            "mirroring-recognition-manager.service",
+            "kpi-logging.service",
+            "devicetracker.service",
+        ],
+        processes: &["EdgeScraper", "contents-ott-detector"],
+        apps: &[],
+        brakes: &["/tmp/eltlaunch.cond"],
+    },
+    Services {
+        key: "airplay",
+        units: &[
+            "com.samsung.tv.airplay-service.service",
+            "com.samsung.tv.airplay-service.path",
+            "com.samsung.tv.airplay-service-2.service",
+            "com.samsung.tv.airplay-service-2.path",
+        ],
+        processes: &[],
+        apps: &["com.samsung.tv.airplay-app", "com.samsung.tv.airplay-app-2"],
+        brakes: &[],
+    },
+    Services {
+        key: "multiview_preload",
+        units: &["com.samsung.tv.multiscreen.service"],
+        processes: &[],
+        apps: &["com.samsung.tv.multiscreen"],
+        brakes: &[],
+    },
 ];
-const TELEMETRY_UNITS: &[&str] = &[
-    "canalysis",
-    "dlog_logger",
-    "ep-agent",
-    "faultmgr",
-    "smart_deadlock",
-    "trace_manager",
-    "pisa-service",
-    "vision-data-recognition-service",
-    "elt-daemon",
-];
-const TELEMETRY_PROCESSES: &[&str] = &["EdgeScraper"];
+
+/// Brake files older builds made under /opt, where they outlived a reboot;
+/// removed once (`Changes::created` records which were tv-blockd's).
+const PERSISTENT_PREFIX: &str = "/opt/";
 
 fn log(message: &str) {
     let path = Path::new(LOG);
@@ -86,6 +136,8 @@ struct Report {
     namespaces_failed: usize,
     otn_autoupdate: Option<i32>,
     telemetry_active: Vec<String>,
+    /// Running units of every service option, on or off.
+    services: BTreeMap<String, Vec<String>>,
     lists: Vec<ListReport>,
     errors: Vec<String>,
 }
@@ -108,10 +160,10 @@ struct Changes {
     /// The auto-update setting before tv-blockd first turned it off.
     #[serde(default)]
     otn_autoupdate: Option<i32>,
-    /// Brake files and the directories made for them, in creation order.
+    /// Brake files (and directories made for them), in creation order.
     #[serde(default)]
     created: Vec<String>,
-    /// Telemetry units that were running when tv-blockd stopped them.
+    /// Units that were running when tv-blockd stopped them.
     #[serde(default)]
     stopped: Vec<String>,
 }
@@ -146,10 +198,11 @@ struct Daemon {
     report: Report,
     changes: Changes,
     written_hosts: Option<String>,
-    /// Telemetry units masked by this process.
-    masked: bool,
-    /// Telemetry changes undone since telemetry was last switched off.
-    telemetry_restored: bool,
+    /// Service options whose units this process has masked (and whose apps
+    /// it has closed).
+    masked: std::collections::BTreeSet<&'static str>,
+    /// Service options restored since they were last switched off.
+    restored: std::collections::BTreeSet<&'static str>,
     list_fetched: BTreeMap<String, Instant>,
     /// Namespaces already reported as failing, so each is logged once.
     reported_failures: std::collections::BTreeSet<String>,
@@ -215,8 +268,8 @@ fn run() -> io::Result<()> {
         report: Report::default(),
         changes: Changes::load(),
         written_hosts: None,
-        masked: false,
-        telemetry_restored: false,
+        masked: Default::default(),
+        restored: Default::default(),
         list_fetched: BTreeMap::new(),
         reported_failures: std::collections::BTreeSet::new(),
     };
@@ -313,6 +366,8 @@ impl Daemon {
                     hosts: false,
                     otn_lock: false,
                     telemetry: false,
+                    airplay: false,
+                    multiview_preload: false,
                     ..self.config.clone()
                 };
                 self.apply(config)
@@ -352,7 +407,7 @@ impl Daemon {
         let remote = self.remote_hosts(&mut report);
         self.reconcile_hosts(&remote, &mut report);
         self.reconcile_otn(&mut report);
-        self.reconcile_telemetry(&mut report);
+        self.reconcile_services(&mut report);
         for error in &report.errors {
             log(error);
         }
@@ -503,87 +558,116 @@ impl Daemon {
         }
     }
 
-    /// Remove the brake files tv-blockd made, unmask, and restart the units
-    /// it stopped. `EdgeScraper` has no unit; it returns at the next boot.
-    fn restore_telemetry(&mut self, units: &[String]) {
-        for path in self.changes.created.drain(..).rev() {
-            // Directories go only if empty.
-            let _ = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path));
+    /// Removes the brake files tv-blockd made under `prefix`, newest first;
+    /// directories go only if empty.
+    fn remove_created(&mut self, prefix: &str) {
+        let (ours, keep): (Vec<String>, Vec<String>) = self
+            .changes
+            .created
+            .drain(..)
+            .partition(|path| path.starts_with(prefix));
+        self.changes.created = keep;
+        for path in ours.iter().rev() {
+            let _ = fs::remove_file(path).or_else(|_| fs::remove_dir(path));
         }
-        let _ = systemctl(&["unmask", "--runtime"], units);
-        self.masked = false;
-        if !self.changes.stopped.is_empty() {
-            let _ = systemctl(&["start", "--no-block"], &self.changes.stopped);
-            self.changes.stopped.clear();
+        if !ours.is_empty() {
+            self.changes.save();
+            log(&format!(
+                "removed {} brake files and directories under {prefix}",
+                ours.len()
+            ));
         }
-        self.changes.save();
-        log("telemetry restored");
     }
 
-    fn reconcile_telemetry(&mut self, report: &mut Report) {
-        let units: Vec<String> = TELEMETRY_UNITS
-            .iter()
-            .map(|unit| format!("{unit}.service"))
-            .collect();
-        if !self.config.telemetry {
-            if !self.telemetry_restored {
-                self.restore_telemetry(&units);
-                self.telemetry_restored = true;
+    /// Unmasks a service option's units and starts the ones tv-blockd
+    /// stopped. Processes it killed come back at the next boot.
+    fn restore_services(&mut self, services: &Services) {
+        let units: Vec<String> = services.units.iter().map(|unit| unit.to_string()).collect();
+        for brake in services.brakes {
+            if let Some(position) = self.changes.created.iter().position(|path| path == brake) {
+                let _ = fs::remove_file(brake);
+                self.changes.created.remove(position);
             }
-            report.telemetry_active = active_units(&units);
-            return;
         }
-        self.telemetry_restored = false;
-        for brake in BRAKES {
-            let path = Path::new(brake);
-            if path.exists() {
+        let _ = systemctl(&["unmask", "--runtime"], &units);
+        let (start, keep): (Vec<String>, Vec<String>) = self
+            .changes
+            .stopped
+            .drain(..)
+            .partition(|unit| units.contains(unit));
+        self.changes.stopped = keep;
+        if !start.is_empty() {
+            let _ = systemctl(&["start", "--no-block"], &start);
+        }
+        self.changes.save();
+        self.masked.remove(services.key);
+        log(&format!("{} restored", services.key));
+    }
+
+    fn reconcile_services(&mut self, report: &mut Report) {
+        // Older builds braked telemetry with files under /opt, which outlived
+        // a reboot without tv-blockd; runtime masks do the job now.
+        self.remove_created(PERSISTENT_PREFIX);
+        for services in SERVICES {
+            let units: Vec<String> = services.units.iter().map(|unit| unit.to_string()).collect();
+            if !self.config.service(services.key) {
+                if self.restored.insert(services.key) {
+                    self.restore_services(services);
+                }
+                report
+                    .services
+                    .insert(services.key.to_owned(), active_units(&units));
                 continue;
             }
-            let mut missing: Vec<&Path> = path
-                .ancestors()
-                .skip(1)
-                .take_while(|dir| !dir.exists())
-                .collect();
-            missing.reverse();
-            missing.push(path);
-            for (index, created) in missing.iter().enumerate() {
-                let result = if index + 1 == missing.len() {
-                    fs::write(created, b"")
-                } else {
-                    fs::create_dir(created)
-                };
-                if let Err(error) = result {
+            self.restored.remove(services.key);
+            for brake in services.brakes {
+                if !Path::new(brake).exists() {
+                    match fs::write(brake, b"") {
+                        Ok(()) => {
+                            self.changes.created.push(brake.to_string());
+                            self.changes.save();
+                        }
+                        Err(error) => report.errors.push(format!("brake {brake}: {error}")),
+                    }
+                }
+            }
+            // Before closing apps: closing an app can end its unit too, and
+            // the unit must still be recorded to be started again on restore.
+            let active = active_units(&units);
+            if self.masked.insert(services.key) {
+                // Runtime masks live in /run: re-applied after every boot.
+                if let Err(error) = systemctl(&["mask", "--runtime"], &units) {
                     report
                         .errors
-                        .push(format!("brake {}: {error}", created.display()));
-                    break;
+                        .push(format!("mask {}: {error}", services.key));
                 }
-                self.changes.created.push(created.display().to_string());
-            }
-            self.changes.save();
-        }
-        if !self.masked {
-            // Runtime masks live in /run: re-applied on every boot.
-            if let Err(error) = systemctl(&["mask", "--runtime"], &units) {
-                report.errors.push(format!("mask: {error}"));
-            }
-            self.masked = true;
-        }
-        let active = active_units(&units);
-        if !active.is_empty() {
-            let _ = systemctl(&["stop", "--no-block"], &active);
-            for unit in &active {
-                if !self.changes.stopped.contains(unit) {
-                    self.changes.stopped.push(unit.clone());
+                for app in services.apps {
+                    let _ = Command::new("/usr/bin/app_launcher")
+                        .args(["-t", app])
+                        .output();
                 }
             }
-            self.changes.save();
+            if !active.is_empty() {
+                let _ = systemctl(&["stop", "--no-block"], &active);
+                for unit in &active {
+                    if !self.changes.stopped.contains(unit) {
+                        self.changes.stopped.push(unit.clone());
+                    }
+                }
+                self.changes.save();
+                log(&format!("{}: stopped {}", services.key, active.join(" ")));
+            }
+            for pid in processes_named(services.processes) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                log(&format!("{}: killed process {pid}", services.key));
+            }
+            report.services.insert(services.key.to_owned(), active);
         }
-        report.telemetry_active = active;
-        for pid in processes_named(TELEMETRY_PROCESSES) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            log(&format!("killed telemetry process {pid}"));
-        }
+        report.telemetry_active = report
+            .services
+            .get("telemetry")
+            .cloned()
+            .unwrap_or_default();
     }
 }
 

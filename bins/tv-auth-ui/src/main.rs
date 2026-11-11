@@ -1266,6 +1266,28 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
             config["telemetry"] == true,
         ),
     ]));
+    let running = |key: &str| report["services"][key].as_array().map_or(0, Vec::len);
+    blocks.push(Block::Section("Background services".into()));
+    blocks.push(Block::Rows(vec![
+        switch(
+            "airplay",
+            "Turn off the AirPlay receiver",
+            &format!(
+                "Frees memory; iPhones and Macs can no longer cast to the TV \u{00b7} {} running",
+                running("airplay")
+            ),
+            config["airplay"] == true,
+        ),
+        switch(
+            "multiview_preload",
+            "Don't preload Multi View",
+            &format!(
+                "Frees memory; Multi View starts a little slower the first time \u{00b7} {} running",
+                running("multiview_preload")
+            ),
+            config["multiview_preload"] == true,
+        ),
+    ]));
     if let Some(patch) = patch {
         let on = patch["config"]["tizentube"] == true;
         let version = patch["script"]["version"].as_str().unwrap_or("?");

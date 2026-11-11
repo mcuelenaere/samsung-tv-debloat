@@ -157,9 +157,29 @@ pub struct Config {
     /// Keep `db/menu/support/softwareupdate/autoupdate` at 0.
     #[serde(default = "yes")]
     pub otn_lock: bool,
-    /// Brake files, stopped and runtime-masked telemetry units, no EdgeScraper.
+    /// Samsung's telemetry units stopped and runtime-masked (see
+    /// `SERVICES` in the daemon).
     #[serde(default = "yes")]
     pub telemetry: bool,
+    /// The AirPlay receiver stopped and runtime-masked.
+    #[serde(default)]
+    pub airplay: bool,
+    /// Multi View's preloaded app closed and its unit runtime-masked.
+    #[serde(default)]
+    pub multiview_preload: bool,
+}
+
+impl Config {
+    /// A service option by its key (`telemetry`, `airplay`,
+    /// `multiview_preload`).
+    pub fn service(&self, key: &str) -> bool {
+        match key {
+            "telemetry" => self.telemetry,
+            "airplay" => self.airplay,
+            "multiview_preload" => self.multiview_preload,
+            _ => false,
+        }
+    }
 }
 
 impl Default for Config {
@@ -290,6 +310,13 @@ mod tests {
     fn defaults_block_every_non_optional_group() {
         let config = Config::default();
         assert!(config.hosts && config.otn_lock && config.telemetry);
+        // The services that break features are opt-in.
+        assert!(!config.airplay && !config.multiview_preload);
+        assert!(
+            config.service("telemetry")
+                && !config.service("airplay")
+                && !config.service("nonsense")
+        );
         assert!(config.groups.contains(&"reported".to_owned()));
         assert!(!config.groups.contains(&"home-images".to_owned()));
         assert!(config.validate().is_ok());
