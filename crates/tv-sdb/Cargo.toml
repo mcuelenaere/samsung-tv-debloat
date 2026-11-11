@@ -1,0 +1,6 @@
+[package]
+name = "tv-sdb"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal SDB client for Samsung TVs over TCP"

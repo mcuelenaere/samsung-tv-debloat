@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage dropbear and its launcher on the TV through Samsung's sdb.
 # Usage: ./install-dropbear.sh 192.0.2.10
-# Optional: SDB=/path/to/tizen-studio/tools/sdb
+# Optional: SDB=/path/to/tizen-studio/tools/sdb, or target/release/tv-sdb
 set -euo pipefail
 
 TV_IP=${1:?'usage: install-dropbear.sh TV_IP'}

@@ -332,3 +332,34 @@ configuration paths.
 
 This provides a series of small, testable milestones and gets the useful setup
 functionality working before any convenience features are added.
+
+## Implementation notes (2026-11-11)
+
+Implemented as `crates/tv-sdb` (library) and `bins/tv-sdb` (CLI, package
+`tv-sdb-cli`). Verified against the QE55S95B (sdbd 2.2.31, plugin 3.8.5) and a
+proxy capture of Samsung's own `sdb`. Where the TV disagreed with the plan, the
+code follows the TV:
+
+- **No identity exchange.** The TV answers `CNXN` directly (version
+  `0x02000000`, max payload 262044). An `AUTH` reply returns an
+  `unsupported negotiation` error; RSA key auth is not implemented.
+- **Max payload 256 KiB**, like Samsung's client, instead of 4096: each `WRTE`
+  waits for an `OKAY`, so small frames make transfers latency-bound (5 MB push
+  ≈ 1.2 s).
+- **`SEND` mode is `0o100755`**, which is what Samsung's client always sends;
+  `dropbear/install-dropbear.sh` relies on pushed files staying executable.
+- **Install uses `0 appinstall <tpk|wgt> <basename>`** (pkgcmd) after pushing to
+  `/home/owner/share/tmp/sdk_tools/`, then `0 rmfile "<path>"`, exactly as
+  `sdb install` does. No archive parsing is needed, so there is no zip
+  dependency. Success means pkgcmd printed `key[end] val[ok]`.
+- **Uninstall uses `0 appuninstall <pkgid>`** (also what `sdb uninstall`
+  sends). **Launch uses `0 execute <appid>`** (app_launcher; success prints
+  `successfully launched`). `0 was_execute` remains reachable through `shell`.
+- **`pull` is whitelisted by sdbd**: only paths such as
+  `/opt/usr/apps/<pkg>/author-signature.xml` are allowed; everything else
+  returns `FAIL You cannot pull files from this path.`
+- **`shell:` is a verb vocabulary**, not a shell: `shell echo hi` returns
+  nothing. Use verbs such as `0 vd_applist` or `0 getduid`.
+
+Not done yet: desktop CI and release artifacts (PR 5); Windows and Linux builds
+are untested but use only `std` networking and filesystem APIs.

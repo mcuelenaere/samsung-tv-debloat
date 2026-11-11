@@ -5,7 +5,13 @@ members = ["crates/*", "bins/*"]
 exclude = ["root-broker"]
 # Host builds: the EFL binaries only link against the TV sysroot (see
 # cross-build.sh), so plain `cargo build` skips them.
-default-members = ["crates/tv-proto", "bins/tv-authd", "bins/tv-auth-cli"]
+default-members = [
+    "crates/tv-proto",
+    "crates/tv-sdb",
+    "bins/tv-authd",
+    "bins/tv-auth-cli",
+    "bins/tv-sdb",
+]
 
 [workspace.dependencies]
 libc = "0.2"
@@ -14,6 +20,7 @@ serde_json = "1"
 tv-proto = { path = "crates/tv-proto" }
 tv-efl = { path = "crates/tv-efl" }
 tv-tizen = { path = "crates/tv-tizen" }
+tv-sdb = { path = "crates/tv-sdb" }
 
 [profile.release]
 opt-level = "z"

@@ -1,0 +1,12 @@
+[package]
+name = "tv-sdb-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tv-sdb"
+path = "src/main.rs"
+
+[dependencies]
+tv-sdb.workspace = true
