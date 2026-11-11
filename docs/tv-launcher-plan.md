@@ -200,8 +200,9 @@ No daemon, no evdev, no root at run time.
   methods.
 - **Off** resets the Home target, so Samsung's Home answers the next press.
 - **Undo all changes** includes it.
-- Autorun Smart Hub is left alone. With the dock as Home, power-on opens our
-  dock, not Samsung's.
+- Autorun Smart Hub opens Samsung's Home at power-on even with the dock as
+  the Home target (cold boot, step 1). Turning it off while Custom Home is on
+  is the user's call.
 - Nothing of Samsung's is disabled or uninstalled.
 - The one lasting change is the appsvc row. Off and Undo reset it. Step 1
   checks what happens to it when the `org.tvauth.ui` package is updated or
@@ -224,7 +225,17 @@ No daemon, no evdev, no root at run time.
    - whether the app behind the dock keeps playing (else the dock goes
      full-screen).
 
-   **Done 2026-11-11** on tv-living, except the cold boot:
+   **Done 2026-11-11** on tv-living:
+   - Cold boot with Custom Home on: the TV boots normally, the Home target is
+     still `org.tvauth.home`, and the first Home press opens the dock.
+     - With Autorun Smart Hub on, power-on still opens **Samsung's** Home:
+       the boot-time autostart uses the factory default (csfs), not the
+       current target.
+     - Seven Samsung units were failed after this boot: aov-service,
+       knox-browser, termsclient.message, hbbtv-service, rct-service,
+       udev-trigger, vdca-update. udev-trigger ran at 3 s, before any suite
+       unit; the rest ran after tv-blockd started (22 s). No stock boot has
+       been recorded to compare against.
    - Home over YouTube shows the dock across the bottom with YouTube still on
      screen; Home again and BACK hide it.
    - 100 Home presses: no launch event at all. Samsung's Home never started,
@@ -237,8 +248,8 @@ No daemon, no evdev, no root at run time.
      (no fallback), so tv-patchd only sets it once `org.tvauth.home` is
      installed.
    - With the dock shown, YouTube's AUL state goes from focus (2) to visible
-     (3), not background (4), so playback continues behind it; not yet
-     confirmed by eye.
+     (3), not background (4), and playback continues behind it (confirmed
+     on the TV).
 2. **Catalog and refresh**. Check: install and uninstall from the store, a
    WGT and a TPK, with the dock open and closed; each appears or disappears
    within 1 s.
