@@ -97,17 +97,17 @@ fn short_dlna_name(name: &str) -> String {
     }
 }
 
-/// The sources in Home's row (`s/source.layer.hdmi@<key>` lines), in order,
-/// then TV, then the connected DLNA media servers by name. `cache` is Home's
+/// TV, then the sources in Home's row (`s/source.layer.hdmi@<key>` lines), in
+/// order, then the connected DLNA media servers by name. `cache` is Home's
 /// `.sourceCache` JSON.
 pub fn sources(cache: &str, row: &str) -> Vec<Source> {
     let Ok(Value::Object(cache)) = serde_json::from_str::<Value>(cache) else {
         return Vec::new();
     };
-    let keys = row
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("s/source.layer.hdmi@"))
-        .chain(["TV"]);
+    let keys = ["TV"].into_iter().chain(
+        row.lines()
+            .filter_map(|line| line.trim().strip_prefix("s/source.layer.hdmi@")),
+    );
     let mut servers: Vec<&str> = cache
         .iter()
         .filter(|(key, entry)| key.starts_with("DLNA/") && entry["ConnectionState"] == true)
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn sources_follow_the_row_then_tv() {
+    fn sources_are_tv_the_row_then_media_servers() {
         let cache = r#"{
             "TV": {"SourceType": 0, "MbrActivityIndex": -2, "IconPath": "/i/tv.svg"},
             "HDMI1/0": {"EditName": "XBOX SeriesX|S", "SourceType": 13, "MbrActivityIndex": 0,
@@ -232,10 +232,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "TV",
                 "XBOX SeriesX|S",
                 "HDMI4",
                 "PlayStation 5",
-                "TV",
                 "Sonos Play:3 (172.17.2.219)",
                 "Plex: NAS"
             ]
@@ -251,9 +251,9 @@ mod tests {
             .1
             .starts_with("172.17.2.219 - Sonos"));
         assert_eq!(found[0].dlna, None);
-        assert_eq!(found[0].icon.as_deref(), Some("/i/x_n.png"));
-        assert_eq!((found[0].kind, found[0].mbr), (13, 0));
-        assert_eq!(found[2].icon.as_deref(), Some("/i/pad.svg"));
+        assert_eq!(found[1].icon.as_deref(), Some("/i/x_n.png"));
+        assert_eq!((found[1].kind, found[1].mbr), (13, 0));
+        assert_eq!(found[3].icon.as_deref(), Some("/i/pad.svg"));
         assert!(sources("not json", row).is_empty());
     }
 

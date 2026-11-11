@@ -175,7 +175,7 @@ creates objects.
   `/run/tv-suite/home-row`, which tv-patchd mirrors because only Home's
   label may read the original.
 
-The inputs are the HDMI sources in Home's row, in that order, then TV, from
+The inputs are TV, then the HDMI sources in Home's row, in that order, from
 Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
 - name: `EditName`, else `DetectedName`, else the source id;
 - icon: `LauncherUnfocusedIconPath` (Samsung's launcher art, e.g. Xbox and
