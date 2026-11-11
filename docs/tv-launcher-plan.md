@@ -344,6 +344,17 @@ No daemon, no evdev, no root at run time.
    off: Home key back to csfs, YouTube's flags stock, the Home mirrors in
    `/run/tv-suite` removed, host blocking, the update lock and the
    telemetry stop off. The previous settings were then restored with `set`.
+   **TV suite redesign (2026-11-11)**, on user feedback (the Tweaks tab and
+   switching tabs looked poor, scrolling was not smooth): after an
+   interactive mockup, the manager was rebuilt like the dock, with plain
+   evas objects (`bins/tv-auth-ui/README.md`, *Behavior*). Checked on
+   tv-living: the rail and tab switching, the Store grid with icons, a
+   details page and back, the Tweaks sections (a host-group chip off and on,
+   the host count 30 → 26 → 30), Permissions.
+   - Seen once while deploying: tv-authd's `/run` alias step failed after an
+     install (`mount: ... No such file or directory`), so the binary stayed
+     under `/opt`, UEP blocked it and launchpad hung before `app_create`. A
+     reinstall mounted it again. Not understood yet.
 6. **Soak and docs** (the user's soak test runs during the week of
    2026-11-11): a day of normal use, standby and resume, a cold boot;
    README, persistence table, plan status.

@@ -15,6 +15,7 @@
 //! that changed. A watcher thread rebuilds the rows when webappservice's
 //! database or Home's row or source cache change.
 
+use crate::kit::{self, picture, side_of, Obj};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -135,57 +136,9 @@ fn entries(catalog: &Catalog) -> [Vec<Entry>; 3] {
     [apps, inputs, settings]
 }
 
-/// An evas object and the values last given to it, so a frame only calls
-/// into EFL for what changed.
-struct Obj {
-    raw: *mut c_void,
-    rect: Option<Rect>,
-    color: Option<[i32; 4]>,
-}
-
-impl Obj {
-    fn new(raw: *mut c_void) -> Self {
-        Self {
-            raw,
-            rect: None,
-            color: None,
-        }
-    }
-
-    fn place(&mut self, rect: Rect) {
-        if self.rect != Some(rect) {
-            unsafe {
-                evas_object_move(self.raw, rect.x, rect.y);
-                evas_object_resize(self.raw, rect.w, rect.h);
-            }
-            self.rect = Some(rect);
-        }
-    }
-
-    fn move_to(&mut self, x: i32, y: i32) {
-        let rect = Rect { x, y, w: 0, h: 0 };
-        if self.rect != Some(rect) {
-            unsafe { evas_object_move(self.raw, x, y) };
-            self.rect = Some(rect);
-        }
-    }
-
-    /// Premultiplied tint.
-    fn tint(&mut self, color: [i32; 4]) {
-        if self.color != Some(color) {
-            unsafe { evas_object_color_set(self.raw, color[0], color[1], color[2], color[3]) };
-            self.color = Some(color);
-        }
-    }
-
-    fn delete(&self) {
-        unsafe { evas_object_del(self.raw) };
-    }
-}
-
 /// A text object's colour and shadow at `alpha` (0..255).
 fn text_alpha(text: &mut Obj, alpha: i32) {
-    if text.color != Some([alpha; 4]) {
+    if text.tinted() != Some([alpha; 4]) {
         unsafe { evas_object_text_shadow_color_set(text.raw, 0, 0, 0, 150 * alpha / 255) };
     }
     text.tint([alpha; 4]);
@@ -346,22 +299,6 @@ fn watch(pipe: usize, updates: mpsc::Sender<Catalog>, mut last: Catalog) {
     }
 }
 
-/// An image object showing `pixels` (`width` x `height`, premultiplied).
-unsafe fn picture(evas: *mut c_void, pixels: &[u32], width: i32, height: i32) -> *mut c_void {
-    let image = evas_object_image_filled_add(evas);
-    evas_object_image_size_set(image, width, height);
-    evas_object_image_alpha_set(image, 1);
-    evas_object_image_data_copy_set(image, pixels.as_ptr() as *mut c_void);
-    evas_object_image_data_update_add(image, 0, 0, width, height);
-    evas_object_image_smooth_scale_set(image, 1);
-    evas_object_show(image);
-    image
-}
-
-fn side_of(pixels: &[u32]) -> i32 {
-    (pixels.len() as f64).sqrt().round() as i32
-}
-
 /// A finished icon's pixels (a square, at most [`ICON_SIDE`]): rounded, on a
 /// tile; and its glow colour.
 unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(Vec<u32>, u32)> {
@@ -415,15 +352,7 @@ unsafe fn load_icon(evas: *mut c_void, path: &str) -> Option<(Vec<u32>, u32)> {
 }
 
 unsafe fn text(evas: *mut c_void, size: i32, value: &str) -> *mut c_void {
-    let object = evas_object_text_add(evas);
-    let font = c_string(FONT);
-    evas_object_text_font_set(object, font.as_ptr(), size);
-    evas_object_text_style_set(object, EVAS_TEXT_STYLE_SOFT_SHADOW);
-    evas_object_text_shadow_color_set(object, 0, 0, 0, 150);
-    let value = c_string(value);
-    evas_object_text_text_set(object, value.as_ptr());
-    evas_object_show(object);
-    object
+    kit::text(evas, FONT, size, value, true)
 }
 
 fn initials(title: &str) -> String {

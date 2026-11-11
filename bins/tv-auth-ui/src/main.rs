@@ -1,11 +1,13 @@
 //! `org.tvauth.ui`: the user-launched TV suite manager.
 //!
-//! Two tabs:
+//! A rail of tabs and pages drawn with plain evas objects (`screen.rs`,
+//! from page data built here; see `page.rs`). Three tabs:
 //! - **Store**: the signed Apps2Samsung catalog (see `store.rs`); installs and
 //!   removals go through `tv-authd`'s `pkg.*` like any package's, so every
 //!   change is shown as a prompt by `tv-auth-popupd` first;
 //! - **Permissions**: persistent root grants (toast mode, revoke) and the
-//!   daemon's recent decisions (`grants.audit`).
+//!   daemon's recent decisions (`grants.audit`);
+//! - **Tweaks**: tv-blockd's and tv-patchd's settings.
 //!
 //! It never sends `ui.hello`, so it does not compete with the popup daemon.
 //! It is an ordinary app window (`E_LAYER_CLIENT_NORMAL`), so opening it
@@ -17,6 +19,7 @@
 //! The daemon stages the executable at `/run/tv-auth/ui-bin/tv-auth-ui` (see
 //! `tv-authd`'s `ui_alias.rs`) so launchpad can map it despite UEP.
 
+use screen::{Event as ScreenEvent, Screen};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -33,6 +36,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tv_auth_ui::page::{Block, Card, Chip, Control, Row, Tone};
 use tv_auth_ui::store::{self, App, Group, State};
 use tv_efl::log::log_line;
 use tv_efl::widgets::*;
@@ -43,20 +47,9 @@ use tv_proto::ui::GrantInfo;
 use tv_proto::DEFAULT_SOCKET;
 
 mod dock;
+mod kit;
+mod screen;
 
-const COLOR_BACKGROUND: i32 = 0x10_12_17;
-const COLOR_ROW: i32 = 0x1c_1f_26;
-const COLOR_BUILD_ROW: i32 = 0x16_19_1f;
-/// Rows are appended in chunks as focus approaches the end of the list.
-const CHUNK_ROWS: usize = 16;
-const LOOKAHEAD_ROWS: usize = 6;
-const ICON_SIZE: i32 = 96;
-const DETAIL_ICON_SIZE: i32 = 200;
-/// Inner width available to wrapped text on the details page.
-const DETAIL_TEXT_WIDTH: i32 = 1500;
-/// A Tweaks row's text, beside its button.
-const TWEAK_TEXT_WIDTH: i32 = 1450;
-const DESCRIPTION_CHARS: usize = 110;
 const AUDIT_SHOWN: usize = 8;
 
 /// Downloads and icons live in the app's corner of `/tmp`, which `tv-authd`'s
@@ -100,9 +93,6 @@ const CATEGORIES: &[(&str, &str)] = &[
 
 const APP_ID: &[u8] = b"org.tvauth.ui\0";
 const DELETE_REQUEST: &[u8] = b"delete,request\0";
-const FOCUSED: &[u8] = b"focused\0";
-const CHANGED_USER: &[u8] = b"changed,user\0";
-const GUIDE_PART: &[u8] = b"elm.guide\0";
 
 thread_local! {
     static UI_PTR: Cell<*mut Ui> = const { Cell::new(ptr::null_mut()) };
@@ -123,12 +113,34 @@ enum Tab {
     Tweaks,
 }
 
+/// What a focusable part of a page does on OK.
+#[derive(Clone, Debug, PartialEq)]
+enum Action {
+    Search,
+    Reload,
+    Category(usize),
+    /// A store group's details page.
+    Details(usize),
+    /// Install or update a group's build.
+    Install(usize, usize),
+    /// Open a group's build, or its installed one.
+    Open(usize, Option<usize>),
+    Remove(usize, usize),
+    Notify(usize),
+    Revoke(usize),
+    Refresh,
+    /// A Tweaks key: `hosts`, `group:<id>`, `otn_lock`, `telemetry`,
+    /// `patch:tizentube`, `patch:update`, `patch:custom_home`.
+    Tweak(String),
+    Undo,
+}
+
 /// Results from worker threads.
 enum Job {
     Catalog(Result<Vec<App>, String>),
     Installed(Result<HashMap<String, Installed>, String>),
     /// An icon with this SHA-256 is now cached.
-    Icon(String),
+    Icon,
     Status(String),
     /// Download fraction, or `None` while waiting on the prompt/installer.
     Progress(Option<f64>),
@@ -155,12 +167,9 @@ struct Store {
     query: String,
     /// The app whose details page is open.
     detail: Option<usize>,
-    /// Row key that last had focus, kept across in-place updates.
-    focus_key: Option<usize>,
-    /// The focused button was a row's action (Install/Update/Open/Remove),
-    /// not its Details button.
-    focus_on_action: bool,
-    /// The list row to return to when the details page closes.
+    /// Group indexes in the grid's order (see `Ui::arrange`).
+    order: Vec<usize>,
+    /// The group whose details page was opened from the grid.
     list_key: Option<usize>,
     busy: bool,
     /// Download URL of the build being installed or removed: its rows show
@@ -180,41 +189,11 @@ impl Store {
     }
 }
 
-/// A list row is keyed by its group and build: `(group << 8 | slot) + 1`,
-/// where slot 0 is the group row and `n + 1` its n-th build. The key is also
-/// the button callback data (never 0).
-fn row_key(group: usize, build: Option<usize>) -> usize {
-    ((group << 8) | build.map_or(0, |build| build + 1)) + 1
-}
-
-fn split_key(key: usize) -> (usize, Option<usize>) {
-    let raw = key - 1;
-    (raw >> 8, (raw & 0xff).checked_sub(1))
-}
-
-struct Row {
-    key: usize,
-    widget: *mut c_void,
-    primary: *mut c_void,
-    /// The row's first action button (Install/Update/Open/Remove), if any.
-    action: *mut c_void,
-    icon: Option<(String, *mut c_void)>,
-}
-
-/// The store list, set aside while a details page is shown.
-struct ParkedList {
-    objects: Vec<*mut c_void>,
-    entries: Vec<usize>,
-    rows: Vec<Row>,
-    list_box: *mut c_void,
-    count_label: *mut c_void,
-}
-
 struct Ui {
     window: *mut c_void,
-    status_label: *mut c_void,
-    content_box: *mut c_void,
-    content_objects: Vec<*mut c_void>,
+    screen: Option<Screen<Action>>,
+    /// Focus for the next render (back from a details page).
+    pending_focus: Option<Action>,
 
     broker: Option<BrokerClient>,
     tx: Sender<Event>,
@@ -225,33 +204,15 @@ struct Ui {
     tab: Tab,
     status: String,
     store: Store,
-    /// Keys of every listed row, in order; `rows` holds the rendered prefix.
-    entries: Vec<usize>,
-    rows: Vec<Row>,
-    list_box: *mut c_void,
-    count_label: *mut c_void,
-    parked_list: Option<ParkedList>,
-    /// The on-screen progress bar and its label in the changing build's row,
-    /// if rendered.
-    progress: *mut c_void,
-    progress_label: *mut c_void,
     grants: Vec<GrantInfo>,
     audit: Vec<String>,
     /// tv-blockd's last `status` response.
     tweaks: Option<Value>,
     /// tv-patchd's.
     patch: Option<Value>,
-    /// Toggle keys (`hosts`, `group:<id>`, `otn_lock`, `telemetry`) and
-    /// their rendered buttons, in screen order.
-    tweak_keys: Vec<String>,
-    tweak_buttons: Vec<*mut c_void>,
-    tweak_labels: Vec<*mut c_void>,
-    tweak_summary: *mut c_void,
-    tweak_focus: usize,
     exiting: bool,
     connected: bool,
     app_control_count: u32,
-    focus_notify_label: Option<String>,
 }
 
 impl Ui {
@@ -259,9 +220,8 @@ impl Ui {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         Self {
             window: ptr::null_mut(),
-            status_label: ptr::null_mut(),
-            content_box: ptr::null_mut(),
-            content_objects: Vec::new(),
+            screen: None,
+            pending_focus: None,
             broker: None,
             tx,
             rx,
@@ -270,31 +230,17 @@ impl Ui {
             tab: Tab::Store,
             status: String::new(),
             store: Store::default(),
-            entries: Vec::new(),
-            rows: Vec::new(),
-            list_box: ptr::null_mut(),
-            count_label: ptr::null_mut(),
-            parked_list: None,
-            progress: ptr::null_mut(),
-            progress_label: ptr::null_mut(),
             grants: Vec::new(),
             audit: Vec::new(),
             tweaks: None,
             patch: None,
-            tweak_keys: Vec::new(),
-            tweak_buttons: Vec::new(),
-            tweak_labels: Vec::new(),
-            tweak_summary: ptr::null_mut(),
-            tweak_focus: 0,
             exiting: false,
             connected: false,
             app_control_count: 0,
-            focus_notify_label: None,
         }
     }
 
     fn create_window(&mut self) -> bool {
-        instant_focus_scrolling();
         unsafe {
             let window = elm_win_add(ptr::null_mut(), APP_ID.as_ptr().cast(), ELM_WIN_BASIC);
             if window.is_null() {
@@ -312,59 +258,9 @@ impl Ui {
             evas_object_smart_callback_add(
                 window,
                 DELETE_REQUEST.as_ptr().cast(),
-                on_back,
+                on_delete,
                 ptr::null_mut(),
             );
-            eext_object_event_callback_add(window, EEXT_CALLBACK_BACK, on_back, ptr::null_mut());
-
-            // The stock elm_bg is transparent in the TV theme.
-            let background = create_rect(window, COLOR_BACKGROUND, 255);
-            evas_object_size_hint_weight_set(background, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
-            elm_win_resize_object_add(window, background);
-
-            // panel() pads its inner box; a resize object's own padding hint
-            // is ignored.
-            let (page, main) = panel(window, COLOR_BACKGROUND, 72, 40);
-            evas_object_size_hint_weight_set(page, 1.0, 1.0);
-            evas_object_size_hint_align_set(page, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            evas_object_size_hint_align_set(main, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            elm_box_padding_set(main, 0, 20);
-            elm_win_resize_object_add(window, page);
-
-            let header = create_row(main);
-            elm_box_pack_end(main, header);
-            add_to_box(
-                header,
-                create_label(header, "<font_size=44><b>TV suite</b></font_size>"),
-            );
-            create_button(
-                header,
-                "Store",
-                on_tab_clicked,
-                ptr::without_provenance_mut(1),
-            );
-            create_button(
-                header,
-                "Permissions",
-                on_tab_clicked,
-                ptr::without_provenance_mut(2),
-            );
-            create_button(
-                header,
-                "Tweaks",
-                on_tab_clicked,
-                ptr::without_provenance_mut(3),
-            );
-
-            self.status_label = add_to_box(main, create_label(main, ""));
-
-            self.content_box = elm_box_add(main);
-            evas_object_size_hint_weight_set(self.content_box, 1.0, 1.0);
-            evas_object_size_hint_align_set(self.content_box, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            elm_box_padding_set(self.content_box, 0, 14);
-            elm_box_pack_end(main, self.content_box);
-            evas_object_show(self.content_box);
-
             let (mut width, mut height) = (0, 0);
             elm_win_screen_size_get(
                 window,
@@ -373,11 +269,19 @@ impl Ui {
                 &mut width,
                 &mut height,
             );
-            if width > 0 && height > 0 {
-                evas_object_resize(window, width, height);
-            } else {
-                evas_object_resize(window, 1920, 1080);
+            if width <= 0 || height <= 0 {
+                (width, height) = (1920, 1080);
             }
+            evas_object_resize(window, width, height);
+            let mut screen = Screen::new(window, width, height, on_frame);
+            screen.set_tabs(&[
+                ("Store", true),
+                ("Permissions", true),
+                ("Tweaks", true),
+                ("System", false),
+            ]);
+            self.screen = Some(screen);
+            evas_object_event_callback_add(window, EVAS_CALLBACK_KEY_DOWN, on_key, ptr::null());
 
             ecore_timer_add(0.1, on_timer, ptr::null_mut());
             let events = Notifier::new(self.tx.clone(), Arc::new(|| {}), log_line);
@@ -393,6 +297,7 @@ impl Ui {
             evas_object_show(self.window);
             elm_win_raise(self.window);
             elm_win_activate(self.window);
+            evas_object_focus_set(self.window, 1);
         }
     }
 
@@ -467,13 +372,9 @@ impl Ui {
 
     fn set_status(&mut self, text: impl Into<String>) {
         self.status = text.into();
-        set_text(
-            self.status_label,
-            &format!(
-                "<font_size=24><color=#c9ccd3>{}</color></font_size>",
-                escape(&self.status)
-            ),
-        );
+        if let Some(screen) = self.screen.as_mut() {
+            screen.set_status(&self.status);
+        }
     }
 
     fn on_job(&mut self, job: Job) -> bool {
@@ -486,7 +387,6 @@ impl Ui {
                 );
                 self.store.loaded = true;
                 self.store.arranged = false;
-                self.store.focus_key = None;
                 // Listed once the installed packages are known, so they
                 // can sort first without the list jumping.
                 self.list_installed();
@@ -508,42 +408,35 @@ impl Ui {
                 }
                 if !self.store.arranged {
                     self.store.arranged = true;
-                    return true;
+                    self.arrange();
                 }
-                // Keep order, scroll position and focus: rebuild rows in place.
-                self.refresh_rows();
-                return false;
+                // The order stays; buttons and badges follow the new state.
+                return true;
             }
-            Job::Icon(digest) => {
-                self.show_icon(&digest);
-                return false;
-            }
+            Job::Icon => return self.tab == Tab::Store,
             Job::Status(message) => {
                 self.set_status(message);
                 return false;
             }
             Job::Progress(fraction) => {
                 self.store.progress_value = fraction;
-                self.update_progress();
-                return false;
+                return self.tab == Tab::Store && self.store.detail.is_some();
             }
             Job::Finished(result) => {
                 self.store.busy = false;
                 self.store.changing = None;
-                self.refresh_rows();
                 self.show();
                 self.set_status(result.unwrap_or_else(|error| error));
                 log_line(&self.status);
                 // The row's buttons change once the installed list is back.
                 self.list_installed();
-                return false;
+                return true;
             }
             Job::Audit(lines) => {
                 self.audit = lines;
                 return self.tab == Tab::Permissions;
             }
             Job::Tweaks(service, message, Ok(status)) => {
-                let first = self.tweaks.is_none() && service == Service::Block;
                 let message = message.or_else(|| status["message"].as_str().map(str::to_owned));
                 match service {
                     Service::Block => self.tweaks = Some(status),
@@ -552,15 +445,8 @@ impl Ui {
                 if let Some(message) = message {
                     self.set_status(message);
                 }
-                if self.tab != Tab::Tweaks {
-                    return false;
-                }
-                if first || self.tweak_buttons.is_empty() {
-                    return true;
-                }
-                // In place, so focus and scroll position stay.
-                self.update_tweaks();
-                return false;
+                // Re-rendered in place: focus and scroll position stay.
+                return self.tab == Tab::Tweaks;
             }
             Job::Tweaks(_, _, Err(error)) => {
                 log_line(&error);
@@ -615,7 +501,7 @@ impl Ui {
             for (url, digest) in wanted {
                 match fetch_verified(&url, &digest, 1 << 20, &icon_path(&digest), None) {
                     Ok(_) => {
-                        let _ = jobs.send(Job::Icon(digest));
+                        let _ = jobs.send(Job::Icon);
                     }
                     Err(error) => log_line(&format!("icon {url}: {error}")),
                 }
@@ -636,25 +522,7 @@ impl Ui {
     fn begin_change(&mut self, app: &App, fraction: Option<f64>) {
         self.store.changing = Some(app.url.clone());
         self.store.progress_value = fraction;
-        self.refresh_rows();
-    }
-
-    /// A filled bar with a short label; the TV theme draws nothing for a
-    /// pulsing (indeterminate) bar, so the waiting phase is a full bar and
-    /// words instead.
-    fn update_progress(&mut self) {
-        if self.progress.is_null() {
-            return;
-        }
-        let (fraction, text) = match self.store.progress_value {
-            Some(fraction) => (
-                fraction.clamp(0.0, 1.0),
-                format!("Downloading {:.0}%", fraction.clamp(0.0, 1.0) * 100.0),
-            ),
-            None => (1.0, "Waiting for approval...".to_owned()),
-        };
-        unsafe { elm_progressbar_value_set(self.progress, fraction) };
-        set_text(self.progress_label, &small(&text, "#c9ccd3"));
+        self.render();
     }
 
     fn install(&mut self, app: App) {
@@ -696,437 +564,123 @@ impl Ui {
         self.set_status(status);
     }
 
+    /// Shows the current tab's page; focus stays on the same action.
     fn render(&mut self) {
-        if self.content_box.is_null() {
+        if self.screen.is_none() {
             return;
         }
-        if let Some(parked) = self.parked_list.take() {
-            for object in parked.objects {
-                unsafe { evas_object_del(object) };
-            }
-        }
-        self.clear_content();
-        self.progress = ptr::null_mut();
-        self.progress_label = ptr::null_mut();
-        self.tweak_buttons.clear();
-        self.tweak_labels.clear();
-        self.tweak_summary = ptr::null_mut();
-        let focus = match (self.tab, self.store.detail) {
-            (Tab::Store, Some(group)) => self.render_details(group),
-            (Tab::Store, None) => self.render_store(),
-            (Tab::Permissions, _) => self.render_permissions(),
-            (Tab::Tweaks, _) => self.render_tweaks(),
+        let keep = self.pending_focus.take().or_else(|| {
+            self.screen
+                .as_ref()
+                .and_then(|screen| screen.focused().cloned())
+        });
+        let (title, blocks) = match (self.tab, self.store.detail) {
+            (Tab::Store, Some(group)) => ("Store".to_owned(), self.details_page(group)),
+            (Tab::Store, None) => ("Store".to_owned(), self.store_page()),
+            (Tab::Permissions, _) => ("Permissions".to_owned(), self.permissions_page()),
+            (Tab::Tweaks, _) => ("Tweaks".to_owned(), self.tweaks_page()),
         };
-        self.set_status(self.status.clone());
-        if !focus.is_null() {
-            unsafe { elm_object_focus_set(focus, 1) };
+        let status = self.status.clone();
+        if let Some(screen) = self.screen.as_mut() {
+            screen.set_status(&status);
+            screen.set_page(self.tab as usize, &title, &blocks, keep.as_ref());
         }
     }
 
-    /// Returns the widget to focus.
-    fn render_store(&mut self) -> *mut c_void {
-        let toolbar = create_row(self.content_box);
-        self.add_content(toolbar);
-        self.count_label = add_to_box(toolbar, create_label(toolbar, ""));
-        let search = unsafe {
-            // A scrollable entry resets its own minimum size whenever its
-            // text changes (and the toolbar then squeezes it to nothing), so
-            // size the cell with a fixed transparent rectangle instead.
-            let cell = elm_table_add(toolbar);
-            let sizer = create_rect(cell, 0, 0);
-            evas_object_size_hint_min_set(sizer, 460, 72);
-            elm_table_pack(cell, sizer, 0, 0, 1, 1);
-            let entry = elm_entry_add(cell);
-            elm_entry_single_line_set(entry, 1);
-            elm_entry_scrollable_set(entry, 1);
-            let guide = c_string("Search apps");
-            elm_object_part_text_set(entry, GUIDE_PART.as_ptr().cast(), guide.as_ptr());
-            set_text(entry, &escape(&self.store.query));
-            evas_object_size_hint_weight_set(entry, 1.0, 1.0);
-            evas_object_size_hint_align_set(entry, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            evas_object_smart_callback_add(
-                entry,
-                CHANGED_USER.as_ptr().cast(),
-                on_search_changed,
-                ptr::null_mut(),
-            );
-            elm_table_pack(cell, entry, 0, 0, 1, 1);
-            evas_object_show(entry);
-            evas_object_show(cell);
-            elm_box_pack_end(toolbar, cell);
-            entry
-        };
-        unsafe {
-            let hoversel = elm_hoversel_add(toolbar);
-            elm_hoversel_hover_parent_set(hoversel, self.window);
-            set_text(
-                hoversel,
-                &format!("Category: {}", CATEGORIES[self.store.category].1),
-            );
-            for (index, (_, label)) in CATEGORIES.iter().enumerate() {
-                let label = c_string(label);
-                elm_hoversel_item_add(
-                    hoversel,
-                    label.as_ptr(),
-                    ptr::null(),
-                    ELM_ICON_NONE,
-                    on_category_selected,
-                    ptr::without_provenance(index + 1),
-                );
-            }
-            evas_object_size_hint_min_set(hoversel, 340, 72);
-            elm_box_pack_end(toolbar, hoversel);
-            evas_object_show(hoversel);
-        }
-        create_button(toolbar, "Reload", on_reload_clicked, ptr::null_mut());
-
-        unsafe {
-            let scroller = elm_scroller_add(self.content_box);
-            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
-            elm_scroller_bounce_set(scroller, 0, 0);
-            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
-            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            self.list_box = elm_box_add(scroller);
-            evas_object_size_hint_weight_set(self.list_box, 1.0, 0.0);
-            evas_object_size_hint_align_set(self.list_box, EVAS_HINT_FILL, 0.0);
-            elm_box_padding_set(self.list_box, 0, 14);
-            elm_object_part_content_set(scroller, ptr::null(), self.list_box);
-            evas_object_show(self.list_box);
-            evas_object_show(scroller);
-            self.add_content(scroller);
-        }
-        self.rows.clear();
-        self.rebuild_list();
-        let focus = self
-            .store
-            .focus_key
-            .and_then(|key| self.rows.iter().find(|row| row.key == key))
-            .or_else(|| self.rows.first())
-            .map(|row| row.primary);
-        focus.unwrap_or(search)
-    }
-
-    /// (Re)list the arranged groups for the current category and search,
-    /// keeping the toolbar (and its focus) intact.
-    fn rebuild_list(&mut self) {
-        for row in self.rows.drain(..) {
-            unsafe { evas_object_del(row.widget) };
-        }
-        if self.list_box.is_null() {
-            return;
-        }
-        let order = store::arrange(
+    /// The store's order for the current category and search: installed
+    /// apps first, then by name. It is kept until the filter changes, so an
+    /// install does not reshuffle the grid under the user.
+    fn arrange(&mut self) {
+        self.store.order = store::arrange(
             &self.store.groups,
             &self.store.versions(),
             CATEGORIES[self.store.category].0,
             &self.store.query,
         );
-        self.entries.clear();
-        for &group in &order {
-            self.entries.push(row_key(group, None));
-        }
-        set_text(
-            self.count_label,
-            &small(&format!("{} apps", order.len()), "#8a8f99"),
-        );
-        let focus = self
-            .store
-            .focus_key
-            .and_then(|key| self.entries.iter().position(|&entry| entry == key))
-            .unwrap_or(0);
-        self.append_rows(focus + CHUNK_ROWS);
-        if self.entries.is_empty() && self.store.loaded {
-            let label = create_label(self.list_box, &small("No apps match.", "#8a8f99"));
-            add_to_box(self.list_box, label);
-            self.rows.push(Row {
-                key: 0,
-                widget: label,
-                primary: ptr::null_mut(),
-                action: ptr::null_mut(),
-                icon: None,
-            });
-        }
     }
 
-    /// Render entries up to `upto` (exclusive) at the end of the list.
-    fn append_rows(&mut self, upto: usize) {
-        let end = upto.min(self.entries.len());
+    fn store_page(&mut self) -> Vec<Block<Action>> {
+        let mut blocks = vec![
+            Block::Toolbar {
+                field: (
+                    self.store.query.clone(),
+                    "Search apps".into(),
+                    Action::Search,
+                ),
+                buttons: vec![("Reload".into(), Action::Reload)],
+            },
+            Block::Chips(
+                CATEGORIES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, label))| Chip {
+                        label: (*label).into(),
+                        on: index == self.store.category,
+                        action: Action::Category(index),
+                    })
+                    .collect(),
+            ),
+        ];
+        if !self.store.loaded {
+            return blocks;
+        }
+        if !self.store.arranged {
+            return blocks;
+        }
+        let versions = self.store.versions();
         let mut icons = Vec::new();
-        while self.rows.len() < end {
-            let key = self.entries[self.rows.len()];
-            let row = self.build_row(key, ptr::null_mut());
-            icons.extend(self.row_icon(key));
-            self.rows.push(row);
+        let mut cards = Vec::new();
+        for &group_index in &self.store.order {
+            let group = &self.store.groups[group_index];
+            icons.extend(group.icon.clone());
+            let installed = group.variants.iter().find_map(|app| {
+                versions
+                    .get(&app.package_id)
+                    .map(|version| (app, version, store::state(app, &versions)))
+            });
+            let (subtitle, badge) = match installed {
+                Some((_, _, State::Upgradable { .. })) => {
+                    (String::new(), Some("Update available".into()))
+                }
+                Some((_, version, _)) => (format!("v{version} installed"), None),
+                None if group.variants.len() > 1 => {
+                    (format!("{} builds", group.variants.len()), None)
+                }
+                None => (
+                    group
+                        .variants
+                        .first()
+                        .map_or(String::new(), |app| format!("v{}", app.version)),
+                    None,
+                ),
+            };
+            cards.push(Card {
+                icon: group
+                    .icon
+                    .as_ref()
+                    .map(|(_, digest)| icon_path(digest).to_string_lossy().into_owned()),
+                title: group.name.clone(),
+                subtitle,
+                badge,
+                action: Action::Details(group_index),
+            });
+        }
+        blocks.push(Block::Section(format!("{} apps", cards.len())));
+        if cards.is_empty() {
+            blocks.push(Block::Paragraph {
+                markup: "No apps match.".into(),
+                size: 26,
+            });
+        } else {
+            blocks.push(Block::Grid(cards));
         }
         self.fetch_icons(icons);
+        blocks
     }
 
-    fn row_icon(&self, key: usize) -> Option<(String, String)> {
-        if self.store.detail.is_some() {
-            return None;
-        }
-        let (group, build) = split_key(key);
-        match build {
-            None => self.store.groups[group].icon.clone(),
-            Some(_) => None,
-        }
-    }
-
-    /// The single app behind a row: a build row, or a group with one build.
-    fn row_app(&self, key: usize) -> Option<&App> {
-        let (group, build) = split_key(key);
-        let variants = &self.store.groups.get(group)?.variants;
-        match build {
-            Some(build) => variants.get(build),
-            None if variants.len() == 1 => variants.first(),
-            None => None,
-        }
-    }
-
-    /// Build one row and pack it after `after` (or at the end when null).
-    fn build_row(&mut self, key: usize, after: *mut c_void) -> Row {
-        let (group_index, build) = split_key(key);
+    fn details_page(&mut self, group_index: usize) -> Vec<Block<Action>> {
         let group = self.store.groups[group_index].clone();
         let versions = self.store.versions();
-        let (row, row_box) = panel(
-            self.list_box,
-            if build.is_some() {
-                COLOR_BUILD_ROW
-            } else {
-                COLOR_ROW
-            },
-            24,
-            if build.is_some() { 8 } else { 12 },
-        );
-        unsafe {
-            if after.is_null() {
-                elm_box_pack_end(self.list_box, row);
-            } else {
-                elm_box_pack_after(self.list_box, row, after);
-            }
-            elm_box_horizontal_set(row_box, 1);
-            elm_box_padding_set(row_box, 24, 0);
-        }
-        let mut icon = None;
-        if build.is_none() {
-            let image = unsafe {
-                let image = elm_image_add(row_box);
-                evas_object_size_hint_min_set(image, ICON_SIZE, ICON_SIZE);
-                evas_object_show(image);
-                image
-            };
-            if let Some((_, digest)) = &group.icon {
-                set_image_file(image, &icon_path(digest));
-                icon = Some((digest.clone(), image));
-            }
-            add_to_box(row_box, image);
-        } else {
-            // Indent builds under their app.
-            let spacer = create_rect(row_box, COLOR_BUILD_ROW, 255);
-            unsafe { evas_object_size_hint_min_set(spacer, ICON_SIZE, 1) };
-            add_to_box(row_box, spacer);
-        }
-
-        let data = ptr::without_provenance_mut(key);
-        let mut buttons = Vec::new();
-        let in_list = build.is_none();
-        // Rows of the build being changed show progress instead of actions.
-        let changing = self
-            .store
-            .changing
-            .as_ref()
-            .is_some_and(|url| match self.row_app(key) {
-                Some(app) => &app.url == url,
-                None => group.variants.iter().any(|app| &app.url == url),
-            });
-        match self.row_app(key).cloned() {
-            Some(app) => {
-                let state = store::state(&app, &versions);
-                let mut facts = vec![
-                    state_text(&app, &state),
-                    app.pkg_type.to_uppercase(),
-                    format_size(app.size),
-                ];
-                if app.partner {
-                    facts.push("partner".into());
-                }
-                let markup = if build.is_some() {
-                    let title = if app.variant.is_empty() {
-                        &app.name
-                    } else {
-                        &app.variant
-                    };
-                    format!(
-                        "<font_size=26><b>{}</b></font_size><br/>{}",
-                        escape(&shorten(title, 70, false)),
-                        small(&facts.join(" \u{00b7} "), "#8a8f99")
-                    )
-                } else {
-                    format!(
-                        "<font_size=28><b>{}</b></font_size>  {}<br/>{}",
-                        escape(&shorten(&group.name, 48, false)),
-                        small(&facts.join(" \u{00b7} "), "#8a8f99"),
-                        small(
-                            &shorten(&group.description, DESCRIPTION_CHARS, false),
-                            "#b4b9c2"
-                        )
-                    )
-                };
-                add_to_box(row_box, create_label(row_box, &markup));
-                if in_list {
-                    buttons.push(create_button(row_box, "Details", on_details_clicked, data));
-                }
-                // In the list, an app that is not installed only offers
-                // Details; installing happens on its page.
-                if !changing && !(in_list && state == State::NotInstalled) {
-                    buttons.push(match state {
-                        State::NotInstalled => {
-                            create_button(row_box, "Install", on_install_clicked, data)
-                        }
-                        State::Upgradable { .. } => {
-                            create_button(row_box, "Update", on_install_clicked, data)
-                        }
-                        State::Installed | State::Newer { .. } => {
-                            create_button(row_box, "Open", on_open_clicked, data)
-                        }
-                    });
-                    if !in_list && !matches!(state, State::NotInstalled) {
-                        buttons.push(create_button(row_box, "Remove", on_remove_clicked, data));
-                    }
-                }
-            }
-            None => {
-                // An app with several builds: a summary; builds are on its
-                // details page.
-                let installed = group
-                    .variants
-                    .iter()
-                    .find_map(|app| versions.get(&app.package_id));
-                let mut facts = vec![format!("{} builds", group.variants.len())];
-                if let Some(version) = installed {
-                    facts.push(format!("v{version} installed"));
-                }
-                add_to_box(
-                    row_box,
-                    create_label(
-                        row_box,
-                        &format!(
-                            "<font_size=28><b>{}</b></font_size>  {}<br/>{}",
-                            escape(&shorten(&group.name, 48, false)),
-                            small(&facts.join(" \u{00b7} "), "#8a8f99"),
-                            small(
-                                &shorten(&group.description, DESCRIPTION_CHARS, false),
-                                "#b4b9c2"
-                            )
-                        ),
-                    ),
-                );
-                buttons.push(create_button(row_box, "Details", on_details_clicked, data));
-                if installed.is_some() && !changing {
-                    buttons.push(create_button(row_box, "Open", on_open_clicked, data));
-                }
-            }
-        };
-        if changing {
-            unsafe {
-                let column = elm_box_add(row_box);
-                elm_box_padding_set(column, 0, 6);
-                evas_object_size_hint_min_set(column, 360, 1);
-                evas_object_size_hint_weight_set(column, 0.0, 0.0);
-                evas_object_size_hint_align_set(column, 0.5, 0.5);
-                let label = create_label(column, "");
-                elm_box_pack_end(column, label);
-                let bar = elm_progressbar_add(column);
-                evas_object_size_hint_min_set(bar, 360, 24);
-                evas_object_size_hint_align_set(bar, EVAS_HINT_FILL, 0.5);
-                elm_box_pack_end(column, bar);
-                evas_object_show(bar);
-                elm_box_pack_end(row_box, column);
-                evas_object_show(column);
-                self.progress = bar;
-                self.progress_label = label;
-            }
-            self.update_progress();
-        }
-        let has_details = in_list || self.row_app(key).is_none();
-        for (index, button) in buttons.iter().enumerate() {
-            let is_action = !(has_details && index == 0);
-            unsafe {
-                evas_object_smart_callback_add(
-                    *button,
-                    FOCUSED.as_ptr().cast(),
-                    if is_action {
-                        on_action_focused
-                    } else {
-                        on_row_focused
-                    },
-                    data,
-                );
-            }
-        }
-        let action = buttons
-            .get(usize::from(has_details))
-            .copied()
-            .unwrap_or(ptr::null_mut());
-        Row {
-            key,
-            widget: row,
-            primary: buttons.first().copied().unwrap_or(ptr::null_mut()),
-            action,
-            icon,
-        }
-    }
-
-    /// Re-create every rendered row in place (states changed), keeping the
-    /// order, scroll position and focus.
-    fn refresh_rows(&mut self) {
-        for index in 0..self.rows.len() {
-            let old_key = self.rows[index].key;
-            if old_key == 0 {
-                continue;
-            }
-            let old = self.rows[index].widget;
-            let row = self.build_row(old_key, old);
-            let focused = self.store.focus_key == Some(old_key);
-            // Focusing below fires the row's focus callback, which would
-            // forget which button the user was on.
-            let on_action = self.store.focus_on_action;
-            // Back onto the button the user pressed (it may have become
-            // Open, or a progress bar; then the row's first button).
-            let target = if self.store.focus_on_action && !row.action.is_null() {
-                row.action
-            } else {
-                row.primary
-            };
-            unsafe {
-                evas_object_del(old);
-                if focused && !target.is_null() {
-                    elm_object_focus_set(target, 1);
-                }
-            }
-            self.store.focus_on_action = on_action;
-            self.rows[index] = row;
-        }
-    }
-
-    /// The details page: what the catalog says about one app, and its builds
-    /// with their actions. Returns the widget to focus.
-    fn render_details(&mut self, group_index: usize) -> *mut c_void {
-        let group = self.store.groups[group_index].clone();
-        let versions = self.store.versions();
-        let (header, header_box) = panel(self.content_box, COLOR_ROW, 32, 24);
-        self.add_content(header);
-        unsafe {
-            elm_box_horizontal_set(header_box, 1);
-            elm_box_padding_set(header_box, 32, 0);
-            let image = elm_image_add(header_box);
-            evas_object_size_hint_min_set(image, DETAIL_ICON_SIZE, DETAIL_ICON_SIZE);
-            evas_object_show(image);
-            if let Some((_, digest)) = &group.icon {
-                set_image_file(image, &icon_path(digest));
-            }
-            elm_box_pack_end(header_box, image);
-        }
         let installed = group
             .variants
             .iter()
@@ -1145,27 +699,21 @@ impl Ui {
             facts.push(format!("v{version} installed"));
         }
         let mut info = Vec::new();
-        let ids: Vec<&str> = {
-            let mut ids: Vec<&str> = group
-                .variants
-                .iter()
-                .map(|app| app.package_id.as_str())
-                .collect();
-            ids.dedup();
-            ids
-        };
+        let mut ids: Vec<&str> = group
+            .variants
+            .iter()
+            .map(|app| app.package_id.as_str())
+            .collect();
+        ids.dedup();
         info.push(format!("Package {}", ids.join(", ")));
-        let repos: Vec<&str> = {
-            let mut repos: Vec<&str> = group
-                .variants
-                .iter()
-                .map(|app| app.repo.as_str())
-                .filter(|repo| !repo.is_empty())
-                .collect();
-            repos.sort_unstable();
-            repos.dedup();
-            repos
-        };
+        let mut repos: Vec<&str> = group
+            .variants
+            .iter()
+            .map(|app| app.repo.as_str())
+            .filter(|repo| !repo.is_empty())
+            .collect();
+        repos.sort_unstable();
+        repos.dedup();
         if !repos.is_empty() {
             info.push(format!("Source github.com/{}", repos.join(", github.com/")));
         }
@@ -1188,224 +736,150 @@ impl Ui {
         if group.variants.iter().any(|app| app.partner) {
             flags.push("needs a Partner certificate");
         }
-        let text = create_label(
-            header_box,
-            &format!(
-                "<font_size=44><b>{}</b></font_size><br/>{}<br/><br/>\
-                 <font_size=24><color=#e8e8e8>{}</color></font_size><br/><br/>{}{}",
-                escape(&group.name),
-                small(&facts.join(" \u{00b7} "), "#8a8f99"),
-                escape(&group.description),
-                info.iter()
-                    .map(|line| small(line, "#b4b9c2"))
-                    .collect::<Vec<_>>()
-                    .join("<br/>"),
-                if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("<br/>{}", small(&flags.join(" \u{00b7} "), "#ffb74d"))
+        let mut details = info
+            .iter()
+            .map(|line| format!("<muted>{}</muted>", escape(line)))
+            .collect::<Vec<_>>()
+            .join("<br/>");
+        if !flags.is_empty() {
+            details.push_str(&format!(
+                "<br/><warn>{}</warn>",
+                escape(&flags.join(" \u{00b7} "))
+            ));
+        }
+        let rows = group
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(build, app)| {
+                let state = store::state(app, &versions);
+                let mut facts = vec![
+                    state_text(app, &state),
+                    app.pkg_type.to_uppercase(),
+                    format_size(app.size),
+                ];
+                if app.partner {
+                    facts.push("partner".into());
                 }
-            ),
-        );
-        unsafe { elm_label_wrap_width_set(text, DETAIL_TEXT_WIDTH - DETAIL_ICON_SIZE) };
-        add_to_box(header_box, text);
-
-        self.add_content(create_label(
-            self.content_box,
-            &small(
-                if group.variants.len() == 1 {
-                    "BUILD"
+                let title = if app.variant.is_empty() {
+                    &app.name
                 } else {
-                    "BUILDS"
-                },
-                "#8a8f99",
-            ),
-        ));
-        unsafe {
-            let scroller = elm_scroller_add(self.content_box);
-            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
-            elm_scroller_bounce_set(scroller, 0, 0);
-            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
-            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            self.list_box = elm_box_add(scroller);
-            evas_object_size_hint_weight_set(self.list_box, 1.0, 0.0);
-            evas_object_size_hint_align_set(self.list_box, EVAS_HINT_FILL, 0.0);
-            elm_box_padding_set(self.list_box, 0, 10);
-            elm_object_part_content_set(scroller, ptr::null(), self.list_box);
-            evas_object_show(self.list_box);
-            evas_object_show(scroller);
-            self.add_content(scroller);
-        }
-        self.rows.clear();
-        self.entries = (0..group.variants.len())
-            .map(|build| row_key(group_index, Some(build)))
+                    &app.variant
+                };
+                let mut row = Row::text(title.clone(), facts.join(" \u{00b7} "));
+                if self.store.changing.as_ref() == Some(&app.url) {
+                    let (fraction, text) = match self.store.progress_value {
+                        Some(fraction) => (
+                            fraction.clamp(0.0, 1.0) as f32,
+                            format!("Downloading {:.0}%", fraction.clamp(0.0, 1.0) * 100.0),
+                        ),
+                        None => (1.0, "Waiting for approval...".to_owned()),
+                    };
+                    row.controls.push(Control::Progress { fraction, text });
+                } else {
+                    let main = match state {
+                        State::NotInstalled => ("Install", Action::Install(group_index, build)),
+                        State::Upgradable { .. } => ("Update", Action::Install(group_index, build)),
+                        State::Installed | State::Newer { .. } => {
+                            ("Open", Action::Open(group_index, Some(build)))
+                        }
+                    };
+                    row.controls.push(Control::Button {
+                        label: main.0.into(),
+                        tone: Tone::Primary,
+                        action: main.1,
+                    });
+                    if !matches!(state, State::NotInstalled) {
+                        row.controls.push(Control::Button {
+                            label: "Remove".into(),
+                            tone: Tone::Danger,
+                            action: Action::Remove(group_index, build),
+                        });
+                    }
+                }
+                row
+            })
             .collect();
-        self.append_rows(self.entries.len());
-        self.rows
-            .iter()
-            .map(|row| row.primary)
-            .find(|primary| !primary.is_null())
-            .unwrap_or(ptr::null_mut())
+        vec![
+            Block::Header {
+                icon: group
+                    .icon
+                    .as_ref()
+                    .map(|(_, digest)| icon_path(digest).to_string_lossy().into_owned()),
+                title: group.name.clone(),
+                facts: facts.join(" \u{00b7} "),
+            },
+            Block::Paragraph {
+                markup: escape(&group.description),
+                size: 26,
+            },
+            Block::Paragraph {
+                markup: details,
+                size: 22,
+            },
+            Block::Section(if group.variants.len() == 1 {
+                "Build".into()
+            } else {
+                "Builds".into()
+            }),
+            Block::Rows(rows),
+        ]
     }
 
-    /// Open an app's details page. The list stays alive (unpacked and
-    /// hidden) so closing the page restores it exactly: scroll position,
-    /// loaded rows and focus.
-    fn open_details(&mut self, key: usize) {
-        let (group, _) = split_key(key);
-        self.store.list_key = Some(row_key(group, None));
-        self.store.focus_key = None;
-        self.store.detail = Some(group);
-        let objects = std::mem::take(&mut self.content_objects);
-        for &object in &objects {
-            unsafe {
-                elm_box_unpack(self.content_box, object);
-                evas_object_hide(object);
-            }
-        }
-        self.parked_list = Some(ParkedList {
-            objects,
-            entries: std::mem::take(&mut self.entries),
-            rows: std::mem::take(&mut self.rows),
-            list_box: self.list_box,
-            count_label: self.count_label,
-        });
-        self.progress = ptr::null_mut();
-        self.progress_label = ptr::null_mut();
-        let focus = self.render_details(group);
-        if !focus.is_null() {
-            unsafe { elm_object_focus_set(focus, 1) };
-        }
-    }
-
-    /// Back to the list, focused on the app whose details were open.
-    fn close_details(&mut self) {
-        self.store.detail = None;
-        self.store.focus_key = self.store.list_key.take();
-        self.store.focus_on_action = false;
-        let Some(parked) = self.parked_list.take() else {
-            self.render();
-            return;
-        };
-        // The details rows die with their scroller.
-        self.rows.clear();
-        self.clear_content();
-        for &object in &parked.objects {
-            unsafe {
-                elm_box_pack_end(self.content_box, object);
-                evas_object_show(object);
-            }
-        }
-        self.content_objects = parked.objects;
-        self.entries = parked.entries;
-        self.rows = parked.rows;
-        self.list_box = parked.list_box;
-        self.count_label = parked.count_label;
-        self.progress = ptr::null_mut();
-        self.progress_label = ptr::null_mut();
-        // Installs or removals on the details page changed some rows'
-        // buttons; rebuilding in place also refocuses the app's row.
-        self.refresh_rows();
-    }
-
-    /// Focus moved to a row: remember it, and extend the list before the
-    /// user reaches its end.
-    fn row_focused(&mut self, key: usize) {
-        self.store.focus_key = Some(key);
-        let rendered = self.rows.len();
-        if let Some(position) = self.entries.iter().position(|&entry| entry == key) {
-            if position + LOOKAHEAD_ROWS >= rendered {
-                self.append_rows(rendered + CHUNK_ROWS);
-            }
-        }
-    }
-
-    fn show_icon(&mut self, digest: &str) {
-        let path = icon_path(digest);
-        for (_, image) in self
-            .rows
-            .iter()
-            .filter_map(|row| row.icon.as_ref())
-            .filter(|(d, _)| d == digest)
-        {
-            set_image_file(*image, &path);
-        }
-    }
-
-    fn render_permissions(&mut self) -> *mut c_void {
+    fn permissions_page(&mut self) -> Vec<Block<Action>> {
+        let mut blocks = Vec::new();
         if !self.connected {
-            self.add_content(create_label(
-                self.content_box,
-                &small(
-                    "Not connected to tv-authd. Retrying automatically.",
-                    "#ffb74d",
-                ),
-            ));
+            blocks.push(Block::Paragraph {
+                markup: "<warn>Not connected to tv-authd. Retrying automatically.</warn>".into(),
+                size: 24,
+            });
         }
-        self.add_content(create_label(
-            self.content_box,
-            &small(
-                "Apps listed here can run commands as root without asking.",
-                "#8a8f99",
-            ),
+        blocks.push(Block::Section(
+            "Apps that run commands as root without asking".into(),
         ));
-        let mut focus: *mut c_void = ptr::null_mut();
-        if self.grants.is_empty() {
-            self.add_content(create_label(
-                self.content_box,
-                "<font_size=28><b>No apps have permanent root access</b></font_size>",
-            ));
-        }
-        for (index, grant) in self.grants.clone().iter().take(5).enumerate() {
-            let (row, row_box) = panel(self.content_box, COLOR_ROW, 32, 16);
-            self.add_content(row);
-            unsafe {
-                elm_box_horizontal_set(row_box, 1);
-                elm_box_padding_set(row_box, 24, 0);
-            }
-            add_to_box(
-                row_box,
-                create_label(
-                    row_box,
-                    &format!(
-                        "<font_size=28><b>{}</b></font_size><br/>{}<br/>{}",
-                        escape(&grant.package),
-                        small(&grant.label, "#8a8f99"),
-                        small(&notify_description(&grant.notify), "#b4b9c2")
-                    ),
-                ),
-            );
-            let data = ptr::without_provenance_mut(index + 1);
-            let notify = create_button(
-                row_box,
-                &notify_button_text(&grant.notify),
-                on_notify_clicked,
-                data,
-            );
-            unsafe { evas_object_size_hint_min_set(notify, 320, 84) };
-            create_button(row_box, "Revoke", on_revoke_clicked, data);
-            // Default focus on the harmless toggle, not Revoke.
-            if self.focus_notify_label.as_deref() == Some(grant.label.as_str()) || focus.is_null() {
-                focus = notify;
-            }
-        }
-        if self.grants.len() > 5 {
-            self.add_content(create_label(
-                self.content_box,
-                &small(
-                    &format!("Only the first 5 of {} apps are shown.", self.grants.len()),
-                    "#8a8f99",
-                ),
-            ));
-        }
-
-        let footer = create_row(self.content_box);
-        self.add_content(footer);
-        add_to_box(
-            footer,
-            create_label(footer, "<font_size=28><b>Recent activity</b></font_size>"),
-        );
-        let refresh = create_button(footer, "Refresh", on_refresh_clicked, ptr::null_mut());
+        let rows = if self.grants.is_empty() {
+            vec![Row::text(
+                "No apps have permanent root access",
+                "Apps you allow for good on a prompt appear here.",
+            )]
+        } else {
+            self.grants
+                .iter()
+                .enumerate()
+                .map(|(index, grant)| {
+                    let mut row = Row::text(
+                        grant.package.clone(),
+                        format!(
+                            "{} \u{00b7} {}",
+                            grant.label,
+                            notify_description(&grant.notify)
+                        ),
+                    );
+                    row.controls = vec![
+                        Control::Button {
+                            label: notify_button_text(&grant.notify),
+                            tone: Tone::Normal,
+                            action: Action::Notify(index),
+                        },
+                        Control::Button {
+                            label: "Revoke".into(),
+                            tone: Tone::Danger,
+                            action: Action::Revoke(index),
+                        },
+                    ];
+                    row
+                })
+                .collect()
+        };
+        blocks.push(Block::Rows(rows));
+        blocks.push(Block::Section("Recent activity".into()));
+        let mut header = Row::text("Root decisions", "Newest first, from tv-authd's audit log");
+        header.controls.push(Control::Button {
+            label: "Refresh".into(),
+            tone: Tone::Normal,
+            action: Action::Refresh,
+        });
+        blocks.push(Block::Rows(vec![header]));
         let now = unix_now();
         let lines: Vec<String> = self
             .audit
@@ -1414,23 +888,233 @@ impl Ui {
             .take(AUDIT_SHOWN)
             .map(|line| audit_markup(line, now))
             .collect();
-        self.add_content(create_label(
-            self.content_box,
-            &if lines.is_empty() {
-                small("No recent decisions.", "#8a8f99")
+        blocks.push(Block::Paragraph {
+            markup: if lines.is_empty() {
+                "<muted>No recent decisions.</muted>".into()
             } else {
                 lines.join("<br/>")
             },
-        ));
-        if focus.is_null() {
-            refresh
-        } else {
-            focus
+            size: 22,
+        });
+        blocks
+    }
+
+    fn tweaks_page(&mut self) -> Vec<Block<Action>> {
+        match &self.tweaks {
+            Some(status) => tweak_page(status, self.patch.as_ref()),
+            None => vec![Block::Paragraph {
+                markup: "<muted>Asking tv-blockd...</muted>".into(),
+                size: 24,
+            }],
         }
     }
 
-    /// Send tv-blockd a request (`status` by default); `message` is shown
-    /// once it succeeds.
+    fn switch_tab(&mut self, tab: Tab) {
+        self.store.detail = None;
+        self.status.clear();
+        self.tab = tab;
+        match tab {
+            Tab::Permissions => self.refresh_grants(),
+            Tab::Tweaks => {
+                self.load_tweaks(Service::Block, None, None);
+                self.load_tweaks(Service::Patch, None, None);
+            }
+            Tab::Store => {}
+        }
+        self.render();
+    }
+
+    fn key(&mut self, key: &str) {
+        let Some(screen) = self.screen.as_mut() else {
+            return;
+        };
+        match screen.key(key) {
+            ScreenEvent::None => {}
+            ScreenEvent::Action(action) => self.act(action),
+            ScreenEvent::Tab(index) => {
+                let tab = [Tab::Store, Tab::Permissions, Tab::Tweaks]
+                    .get(index)
+                    .copied();
+                if let Some(tab) = tab {
+                    self.switch_tab(tab);
+                }
+            }
+            ScreenEvent::Back { in_rail: true } => self.exit_now(),
+            ScreenEvent::Back { in_rail: false } => {
+                if self.tab == Tab::Store && self.store.detail.is_some() {
+                    self.store.detail = None;
+                    self.pending_focus = self.store.list_key.take().map(Action::Details);
+                    self.render();
+                } else if let Some(screen) = self.screen.as_mut() {
+                    screen.focus_rail();
+                }
+            }
+        }
+    }
+
+    /// The single app behind an action: a build, or a group's installed
+    /// build.
+    fn app_for(&self, group: usize, build: Option<usize>) -> Option<App> {
+        let variants = &self.store.groups.get(group)?.variants;
+        match build {
+            Some(build) => variants.get(build).cloned(),
+            None => variants
+                .iter()
+                .find(|app| self.store.installed.contains_key(&app.package_id))
+                .cloned(),
+        }
+    }
+
+    fn act(&mut self, action: Action) {
+        match action {
+            Action::Search => {
+                let query = self.store.query.clone();
+                if let Some(screen) = self.screen.as_mut() {
+                    screen.start_field(&query, on_field_done);
+                }
+            }
+            Action::Reload => {
+                self.store.icons_requested.clear();
+                self.load_catalog();
+                self.render();
+            }
+            Action::Category(index) => {
+                self.store.category = index.min(CATEGORIES.len() - 1);
+                self.arrange();
+                self.render();
+            }
+            Action::Details(group) => {
+                self.store.list_key = Some(group);
+                self.store.detail = Some(group);
+                self.render();
+            }
+            Action::Install(group, build) => {
+                if let Some(app) = self.app_for(group, Some(build)) {
+                    log_line(&format!("install clicked {}", app.package_id));
+                    self.install(app);
+                }
+            }
+            Action::Open(group, build) => {
+                if let Some(app) = self.app_for(group, build) {
+                    self.open(&app);
+                }
+            }
+            Action::Remove(group, build) => {
+                if let Some(app) = self.app_for(group, Some(build)) {
+                    log_line(&format!("remove clicked {}", app.package_id));
+                    self.uninstall(app);
+                }
+            }
+            Action::Notify(index) => {
+                let Some((label, next)) = self
+                    .grants
+                    .get(index)
+                    .map(|grant| (grant.label.clone(), next_notify(&grant.notify)))
+                else {
+                    return;
+                };
+                log_line(&format!("notify clicked {label} -> {next}"));
+                if let Some(broker) = &self.broker {
+                    broker.set_notify(&label, &next);
+                }
+            }
+            Action::Revoke(index) => {
+                let Some(label) = self.grants.get(index).map(|grant| grant.label.clone()) else {
+                    return;
+                };
+                log_line(&format!("revoke clicked {label}"));
+                self.set_status(format!("Revoking {label}..."));
+                if let Some(broker) = &self.broker {
+                    broker.revoke(&label);
+                }
+            }
+            Action::Refresh => {
+                self.set_status("Refreshing...");
+                self.refresh_grants();
+            }
+            Action::Tweak(key) => self.apply_tweak(&key),
+            Action::Undo => {
+                self.set_status("Undoing...");
+                self.load_tweaks(Service::Patch, Some(json!({"method": "undo"})), None);
+                self.load_tweaks(
+                    Service::Block,
+                    Some(json!({"method": "undo"})),
+                    Some("Everything the suite changed is undone."),
+                );
+            }
+        }
+    }
+
+    fn apply_tweak(&mut self, key: &str) {
+        match key {
+            "patch:update" => {
+                self.set_status("Checking for a TizenTube update...");
+                self.load_tweaks(Service::Patch, Some(json!({"method": "update"})), None);
+                return;
+            }
+            "patch:tizentube" | "patch:custom_home" => {
+                let field = &key["patch:".len()..];
+                // `set` replaces the whole config: keep the other settings.
+                let mut config = self
+                    .patch
+                    .as_ref()
+                    .map_or_else(|| json!({}), |patch| patch["config"].clone());
+                let on = config[field] == true;
+                config[field] = json!(!on);
+                let message = match (field, on) {
+                    ("tizentube", true) => "TizenTube is off; YouTube is back to normal.",
+                    ("tizentube", false) => "TizenTube is on. Open YouTube to use it.",
+                    (_, true) => "Custom Home is off; the Home key opens Samsung's Home.",
+                    (_, false) => "Custom Home is on; press Home for the dock.",
+                };
+                self.set_status("Applying...");
+                self.load_tweaks(
+                    Service::Patch,
+                    Some(json!({"method": "set", "config": config})),
+                    Some(message),
+                );
+                return;
+            }
+            _ => {}
+        }
+        let Some(status) = &self.tweaks else { return };
+        let mut config = status["config"].clone();
+        match key.strip_prefix("group:") {
+            Some(id) => {
+                if let Some(groups) = config["groups"].as_array_mut() {
+                    if let Some(position) = groups.iter().position(|value| value == id) {
+                        groups.remove(position);
+                    } else {
+                        groups.push(json!(id));
+                    }
+                }
+            }
+            None => {
+                let on = config[key] == true;
+                config[key] = json!(!on);
+            }
+        }
+        self.set_status("Applying...");
+        self.load_tweaks(
+            Service::Block,
+            Some(json!({"method": "set", "config": config})),
+            Some("Saved and applied."),
+        );
+    }
+
+    fn field_done(&mut self) {
+        let Some(text) = self.screen.as_mut().and_then(Screen::finish_field) else {
+            return;
+        };
+        if text != self.store.query {
+            self.store.query = text;
+            self.arrange();
+        }
+        self.render();
+    }
+
+    /// Sends a Tweaks daemon a request (`status` by default); `message` is
+    /// shown once it succeeds.
     fn load_tweaks(
         &mut self,
         service: Service,
@@ -1461,119 +1145,6 @@ impl Ui {
         });
     }
 
-    /// Returns the widget to focus.
-    fn render_tweaks(&mut self) -> *mut c_void {
-        let Some(status) = self.tweaks.clone() else {
-            self.add_content(create_label(
-                self.content_box,
-                &small("Asking tv-blockd...", "#8a8f99"),
-            ));
-            return ptr::null_mut();
-        };
-        self.tweak_summary = create_label(self.content_box, &tweaks_summary(&status));
-        self.add_content(self.tweak_summary);
-        let list = unsafe {
-            let scroller = elm_scroller_add(self.content_box);
-            elm_scroller_policy_set(scroller, ELM_SCROLLER_POLICY_OFF, ELM_SCROLLER_POLICY_OFF);
-            elm_scroller_bounce_set(scroller, 0, 0);
-            evas_object_size_hint_weight_set(scroller, 1.0, 1.0);
-            evas_object_size_hint_align_set(scroller, EVAS_HINT_FILL, EVAS_HINT_FILL);
-            let list = elm_box_add(scroller);
-            evas_object_size_hint_weight_set(list, 1.0, 0.0);
-            evas_object_size_hint_align_set(list, EVAS_HINT_FILL, 0.0);
-            elm_box_padding_set(list, 0, 10);
-            elm_object_part_content_set(scroller, ptr::null(), list);
-            evas_object_show(list);
-            evas_object_show(scroller);
-            self.add_content(scroller);
-            list
-        };
-        self.tweak_keys.clear();
-        for (index, tweak) in tweaks(&status, self.patch.as_ref()).into_iter().enumerate() {
-            let (row, row_box) = panel(list, COLOR_ROW, 32, 12);
-            unsafe {
-                elm_box_pack_end(list, row);
-                elm_box_horizontal_set(row_box, 1);
-                elm_box_padding_set(row_box, 24, 0);
-            }
-            let text = add_to_box(row_box, create_label(row_box, &tweak_markup(&tweak)));
-            self.tweak_labels.push(text);
-            // Nested word-wrapped labels otherwise size to their full line.
-            unsafe { elm_label_wrap_width_set(text, TWEAK_TEXT_WIDTH) };
-            let button = create_button(
-                row_box,
-                &tweak.button,
-                on_tweak_clicked,
-                ptr::without_provenance_mut(index + 1),
-            );
-            unsafe { evas_object_size_hint_min_set(button, 180, 72) };
-            self.tweak_keys.push(tweak.key);
-            self.tweak_buttons.push(button);
-        }
-        let (row, row_box) = panel(list, COLOR_ROW, 32, 12);
-        unsafe {
-            elm_box_pack_end(list, row);
-            elm_box_horizontal_set(row_box, 1);
-            elm_box_padding_set(row_box, 24, 0);
-        }
-        let text = add_to_box(
-            row_box,
-            create_label(
-                row_box,
-                &format!(
-                    "<font_size=26><b>Undo all changes</b></font_size><br/>{}",
-                    small(
-                        "Switches everything above off and puts back what the suite changed: \
-                         hosts, brake files, masked or stopped services, the auto-update setting, \
-                         YouTube's flags, the Home key.",
-                        "#8a8f99"
-                    )
-                ),
-            ),
-        );
-        unsafe { elm_label_wrap_width_set(text, TWEAK_TEXT_WIDTH) };
-        let undo = create_button(row_box, "Undo", on_undo_clicked, ptr::null_mut());
-        unsafe { evas_object_size_hint_min_set(undo, 180, 72) };
-        self.tweak_buttons
-            .get(self.tweak_focus)
-            .or(self.tweak_buttons.first())
-            .copied()
-            .unwrap_or(ptr::null_mut())
-    }
-
-    fn update_tweaks(&mut self) {
-        let Some(status) = &self.tweaks else { return };
-        let tweaks = tweaks(status, self.patch.as_ref());
-        if tweaks.len() != self.tweak_buttons.len() {
-            self.render();
-            return;
-        }
-        set_text(self.tweak_summary, &tweaks_summary(status));
-        for ((button, label), tweak) in self
-            .tweak_buttons
-            .iter()
-            .zip(&self.tweak_labels)
-            .zip(&tweaks)
-        {
-            set_text(*button, &tweak.button);
-            set_text(*label, &tweak_markup(tweak));
-        }
-    }
-
-    fn add_content(&mut self, child: *mut c_void) {
-        if child.is_null() {
-            return;
-        }
-        unsafe { elm_box_pack_end(self.content_box, child) };
-        self.content_objects.push(child);
-    }
-
-    fn clear_content(&mut self) {
-        for object in self.content_objects.drain(..) {
-            unsafe { evas_object_del(object) };
-        }
-    }
-
     fn exit_now(&mut self) {
         if self.exiting {
             return;
@@ -1592,150 +1163,162 @@ fn state_text(app: &App, state: &State) -> String {
     }
 }
 
-struct Tweak {
-    key: String,
-    title: String,
-    note: String,
-    button: String,
-}
-
-/// The toggles for a tv-blockd `status` response, in screen order.
-fn tweaks(status: &Value, patch: Option<&Value>) -> Vec<Tweak> {
+/// The Tweaks page from tv-blockd's and tv-patchd's `status`.
+fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
     let config = &status["config"];
-    let tweak = |key: &str, title: &str, note: &str| Tweak {
-        key: key.into(),
-        title: title.into(),
-        note: note.into(),
-        button: on_off(config[key] == true).into(),
+    let report = &status["report"];
+    let switch = |key: &str, title: &str, subtitle: &str, on: bool| {
+        let mut row = Row::text(title, subtitle);
+        row.controls.push(Control::Switch {
+            on,
+            action: Action::Tweak(key.into()),
+        });
+        row
     };
-    let mut list = vec![tweak(
+    let hosts_on = config["hosts"] == true;
+    let home = patch
+        .and_then(|patch| patch["report"]["home"].as_str())
+        .unwrap_or_default();
+    let mut blocks = vec![Block::Tiles(vec![
+        (
+            if hosts_on {
+                report["blocked_hosts"].to_string()
+            } else {
+                "Off".into()
+            },
+            "hosts blocked".into(),
+        ),
+        (
+            match report["otn_autoupdate"].as_i64() {
+                Some(0) => "Off".into(),
+                Some(_) => "On".into(),
+                None => "?".into(),
+            },
+            "auto-update".into(),
+        ),
+        (
+            report["telemetry_active"]
+                .as_array()
+                .map_or(0, Vec::len)
+                .to_string(),
+            "telemetry services running".into(),
+        ),
+        (
+            match home {
+                "org.tvauth.home" => "Dock".into(),
+                "com.samsung.tv.csfs" => "Samsung".into(),
+                "" => "?".into(),
+                other => other.into(),
+            },
+            "Home key".into(),
+        ),
+    ])];
+    let errors: Vec<String> = [report, patch.map_or(&Value::Null, |patch| &patch["report"])]
+        .iter()
+        .filter_map(|report| {
+            report["errors"]
+                .as_array()
+                .and_then(|errors| errors.first())
+        })
+        .filter_map(|error| error.as_str().map(str::to_owned))
+        .collect();
+    if !errors.is_empty() {
+        blocks.push(Block::Paragraph {
+            markup: format!("<warn>{}</warn>", escape(&errors.join(" \u{00b7} "))),
+            size: 22,
+        });
+    }
+    let enabled = config["groups"].as_array().cloned().unwrap_or_default();
+    let mut hosts = switch(
         "hosts",
         "Block tracking hosts",
-        "Points the host groups below at nothing, for every app on the TV.",
-    )];
-    let enabled = config["groups"].as_array().cloned().unwrap_or_default();
-    for group in status["groups"].as_array().into_iter().flatten() {
-        let id = group["id"].as_str().unwrap_or_default();
-        let hosts = group["hosts"].as_array().map_or(0, Vec::len);
-        list.push(Tweak {
-            key: format!("group:{id}"),
-            title: format!("  {}", group["label"].as_str().unwrap_or(id)),
-            note: format!(
-                "{} {hosts} host{}, evidence: {}.",
-                group["note"].as_str().unwrap_or_default(),
-                if hosts == 1 { "" } else { "s" },
-                group["evidence"].as_str().unwrap_or("unknown")
-            ),
-            button: on_off(enabled.iter().any(|value| value == id)).into(),
-        });
-    }
-    list.push(tweak(
-        "otn_lock",
-        "Keep automatic updates off",
-        "Turns the TV's auto-update setting back off whenever it is switched on.",
-    ));
-    list.push(tweak(
-        "telemetry",
-        "Stop telemetry services",
-        "Stops Samsung's log, crash and analytics services, again after every reboot.",
-    ));
+        "Points the groups below at nothing, for every app on the TV",
+        hosts_on,
+    );
+    hosts.chips = status["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|group| {
+            let id = group["id"].as_str().unwrap_or_default();
+            Chip {
+                label: group["label"].as_str().unwrap_or(id).to_owned(),
+                on: enabled.iter().any(|value| value == id),
+                action: Action::Tweak(format!("group:{id}")),
+            }
+        })
+        .collect();
+    hosts.dim = !hosts_on;
+    blocks.push(Block::Section("Blocking".into()));
+    blocks.push(Block::Rows(vec![hosts]));
+    blocks.push(Block::Section("Updates and telemetry".into()));
+    blocks.push(Block::Rows(vec![
+        switch(
+            "otn_lock",
+            "Keep automatic updates off",
+            "Switches the TV's auto-update setting back off whenever it is turned on",
+            config["otn_lock"] == true,
+        ),
+        switch(
+            "telemetry",
+            "Stop telemetry services",
+            "Samsung's log, crash and analytics services, again after every boot",
+            config["telemetry"] == true,
+        ),
+    ]));
     if let Some(patch) = patch {
-        let report = &patch["report"];
         let on = patch["config"]["tizentube"] == true;
         let version = patch["script"]["version"].as_str().unwrap_or("?");
-        let state = match report["errors"]
-            .as_array()
-            .and_then(|errors| errors.first())
-        {
-            Some(error) => format!("Problem: {}", error.as_str().unwrap_or_default()),
-            None if on && report["ready"] == true => {
-                "On: its options are under YouTube's settings, TizenTube Settings.".into()
-            }
-            None => "Switching it off restores Samsung's YouTube.".into(),
+        let state = if on && patch["report"]["ready"] == true {
+            "on; its options are in YouTube's settings"
+        } else if on {
+            "starting"
+        } else {
+            "off; Samsung's YouTube as it was"
         };
-        list.push(Tweak {
-            key: "patch:tizentube".into(),
-            title: "TizenTube in YouTube".into(),
-            note: format!(
-                "Blocks ads and skips sponsor segments in Samsung's own YouTube app, \
-                 through a local proxy. TizenTube {version}. {state}"
-            ),
-            button: on_off(on).into(),
-        });
-        list.push(Tweak {
-            key: "patch:update".into(),
-            title: "  Update TizenTube".into(),
-            note: format!(
-                "Installs the newest release from npm (this build pins {}).",
+        let mut update = Row::text(
+            "Update TizenTube",
+            format!(
+                "Newest release from npm (this build pins {})",
                 patch["pinned"].as_str().unwrap_or("?")
             ),
-            button: "Update".into(),
+        );
+        update.controls.push(Control::Button {
+            label: "Update".into(),
+            tone: Tone::Normal,
+            action: Action::Tweak("patch:update".into()),
         });
-        let custom = patch["config"]["custom_home"] == true;
-        let home = report["home"].as_str().unwrap_or_default();
-        let state = if custom && home == "org.tvauth.home" {
-            "On: the Home key opens the dock.".to_owned()
-        } else if custom {
-            format!("On, but the Home key still opens {home}.")
-        } else {
-            "Off: the Home key opens Samsung's Home.".to_owned()
-        };
-        list.push(Tweak {
-            key: "patch:custom_home".into(),
-            title: "Custom Home".into(),
-            note: format!(
-                "The Home key opens the suite's dock over what is playing: your apps, \
-                 Up for the inputs, Down for Samsung Home and Settings. {state}"
+        blocks.push(Block::Section("YouTube".into()));
+        blocks.push(Block::Rows(vec![
+            switch(
+                "patch:tizentube",
+                "TizenTube",
+                &format!("Ad blocking and SponsorBlock in Samsung's YouTube \u{00b7} {version} \u{00b7} {state}"),
+                on,
             ),
-            button: on_off(custom).into(),
-        });
+            update,
+        ]));
+        let custom = patch["config"]["custom_home"] == true;
+        blocks.push(Block::Section("Home".into()));
+        blocks.push(Block::Rows(vec![switch(
+            "patch:custom_home",
+            "Custom Home",
+            "The Home key opens the dock over what is playing: apps, Up for inputs, Down for Settings",
+            custom,
+        )]));
     }
-    list
-}
-
-fn tweaks_summary(status: &Value) -> String {
-    let report = &status["report"];
-    let mut parts = vec![if status["config"]["hosts"] == true {
-        format!("{} hosts blocked", report["blocked_hosts"])
-    } else {
-        "Host blocking off".into()
-    }];
-    parts.push(match report["otn_autoupdate"].as_i64() {
-        Some(0) => "auto-update off".into(),
-        Some(_) => "auto-update on".into(),
-        None => "auto-update unknown".into(),
+    let mut undo = Row::text(
+        "Undo all changes",
+        "Everything above off; hosts, services, auto-update, YouTube and the Home key put back",
+    );
+    undo.controls.push(Control::Button {
+        label: "Undo".into(),
+        tone: Tone::Danger,
+        action: Action::Undo,
     });
-    let running = report["telemetry_active"].as_array().map_or(0, Vec::len);
-    parts.push(format!("{running} telemetry services running"));
-    let failed = report["namespaces_failed"].as_u64().unwrap_or(0);
-    if failed > 0 {
-        parts.push(format!("{failed} namespaces not covered"));
-    }
-    let mut markup = small(&parts.join(" · "), "#8a8f99");
-    if let Some(error) = report["errors"]
-        .as_array()
-        .and_then(|errors| errors.first())
-    {
-        markup.push_str("<br/>");
-        markup.push_str(&small(error.as_str().unwrap_or_default(), "#ffb74d"));
-    }
-    markup
-}
-
-fn tweak_markup(tweak: &Tweak) -> String {
-    format!(
-        "<font_size=26><b>{}</b></font_size><br/>{}",
-        escape(&tweak.title),
-        small(&tweak.note, "#8a8f99")
-    )
-}
-
-fn on_off(on: bool) -> &'static str {
-    if on {
-        "On"
-    } else {
-        "Off"
-    }
+    blocks.push(Block::Section("Reset".into()));
+    blocks.push(Block::Rows(vec![undo]));
+    blocks
 }
 
 fn or_unknown(error: &str) -> &str {
@@ -1779,16 +1362,6 @@ fn audit_markup(line: &str, now: i64) -> String {
         small(&age, "#8a8f99"),
         small(&shorten(event, 120, false), "#e8e8e8")
     )
-}
-
-/// Show a cached icon; a missing file leaves the image empty.
-fn set_image_file(image: *mut c_void, path: &Path) {
-    if !path.exists() {
-        return;
-    }
-    if let Ok(file) = CString::new(path.as_os_str().as_encoded_bytes()) {
-        unsafe { elm_image_file_set(image, file.as_ptr(), ptr::null()) };
-    }
 }
 
 fn icon_path(digest: &str) -> PathBuf {
@@ -2005,280 +1578,32 @@ unsafe extern "C" fn on_timer(_data: *mut c_void) -> EinaBool {
     ui().on_timer()
 }
 
-unsafe extern "C" fn on_back(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    log_line("back key");
-    let state = ui();
-    if state.tab == Tab::Store && state.store.detail.is_some() {
-        state.close_details();
-    } else {
-        state.exit_now();
-    }
+unsafe extern "C" fn on_delete(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    ui().exit_now();
 }
 
-unsafe extern "C" fn on_tab_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    let state = ui();
-    state.store.detail = None;
-    state.status.clear();
-    state.tab = match data as usize {
-        2 => Tab::Permissions,
-        3 => Tab::Tweaks,
-        _ => Tab::Store,
-    };
-    match state.tab {
-        Tab::Permissions => state.refresh_grants(),
-        Tab::Tweaks => {
-            state.load_tweaks(Service::Block, None, None);
-            state.load_tweaks(Service::Patch, None, None);
-        }
-        Tab::Store => {}
-    }
-    state.render();
-}
-
-unsafe extern "C" fn on_category_selected(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    state.store.category = (data as usize).saturating_sub(1).min(CATEGORIES.len() - 1);
-    state.store.focus_key = None;
-    state.render();
-}
-
-unsafe extern "C" fn on_search_changed(
+unsafe extern "C" fn on_key(
     _data: *mut c_void,
-    object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    let text = elm_object_part_text_get(object, ptr::null());
-    let markup = if text.is_null() {
-        String::new()
-    } else {
-        std::ffi::CStr::from_ptr(text)
-            .to_string_lossy()
-            .into_owned()
-    };
-    state.store.query = markup
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&");
-    state.store.focus_key = None;
-    state.rebuild_list();
-}
-
-unsafe extern "C" fn on_row_focused(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    if data as usize != 0 {
-        let state = ui();
-        state.store.focus_on_action = false;
-        state.row_focused(data as usize);
-    }
-}
-
-unsafe extern "C" fn on_action_focused(
-    data: *mut c_void,
+    _evas: *mut c_void,
     _object: *mut c_void,
-    _info: *mut c_void,
+    info: *mut c_void,
 ) {
-    if data as usize != 0 {
-        let state = ui();
-        state.store.focus_on_action = true;
-        state.row_focused(data as usize);
+    // `Evas_Event_Key_Down` starts with `const char *keyname`.
+    let name = *(info as *const *const c_char);
+    if !name.is_null() {
+        ui().key(&std::ffi::CStr::from_ptr(name).to_string_lossy());
     }
 }
 
-unsafe extern "C" fn on_details_clicked(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    if data as usize != 0 {
-        ui().open_details(data as usize);
+unsafe extern "C" fn on_frame(_data: *mut c_void) -> EinaBool {
+    match ui().screen.as_mut() {
+        Some(screen) => EinaBool::from(screen.frame()),
+        None => 0,
     }
 }
 
-unsafe extern "C" fn on_reload_clicked(
-    _data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    state.store.icons_requested.clear();
-    state.load_catalog();
-    state.set_status(state.status.clone());
-}
-
-unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    let state = ui();
-    let index = (data as usize).wrapping_sub(1);
-    state.tweak_focus = index;
-    match state.tweak_keys.get(index).map(String::as_str) {
-        Some("patch:update") => {
-            state.set_status("Checking for a TizenTube update...");
-            state.load_tweaks(Service::Patch, Some(json!({"method": "update"})), None);
-            return;
-        }
-        Some(key @ ("patch:tizentube" | "patch:custom_home")) => {
-            let field = &key["patch:".len()..];
-            // `set` replaces the whole config: keep the other settings.
-            let mut config = state
-                .patch
-                .as_ref()
-                .map_or_else(|| json!({}), |patch| patch["config"].clone());
-            let on = config[field] == true;
-            config[field] = json!(!on);
-            let message = match (field, on) {
-                ("tizentube", true) => "TizenTube is off; YouTube is back to normal.",
-                ("tizentube", false) => "TizenTube is on. Open YouTube to use it.",
-                (_, true) => "Custom Home is off; the Home key opens Samsung's Home.",
-                (_, false) => "Custom Home is on; press Home for the dock.",
-            };
-            state.set_status("Applying...");
-            state.load_tweaks(
-                Service::Patch,
-                Some(json!({"method": "set", "config": config})),
-                Some(message),
-            );
-            return;
-        }
-        _ => {}
-    }
-    let (Some(key), Some(status)) = (state.tweak_keys.get(index), &state.tweaks) else {
-        return;
-    };
-    let mut config = status["config"].clone();
-    match key.strip_prefix("group:") {
-        Some(id) => {
-            if let Some(groups) = config["groups"].as_array_mut() {
-                if let Some(position) = groups.iter().position(|value| value == id) {
-                    groups.remove(position);
-                } else {
-                    groups.push(json!(id));
-                }
-            }
-        }
-        None => {
-            let on = config[key.as_str()] == true;
-            config[key.as_str()] = json!(!on);
-        }
-    }
-    state.set_status("Applying...");
-    state.load_tweaks(
-        Service::Block,
-        Some(json!({"method": "set", "config": config})),
-        Some("Saved and applied."),
-    );
-}
-
-unsafe extern "C" fn on_undo_clicked(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    let state = ui();
-    state.set_status("Undoing...");
-    state.load_tweaks(Service::Patch, Some(json!({"method": "undo"})), None);
-    state.load_tweaks(
-        Service::Block,
-        Some(json!({"method": "undo"})),
-        Some("Everything the suite changed is undone."),
-    );
-}
-
-fn clicked_app(data: *mut c_void) -> Option<App> {
-    let key = data as usize;
-    if key == 0 {
-        return None;
-    }
-    let state = ui();
-    if let Some(app) = state.row_app(key) {
-        return Some(app.clone());
-    }
-    // A group row's "Open": its installed build.
-    let (group, _) = split_key(key);
-    let group = state.store.groups.get(group)?;
-    group
-        .variants
-        .iter()
-        .find(|app| state.store.installed.contains_key(&app.package_id))
-        .cloned()
-}
-
-unsafe extern "C" fn on_install_clicked(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    if let Some(app) = clicked_app(data) {
-        log_line(&format!("install clicked {}", app.package_id));
-        ui().install(app);
-    }
-}
-
-unsafe extern "C" fn on_open_clicked(data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
-    if let Some(app) = clicked_app(data) {
-        ui().open(&app);
-    }
-}
-
-unsafe extern "C" fn on_remove_clicked(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    if let Some(app) = clicked_app(data) {
-        log_line(&format!("remove clicked {}", app.package_id));
-        ui().uninstall(app);
-    }
-}
-
-unsafe extern "C" fn on_revoke_clicked(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    let Some(label) = (data as usize)
-        .checked_sub(1)
-        .and_then(|index| state.grants.get(index))
-        .map(|grant| grant.label.clone())
-    else {
-        return;
-    };
-    log_line(&format!("revoke clicked {label}"));
-    state.status = format!("Revoking {label}...");
-    state.render();
-    if let Some(broker) = &state.broker {
-        broker.revoke(&label);
-    }
-}
-
-unsafe extern "C" fn on_notify_clicked(
-    data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    let Some((label, next)) = (data as usize)
-        .checked_sub(1)
-        .and_then(|index| state.grants.get(index))
-        .map(|grant| (grant.label.clone(), next_notify(&grant.notify)))
-    else {
-        return;
-    };
-    log_line(&format!("notify clicked {label} -> {next}"));
-    state.focus_notify_label = Some(label.clone());
-    if let Some(broker) = &state.broker {
-        broker.set_notify(&label, &next);
-    }
-}
-
-unsafe extern "C" fn on_refresh_clicked(
-    _data: *mut c_void,
-    _object: *mut c_void,
-    _info: *mut c_void,
-) {
-    let state = ui();
-    state.status = "Refreshing...".into();
-    state.refresh_grants();
-    state.render();
+unsafe extern "C" fn on_field_done(_data: *mut c_void, _object: *mut c_void, _info: *mut c_void) {
+    ui().field_done();
 }
 
 fn main() {

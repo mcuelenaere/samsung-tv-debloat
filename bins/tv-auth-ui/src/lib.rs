@@ -2,5 +2,6 @@
 
 pub mod catalog;
 pub mod dock_core;
+pub mod page;
 pub mod pixels;
 pub mod store;

@@ -52,7 +52,22 @@ is re-established on every daemon start.
 
 ## Behavior
 
-Three tabs, driven with the remote (arrows, OK, BACK to exit).
+A rail of tabs on the left (Store, Permissions, Tweaks; System, greyed out,
+is a placeholder for a dev mode) and the tab's page on the right. Up and Down
+on the rail switch tabs; Right or OK enters the page; Left at a page's left
+edge, or BACK, returns to the rail; BACK on the rail exits.
+
+Drawn without Elementary widgets (`src/screen.rs`), like the dock: every page
+is data (`src/page.rs`, host-tested): sections, status tiles, rounded cards
+of rows with switches, buttons or a progress bar, chips, a grid of app cards,
+a header and wrapped paragraphs. `page.rs` lays them out, moves focus by
+geometry (the nearest focusable part in the arrow's direction, so grids,
+chips and button pairs all work) and works out the scroll position.
+`screen.rs` creates evas objects only for parts near the viewport, and an
+ecore animator glides the focus ring (or, on switch rows, a highlight with a
+blue edge), the scroll position and the rail's highlight; a new tab fades
+and rises in. Each change re-renders the page in place: focus stays on the
+same action and the scroll position is kept.
 
 ### Store
 
@@ -61,76 +76,65 @@ Three tabs, driven with the remote (arrows, OK, BACK to exit).
   libcrypto against the Apps2Samsung key pinned in `src/store.rs` (the one
   their TV-Store pins), and rejects a catalog older than 7 days or dated more
   than an hour ahead.
-- Lists one row per app (135 today): community entries grouped by their
-  `group` (variants become builds), and each release provider's latest
-  release as one app whose assets are its builds. Each row has **Details**;
-  installed apps also have **Open** (or **Update** when the catalog is
-  newer). Installing starts from the details page.
-- **Details** opens a page with the large icon, full description, category,
-  package id(s), source repository, minimum Tizen version, catalog flags
-  (closed-source, self-updating, root, Partner certificate), and every build
-  with Install/Update/Open/Remove. BACK (there is no on-screen Back button)
-  returns to the list exactly as it was: the list is unpacked and hidden
-  while the page is open, not rebuilt, so scroll position and focus survive.
-  Installed apps sort first, then by name; the order stays put until the
-  filter changes. One scrolling list: rows are appended 16 at a time as
-  focus nears the end, and the scroller follows focus.
-- A search field (`elm_entry`; OK opens the TV keyboard) filters by name,
-  description, build name and package id as you type; a category dropdown
-  (`elm_hoversel`) filters by category. Adult entries, non-HTTPS URLs, entries without a
-  SHA-256, and apps needing Tizen > 6.5 are left out; Partner-level apps are
-  labelled.
-- Matches `package_id`/`package_version` against `pkg.list`: **Install**,
-  **Update** (`vX → vY`), or **Open** + **Remove**.
-- While a build is being installed or removed its rows (in the list and on
-  the details page) show "Downloading N%" or "Waiting for approval…" over a
-  progress bar instead of their buttons. (The TV theme draws nothing for a
-  pulsing bar, so the waiting phase is a full bar plus text.)
-- After a change only the visible rows are rebuilt in place, so the
-  selection, scroll position and the focused button survive.
+- A search field, **Reload**, category chips, then a five-column grid of app
+  cards (139 today): icon, name, and the installed version, the number of
+  builds, or "Update available". Installed apps sort first, then by name;
+  the order stays put until the filter changes. Community entries are
+  grouped by their `group` (variants become builds), and each release
+  provider's latest release is one app whose assets are its builds.
+- OK on the search field opens a single-line Elementary entry over it, so
+  the TV's keyboard comes up; confirming (or leaving it) filters by name,
+  description, build name and package id.
+- OK on a card opens its details page: large icon, category, builds,
+  description, package id(s), source repository, minimum Tizen version,
+  catalog flags (closed-source, self-updating, root, Partner certificate),
+  and one row per build with **Install**, **Update**, **Open** and
+  **Remove**. BACK returns to the grid, focused on that app.
+- Adult entries, non-HTTPS URLs, entries without a SHA-256, and apps needing
+  Tizen > 6.5 are left out.
+- While a build is installed or removed its row shows "Downloading N%" or
+  "Waiting for approval..." with a progress bar instead of its buttons.
 - Install: downloads to `/tmp/tv-store/<pkgid>.<wgt|tpk>` on a worker thread,
   keeps it only if size and SHA-256 match the signed catalog, then sends
   `pkg.install`. `tv-authd` stages and re-signs it and asks the user on the
   popup's prompt. Remove sends `pkg.uninstall` (also prompted). Open launches
   the package's main app through `app_control` (needs the
   `appmanager.launch` privilege; without it launches fail with -13).
-- Icons are fetched as rows are appended, hash-checked, cached in
-  `/tmp/tv-store/icons/`, and swapped into their row in place.
+- Icons are fetched for the listed apps, hash-checked, cached in
+  `/tmp/tv-store/icons/`, and shown as they arrive.
 - The window is an ordinary app toplevel (`E_LAYER_CLIENT_NORMAL`, layer 200).
   On this firmware `ELM_WIN_BASIC` leaves the Wayland window type at NONE and
   such a surface never gets an xdg toplevel, so the manager sets
   `ECORE_WL2_WINDOW_TYPE_TOPLEVEL` itself. As a real app window it obscures
-  (and so pauses) the app underneath, Samsung's Home bar (layer 650) and the
-  popup's prompt (800) open above it, and BACK arrives by focus with no
-  keygrab.
+  (and so pauses) the app underneath; the popup's prompt (800) opens above
+  it, and keys arrive by focus with no keygrab.
 
 ### Permissions
 
-The persistent-grant list: a toast toggle per app that cycles **Toast: every**
-→ **Toast: first use** → **Toast: never**, and **Revoke** (focus starts on the
-toggle). Below it, **Recent activity** shows the newest `grants.audit` lines
-with their age. The first 5 grants are shown.
+The persistent-grant list: per app its toast mode button, which cycles
+**Toast: every** → **Toast: first use** → **Toast: never**, and **Revoke**.
+Below it, **Recent activity** shows the newest `grants.audit` lines with
+their age, and **Refresh**.
 
 The manager never sends `ui.hello`, so it does not take prompts or toasts from
 the popup daemon.
 
 ### Tweaks
 
-On/Off toggles for `tv-blockd` (`/run/tv-suite/blockd.sock`): host blocking,
-each built-in host group with its note, host count and evidence, the
-auto-update lock, and telemetry. A summary line shows the blocked host count,
-the auto-update setting, running telemetry services and any reconcile error.
-Each press sends the whole edited config with `set`; the row's button updates
-in place from the answer, so focus stays. **Undo all changes** at the bottom
-sends `undo` to tv-blockd and tv-patchd: everything off, and what they
-changed put back. See `bins/tv-blockd/README.md`.
+Four status tiles (hosts blocked, the auto-update setting, telemetry services
+running, what the Home key opens), any daemon error, then sections:
+- **Blocking**: `tv-blockd`'s host blocking switch, with each built-in host
+  group as a chip under it (dimmed while blocking is off);
+- **Updates and telemetry**: the auto-update lock and telemetry;
+- **YouTube** (`tv-patchd`): **TizenTube** and **Update TizenTube**;
+- **Home**: **Custom Home** (`custom_home`; the Home key opens the dock
+  below, or Samsung's Home again);
+- **Reset**: **Undo all changes** sends `undo` to tv-blockd and tv-patchd:
+  everything off, and what they changed put back.
 
-**TizenTube in YouTube** switches `tv-patchd` (`/run/tv-suite/patchd.sock`)
-on and off, and **Update TizenTube** installs npm's latest release.
-**Custom Home** switches tv-patchd's `custom_home`: the Home key opens the
-dock below, or Samsung's Home again; its note says which app the Home key
-opens now. Both send tv-patchd's whole config with `set`, so neither
-changes the other. See `bins/tv-patchd/README.md`.
+Each switch or chip sends the daemon's whole edited config with `set`
+(`/run/tv-suite/blockd.sock`, `/run/tv-suite/patchd.sock`). See
+`bins/tv-blockd/README.md` and `bins/tv-patchd/README.md`.
 
 ### Dock (`org.tvauth.home`)
 
@@ -207,17 +211,16 @@ on every launch too) does it wake the main loop through an `ecore_pipe`; the
 rows are rebuilt and each keeps its selection. An install or uninstall shows
 within about 2–3 s of its start, before `tvauth-cli` returns.
 
-The manager sets Elementary's focus autoscroll to SHOW: its scroller jumps
-to the focused widget instead of animating there, which lagged behind key
-repeat.
-
 See `docs/tv-launcher-plan.md`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | EFL window, Store/Permissions views, worker jobs |
+| `src/main.rs` | window, the pages built from data, actions, worker jobs |
+| `src/screen.rs` | the manager's renderer: rail, pages, focus, motion |
+| `src/page.rs` | page model: layout, focus movement, scrolling (host-tested) |
+| `src/kit.rs` | evas helpers shared by the manager and the dock |
 | `src/store.rs` | catalog envelope, freshness, flattening, version states (host-tested) |
 | `src/dock.rs` | the dock (`org.tvauth.home`) |
 | `src/catalog.rs` | the dock's app list and order (host-tested) |

@@ -227,6 +227,22 @@ extern "C" {
         b: c_int,
         a: c_int,
     );
+    /// 0.0..1.0 cuts the text to its width with an ellipsis (1.0 at the
+    /// end); -1.0 turns it off.
+    pub fn evas_object_text_ellipsis_set(object: *mut c_void, ellipsis: c_double);
+    /// Decodes the file at this size (the PNG and JPEG loaders scale on
+    /// load).
+    pub fn evas_object_image_load_size_set(object: *mut c_void, width: c_int, height: c_int);
+    pub fn evas_object_textblock_add(evas: *mut c_void) -> *mut c_void;
+    pub fn evas_textblock_style_new() -> *mut c_void;
+    pub fn evas_textblock_style_set(style: *mut c_void, text: *const c_char);
+    pub fn evas_object_textblock_style_set(object: *mut c_void, style: *mut c_void);
+    pub fn evas_object_textblock_text_markup_set(object: *mut c_void, text: *const c_char);
+    pub fn evas_object_textblock_size_formatted_get(
+        object: *const c_void,
+        width: *mut c_int,
+        height: *mut c_int,
+    );
     pub fn evas_object_image_size_set(object: *mut c_void, width: c_int, height: c_int);
     pub fn evas_object_image_alpha_set(object: *mut c_void, alpha: EinaBool);
     /// Copies premultiplied ARGB pixels of the image's size.
