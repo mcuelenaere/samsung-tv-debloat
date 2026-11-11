@@ -147,7 +147,10 @@ small as the widest row), over whatever is playing, with three rows:
 - **Down**: Samsung Home (`com.samsung.tv.csfs`), Settings (`org.tizen.menu`)
   and TV suite; Up returns.
 
-The selection glides between icons in 0.3 s at constant speed. The focused
+The selection glides between icons in 0.3 s at constant speed. Holding
+Left or Right past 0.35 s starts a run that speeds up from 6 to 28 entries
+per second and settles on the next entry when the key is released (key-up,
+or 0.25 s without key repeats). The focused
 icon grows from 92 to 112 px and rises 4 px, a white ring and a glow in the
 icon's own colour follow the selection, and its name fades in underneath.
 The row scrolls to keep the selection centred. Rows fade and slide in from

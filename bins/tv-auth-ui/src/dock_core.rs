@@ -36,6 +36,19 @@ pub const FOCUS_SECONDS: f64 = 0.3;
 pub const SHOW_SECONDS: f64 = 0.3;
 pub const HIDE_SECONDS: f64 = 0.16;
 pub const IDLE_SECONDS: f64 = 20.0;
+/// Holding Left or Right longer than this (past the first glide) starts a
+/// continuous run; a tap moves one entry.
+pub const HOLD_DELAY: f64 = 0.35;
+/// A hold also ends when neither a key-up nor a key repeat came for this
+/// long (a lost key-up must not run on forever); once repeats are coming
+/// (every few tens of milliseconds), after [`REPEAT_TIMEOUT`].
+pub const HOLD_TIMEOUT: f64 = 1.0;
+pub const REPEAT_TIMEOUT: f64 = 0.25;
+/// The run starts at this speed, in entries per second, speeds up by
+/// [`RUN_ACCEL`] per second and stays below [`RUN_MAX`].
+pub const RUN_START: f32 = 6.0;
+pub const RUN_ACCEL: f32 = 24.0;
+pub const RUN_MAX: f32 = 28.0;
 /// A row that replaces another starts this far shown, and slides this far.
 const SWITCH_FROM: f32 = 0.4;
 pub const SLIDE: f32 = 24.0;
@@ -227,6 +240,8 @@ pub struct Focus {
     pub position: f32,
     from: f32,
     elapsed: f64,
+    /// This glide's length; 0 means [`FOCUS_SECONDS`].
+    duration: f64,
 }
 
 impl Focus {
@@ -237,8 +252,18 @@ impl Focus {
         // A new run from wherever the selection is now.
         self.from = self.position;
         self.elapsed = 0.0;
+        self.duration = FOCUS_SECONDS;
         self.target = index;
         true
+    }
+
+    /// Glides the rest of the way to `index` at the usual speed (after a
+    /// run: usually less than one entry).
+    fn settle(&mut self, index: usize) {
+        self.from = self.position;
+        self.elapsed = 0.0;
+        self.duration = (FOCUS_SECONDS * (index as f32 - self.position).abs() as f64).max(0.06);
+        self.target = index;
     }
 
     pub fn jump(&mut self, index: usize) {
@@ -247,6 +272,7 @@ impl Focus {
             position: index as f32,
             from: index as f32,
             elapsed: 0.0,
+            duration: FOCUS_SECONDS,
         };
     }
 
@@ -255,7 +281,12 @@ impl Focus {
             return false;
         }
         self.elapsed += dt;
-        let progress = (self.elapsed / FOCUS_SECONDS) as f32;
+        let duration = if self.duration > 0.0 {
+            self.duration
+        } else {
+            FOCUS_SECONDS
+        };
+        let progress = (self.elapsed / duration) as f32;
         self.position = if progress >= 1.0 {
             self.target as f32
         } else {
@@ -311,12 +342,26 @@ pub enum Action {
     Hide,
 }
 
+/// Left or Right held down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hold {
+    row: Row,
+    /// -1 left, +1 right.
+    step: i32,
+    /// Seconds since the press.
+    held: f64,
+    /// Seconds since the last key event for it (press or repeat).
+    quiet: f64,
+    repeats: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Controller {
     pub row: Option<Row>,
     pub focus: [Focus; 3],
     pub fade: [Fade; 3],
     pub counts: [usize; 3],
+    hold: Option<Hold>,
 }
 
 impl Controller {
@@ -349,6 +394,7 @@ impl Controller {
         for fade in &mut self.fade {
             *fade = Fade::default();
         }
+        self.hold = None;
         self.focus[Row::Apps.index()].jump(focus.min(self.counts[0].saturating_sub(1)));
         self.fade[0] = Fade {
             presence: 0.0,
@@ -359,9 +405,39 @@ impl Controller {
     }
 
     pub fn hide(&mut self) {
+        self.release();
         for fade in &mut self.fade {
             fade.showing = false;
         }
+    }
+
+    /// The held key is up (or quiet too long): a run settles on the next
+    /// entry in its direction.
+    fn release(&mut self) {
+        let Some(hold) = self.hold.take() else { return };
+        if hold.held > HOLD_DELAY {
+            let focus = &mut self.focus[hold.row.index()];
+            let next = if hold.step > 0 {
+                focus.position.ceil()
+            } else {
+                focus.position.floor()
+            };
+            focus.settle(next.max(0.0) as usize);
+        }
+    }
+
+    /// A key-up; only Left and Right matter (they end a hold).
+    pub fn key_up(&mut self, key: &str) -> Action {
+        let step = match key {
+            "Left" => -1,
+            "Right" => 1,
+            _ => return Action::None,
+        };
+        if self.hold.is_some_and(|hold| hold.step == step) {
+            self.release();
+            return Action::Moved;
+        }
+        Action::None
     }
 
     /// Replaces the shown row with `row`, focused on `focus`.
@@ -370,6 +446,7 @@ impl Controller {
         if from == row {
             return;
         }
+        self.release();
         self.fade[from.index()].showing = false;
         // The new row comes from the side the arrow pointed to.
         let direction = if from.up().map(|(to, _)| to) == Some(row) {
@@ -390,12 +467,40 @@ impl Controller {
         let Some(row) = self.shown() else {
             return Action::None;
         };
-        let focus = &mut self.focus[row.index()];
         let last = self.counts[row.index()].saturating_sub(1);
-        let moved = |changed: bool| if changed { Action::Moved } else { Action::None };
+        if let Some(step) = match key {
+            "Left" => Some(-1),
+            "Right" => Some(1),
+            _ => None,
+        } {
+            // A key repeat of the held key keeps the hold alive.
+            if let Some(hold) = self
+                .hold
+                .as_mut()
+                .filter(|hold| hold.row == row && hold.step == step)
+            {
+                hold.quiet = 0.0;
+                hold.repeats += 1;
+                return Action::Moved;
+            }
+            self.release();
+            self.hold = Some(Hold {
+                row,
+                step,
+                held: 0.0,
+                quiet: 0.0,
+                repeats: 0,
+            });
+            let focus = &mut self.focus[row.index()];
+            let target = focus.target as i64 + i64::from(step);
+            if (0..=last as i64).contains(&target) {
+                focus.move_to(target as usize);
+            }
+            // Frames run while the key is held, to time the hold.
+            return Action::Moved;
+        }
+        let focus = &mut self.focus[row.index()];
         match key {
-            "Left" => moved(focus.target > 0 && focus.move_to(focus.target - 1)),
-            "Right" => moved(focus.target < last && focus.move_to(focus.target + 1)),
             "Up" => row.up().map_or(Action::None, |(to, _)| Action::Open(to)),
             "Down" => row.down().map_or(Action::None, |(to, _)| Action::Open(to)),
             "Return" | "KP_Enter" | "Select" if self.counts[row.index()] > 0 => {
@@ -412,8 +517,39 @@ impl Controller {
     pub fn tick(&mut self, dt: f64) -> bool {
         let dt = dt.clamp(0.0, 0.1); // a stalled frame must not teleport anything
         let mut more = false;
+        let mut running = None;
+        if let Some(hold) = self.hold.as_mut() {
+            hold.held += dt;
+            hold.quiet += dt;
+            more = true;
+            let limit = if hold.repeats >= 2 {
+                REPEAT_TIMEOUT
+            } else {
+                HOLD_TIMEOUT
+            };
+            if hold.quiet > limit {
+                self.release();
+            } else if hold.held > HOLD_DELAY {
+                // The run: the selection slides at a speed that grows the
+                // longer the key is held, its target the next entry ahead.
+                let (row, step) = (hold.row, hold.step as f32);
+                let speed = (RUN_START + RUN_ACCEL * (hold.held - HOLD_DELAY) as f32).min(RUN_MAX);
+                let last = self.counts[row.index()].saturating_sub(1) as f32;
+                let focus = &mut self.focus[row.index()];
+                focus.position = (focus.position + step * speed * dt as f32).clamp(0.0, last);
+                let next = if step > 0.0 {
+                    focus.position.ceil()
+                } else {
+                    focus.position.floor()
+                };
+                focus.target = next as usize;
+                running = Some(row.index());
+            }
+        }
         for index in 0..3 {
-            more |= self.focus[index].tick(dt);
+            if running != Some(index) {
+                more |= self.focus[index].tick(dt);
+            }
             more |= self.fade[index].tick(dt);
         }
         more
@@ -478,6 +614,7 @@ mod tests {
         let mut controller = Controller::new([10, 4, 3]);
         controller.show(0);
         assert_eq!(controller.key("Right"), Action::Moved);
+        controller.key_up("Right");
         run(&mut controller, FOCUS_SECONDS / 2.0);
         assert!((controller.focus[0].position - 0.5).abs() < 0.06);
         run(&mut controller, FOCUS_SECONDS);
@@ -485,9 +622,84 @@ mod tests {
         // At rest no frames are asked for.
         assert!(!controller.tick(1.0 / 60.0));
         // The ends do not move.
-        assert_eq!(controller.key("Left"), Action::Moved);
+        controller.key("Left");
+        controller.key_up("Left");
         run(&mut controller, 1.0);
-        assert_eq!(controller.key("Left"), Action::None);
+        controller.key("Left");
+        controller.key_up("Left");
+        run(&mut controller, 1.0);
+        assert_eq!(controller.focus[0].position, 0.0);
+    }
+
+    #[test]
+    fn a_tap_moves_one_entry() {
+        let mut controller = Controller::new([30, 4, 3]);
+        controller.show(0);
+        controller.key("Right");
+        run(&mut controller, 0.1);
+        controller.key_up("Right");
+        run(&mut controller, 1.0);
+        assert_eq!(controller.focus[0].position, 1.0);
+        assert!(!controller.tick(1.0 / 60.0));
+    }
+
+    #[test]
+    fn holding_runs_faster_and_faster_then_settles_on_an_entry() {
+        let mut controller = Controller::new([200, 4, 3]);
+        controller.show(0);
+        controller.key("Right");
+        let mut positions = Vec::new();
+        for _ in 0..4 {
+            for _ in 0..10 {
+                run(&mut controller, 0.05);
+                controller.key("Right"); // the remote's key repeat
+            }
+            positions.push(controller.focus[0].position);
+        }
+        // Each half second covers more ground than the one before, up to the cap.
+        let steps: Vec<f32> = positions.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            steps[0] < steps[1] && steps[1] <= steps[2] + 0.01,
+            "{steps:?}"
+        );
+        // 10 x run(0.05) is up to 0.67 s (whole 1/60 s frames).
+        assert!(steps[2] <= RUN_MAX * 0.67 + 0.5);
+        controller.key_up("Right");
+        run(&mut controller, 1.0);
+        let focus = controller.focus[0];
+        assert_eq!(focus.position, focus.position.round());
+        assert_eq!(focus.target as f32, focus.position);
+        assert!(focus.position > positions[3]);
+    }
+
+    #[test]
+    fn a_run_stops_at_the_end_and_a_lost_key_up_times_out() {
+        let mut controller = Controller::new([10, 4, 3]);
+        controller.show(0);
+        controller.key("Right");
+        run(&mut controller, 0.9); // repeats stop arriving, no key-up either
+        run(&mut controller, HOLD_TIMEOUT + 0.5);
+        let focus = controller.focus[0];
+        assert_eq!(focus.position, 9.0);
+        assert_eq!(focus.target, 9);
+        assert!(!controller.tick(1.0 / 60.0));
+    }
+
+    #[test]
+    fn once_repeats_come_their_end_releases_quickly() {
+        let mut controller = Controller::new([200, 4, 3]);
+        controller.show(0);
+        controller.key("Right");
+        for _ in 0..40 {
+            run(&mut controller, 0.05);
+            controller.key("Right");
+        }
+        let at_release = controller.focus[0].position;
+        // Repeats stop and no key-up comes: released within REPEAT_TIMEOUT.
+        run(&mut controller, REPEAT_TIMEOUT + 1.0);
+        let moved = controller.focus[0].position - at_release;
+        assert!(moved < RUN_MAX * (REPEAT_TIMEOUT as f32 + 0.1), "{moved}");
+        assert!(!controller.tick(1.0 / 60.0));
     }
 
     #[test]

@@ -478,6 +478,7 @@ impl Dock {
             }
             self.screen = (width, height);
             evas_object_event_callback_add(window, EVAS_CALLBACK_KEY_DOWN, on_key, ptr::null());
+            evas_object_event_callback_add(window, EVAS_CALLBACK_KEY_UP, on_key_up, ptr::null());
         }
         let first = load();
         let last = first.clone();
@@ -1001,6 +1002,23 @@ unsafe extern "C" fn on_key(
     }
     let key = CStr::from_ptr(name).to_string_lossy();
     dock().key(&key);
+}
+
+unsafe extern "C" fn on_key_up(
+    _data: *mut c_void,
+    _evas: *mut c_void,
+    _object: *mut c_void,
+    info: *mut c_void,
+) {
+    // `Evas_Event_Key_Up` starts with `const char *keyname` as well.
+    let name = *(info as *const *const c_char);
+    if name.is_null() {
+        return;
+    }
+    let dock = dock();
+    if dock.ctl.key_up(&CStr::from_ptr(name).to_string_lossy()) == Action::Moved {
+        dock.start_animator();
+    }
 }
 
 unsafe extern "C" fn on_update(_data: *mut c_void, _buffer: *mut c_void, _bytes: u32) {

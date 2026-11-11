@@ -63,6 +63,8 @@ pub type EvasObjectEventCb = unsafe extern "C" fn(
 /// `Evas_Callback_Type` `EVAS_CALLBACK_KEY_DOWN`; the event info starts with
 /// `const char *keyname`.
 pub const EVAS_CALLBACK_KEY_DOWN: c_int = 10;
+/// `EVAS_CALLBACK_KEY_UP`; its event info starts with `keyname` too.
+pub const EVAS_CALLBACK_KEY_UP: c_int = 11;
 /// `Evas_Text_Style_Type` soft shadow.
 pub const EVAS_TEXT_STYLE_SOFT_SHADOW: c_int = 8;
 

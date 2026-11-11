@@ -31,8 +31,10 @@ record lives in `/opt/tv-suite/var/changes.json`, because brake files and the
 auto-update setting outlive a reboot. `EdgeScraper` has no unit to restart;
 it comes back at the next boot.
 
-Known gap: most telemetry unit names are Vetro's and do not exist on this
-firmware (see the backlog in `docs/rust-tv-suite-plan.md`).
+Known gap: most telemetry unit names do not exist on this firmware. Only the
+brake-file paths come from Vetro; Vetro stops other units
+(`adagent-service`, `contents-recognition-service`, `kpi-logging`, ...). See
+the backlog in `docs/rust-tv-suite-plan.md`.
 
 ## Configuration
 
