@@ -124,7 +124,7 @@ bins/tv-patchd/build-armv7.sh            # gnueabi: links libssl, libsqlite3, li
 
 Binary at `/opt/tv-suite/bin/tv-patchd` (0755), unit
 `systemd/tv-patchd.service` at `/opt/tv-units/tv-patchd.service` (0600). The
-sysroot needs `libssl.so` (`sysroot/fetch-tv-sysroot.sh`).
+sysroot needs `libssl.so` (`toolchain/sysroot/fetch-tv-sysroot.sh`).
 
 ## Not done
 

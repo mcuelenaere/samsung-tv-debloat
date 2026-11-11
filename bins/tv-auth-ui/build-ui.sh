@@ -11,7 +11,7 @@ ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 OUTPUT="$SCRIPT_DIR/out"
 TPK="$OUTPUT/org.tvauth.ui-0.1.0.tpk"
 
-"$ROOT/cross-build.sh" gnueabi build --locked --release -p tv-auth-ui
+"$ROOT/toolchain/cross-build.sh" gnueabi build --locked --release -p tv-auth-ui
 
 rm -rf "$OUTPUT/pkgroot"
 mkdir -p "$OUTPUT/pkgroot/bin" "$OUTPUT/pkgroot/shared/res"

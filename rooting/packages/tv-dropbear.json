@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "id": "tv-dropbear",
+  "version": "0.1.0",
+  "kind": "native",
+  "directories": [
+    {"path": "/opt/tv-sshd/bin", "mode": "0755", "smack": "System::Shared"}
+  ],
+  "files": [
+    {"source": "tv-dropbear", "destination": "/opt/tv-sshd/bin/dropbear", "mode": "0755", "smack": "System::Shared"}
+  ],
+  "links": [
+    {"path": "/opt/tv-sshd/bin/dropbearkey", "target": "dropbear"}
+  ],
+  "units": [
+    {"source": "dropbear.service", "name": "dropbear.service"}
+  ]
+}

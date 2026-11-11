@@ -501,6 +501,32 @@ mod tests {
     }
 
     #[test]
+    fn focused_key_merge_is_atomic_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        fs::write(&paths.authorized_keys, format!("# keep\n{ED}\n")).unwrap();
+        let access = Access::new(paths.clone(), None);
+        let key = ssh_keys::parse(ED)[0].clone();
+        access
+            .write_keys(&ssh_keys::add(
+                &fs::read_to_string(&paths.authorized_keys).unwrap(),
+                std::slice::from_ref(&key),
+            ))
+            .unwrap();
+        let merged = fs::read_to_string(&paths.authorized_keys).unwrap();
+        assert_eq!(merged, format!("# keep\n{ED}\n"));
+        assert_eq!(
+            fs::metadata(&paths.authorized_keys)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!paths.authorized_keys.with_extension("tmp").exists());
+    }
+
+    #[test]
     fn comments_are_one_log_token() {
         assert_eq!(safe("my laptop\tkey"), "my_laptop_key");
     }

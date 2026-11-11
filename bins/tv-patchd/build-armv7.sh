@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
-"$ROOT/cross-build.sh" gnueabi build --locked --release -p tv-patchd
+"$ROOT/toolchain/cross-build.sh" gnueabi build --locked --release -p tv-patchd
 
 mkdir -p "$SCRIPT_DIR/out"
 install -m 0755 "$ROOT/target/cross-gnueabi/armv7-unknown-linux-gnueabi/release/tv-patchd" \

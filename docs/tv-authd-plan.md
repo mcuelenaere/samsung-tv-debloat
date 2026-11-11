@@ -291,7 +291,7 @@ installed as a normal signed package, launched through AUL, ran as
 YouTube, and dismissed with OK/RETURN. It was removed from the tree after the
 native UI passed acceptance and remains in git history at commit `7b39883`.
 
-The production approval UI lives in `root-broker/ui/rust/` and:
+The production approval UI lives in `research/root-broker/ui/rust/` and:
 
 1. is launched by the daemon through a fixed AUL/`app_launcher -s org.tvauth.ui` command;
 2. creates a notification-type EFL/Wayland window at the highest usable notification level;
@@ -437,7 +437,7 @@ Only the root executable must be copied into RAM-backed `/run`, so that artifact
 
 ### Native UI
 
-The UI is a native Rust/EFL Tizen `type="capp"` application in `root-broker/ui/rust`. It runs as UID 5001 with the package SMACK label and connects directly to the broker socket. The daemon stages its ELF through the `/run` alias described in §7; no UEP bypass or partner signing is involved. Keep the raw EFL surface in `efl.rs` and the protocol/state machine in the small native modules. Track the stripped binary size, signed TPK size, process RSS, and launch latency.
+The UI is a native Rust/EFL Tizen `type="capp"` application in `research/root-broker/ui/rust`. It runs as UID 5001 with the package SMACK label and connects directly to the broker socket. The daemon stages its ELF through the `/run` alias described in §7; no UEP bypass or partner signing is involved. Keep the raw EFL surface in `efl.rs` and the protocol/state machine in the small native modules. Track the stripped binary size, signed TPK size, process RSS, and launch latency.
 
 ### Validated M0 evidence
 
@@ -489,12 +489,12 @@ Freeze the small wire protocol and package/label names before parallel implement
 
 | Workstream | Ownership | Deliverable |
 |---|---|---|
-| A. Platform spikes | `root-broker/spikes/` and small test programs | Rust ARMv7 execution, `SO_PEERSEC`, EFL popup evidence |
-| B. Daemon | `root-broker/daemon/` | Rust broker, protocol, grants, execution, unit tests |
-| C. Approval UI | `root-broker/ui/rust/` | Native Rust/EFL prompt/grant manager with isolated FFI |
+| A. Platform spikes | `research/root-broker/spikes/` and small test programs | Rust ARMv7 execution, `SO_PEERSEC`, EFL popup evidence |
+| B. Daemon | `research/root-broker/daemon/` | Rust broker, protocol, grants, execution, unit tests |
+| C. Approval UI | `research/root-broker/ui/rust/` | Native Rust/EFL prompt/grant manager with isolated FFI |
 | D. Vetro adapter | Separate Vetro worktree only | Same-process, dependency-free Unix-socket implementation behind `platform.execute()` |
-| E. Persistence/build | `root-broker/systemd/`, `root-broker/build/`, minimal `persistence/` edits | Reproducible ARMv7 build and boot integration |
-| F. End-to-end tests | `root-broker/tests/` | Multi-app, failure, reboot, and Vetro acceptance tests |
+| E. Persistence/build | `research/root-broker/systemd/`, `research/root-broker/build/`, minimal `rooting/payloads/persistence/` edits | Reproducible ARMv7 build and boot integration |
+| F. End-to-end tests | `research/root-broker/tests/` | Multi-app, failure, reboot, and Vetro acceptance tests |
 
 Avoid having multiple agents edit the protocol definition or the same persistence hook concurrently. Merge protocol changes explicitly.
 
@@ -508,7 +508,7 @@ Avoid having multiple agents edit the protocol definition or the same persistenc
 
 ### M1 — Headless broker (complete)
 
-- Rust core implemented under `root-broker/daemon/` with NDJSON protocol, strict package-label identity, exact-label grants, bounded execution, and ARMv7 build.
+- Rust core implemented under `research/root-broker/daemon/` with NDJSON protocol, strict package-label identity, exact-label grants, bounded execution, and ARMv7 build.
 - Deployed as `/opt/tv-auth/tv-authd`, unit source `/opt/tv-units/tv-authd.service`, runtime socket `/run/tv-auth/broker.sock`.
 - Dynamic boot hook stages and starts every `/opt/tv-units/*.service` independently.
 - A granted managed .NET package executed a root command and received a valid response; an ungranted package was denied.
@@ -528,7 +528,7 @@ Avoid having multiple agents edit the protocol definition or the same persistenc
   persists the exact label before execution; revoke restores prompting.
 - UI timeout, disconnect, launcher failure, and stale/expired decisions fail
   closed.
-- Managed .NET approval/grant-manager UI implemented under `root-broker/ui/`.
+- Managed .NET approval/grant-manager UI implemented under `research/root-broker/ui/`.
 - 35 Linux tests pass, including queueing, nonce rejection, timeout, disconnect,
   persistence, revoke, rollback on failed grant writes, and role separation.
   ARMv7 broker build: 546,388 bytes, SHA-256
@@ -643,12 +643,12 @@ results. The pre-migration managed `.NET` UI remains in git history at commit
 `7b39883`. Raw evidence
 and build commands live in:
 
-- `root-broker/spikes/armv7-hello/`
-- `root-broker/spikes/peer-identity/`
-- `root-broker/spikes/efl-popup/`
-- `root-broker/sysroot/`
-- `root-broker/daemon/`
-- `root-broker/ui/`
+- `research/root-broker/spikes/armv7-hello/`
+- `research/root-broker/spikes/peer-identity/`
+- `research/root-broker/spikes/efl-popup/`
+- `research/root-broker/sysroot/`
+- `research/root-broker/daemon/`
+- `research/root-broker/ui/`
 
 Future milestones should continue updating this document rather than preserving
 superseded assumptions.

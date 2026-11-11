@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "id": "tv-authd",
+  "version": "0.1.0",
+  "kind": "native",
+  "files": [
+    {"source": "tv-authd", "destination": "/opt/tv-auth/tv-authd", "mode": "0755", "smack": "System::Shared"}
+  ],
+  "units": [
+    {"source": "tv-authd.service", "name": "tv-authd.service"}
+  ]
+}

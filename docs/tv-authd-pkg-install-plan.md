@@ -459,7 +459,7 @@ with explicit authorization, on the user's TV.
 
 | Milestone | Content | Host validation | TV validation |
 |---|---|---|---|
-| M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
+| M1 | protocol v2 parsing, staging, manifest parser, trust enrollment, `pkg.install` for pre-signed tpk, `kind=install` prompt, approve/deny | **done (host, rebased on M4 + review-fixes):** 106 Linux tests in `research/root-broker/daemon`, clippy-clean, ARMv7 cross-build, UI build; `sign-wgt.sh` still outstanding | **validated 2026-11-08 (incl. cold boot):** trust enrollment + PID-1 namespace check, TPK install via broker, prompt UI, deny/timeout, policy refusals. WGT blocked; Home listing needs M4 (§13/§14) |
 | M2 | `pkg.uninstall` (prompted), `pkg.list`, root CLI role with UI notice | **done (host):** 120 Linux tests, clippy/fmt clean, ARMv7 cross-build; uninstall/list protocol round-trips, root-role gating, notice kinds | **validated 2026-11-08:** app-role uninstall prompt, Deny and Remove, protected/unknown refusals, `pkg.list` from app and root roles, prompt-free root install/uninstall with `PACKAGE CHANGE` toasts |
 | M3 | `pkgsign.rs` on-device re-signing of unsigned and foreign-signed packages | **done (host):** template/reference/signature-file unit tests, archive rewrite, author-mismatch refusal, 127 Linux tests, ARMv7 build | **validated 2026-11-08 (tpk):** foreign-signed tpk → approve → `re_signed: true` → installs; stripped Partner-signed upgrade → `author_mismatch_requires_reinstall`; two-CA domain rule verified. WGT install still blocked by `pkgcmd` (M4) |
 | M4 | WAS backend (`wascmd` under a private mount namespace) so installs appear in Samsung Home | **done (host):** `/etc` symlink overlay without `release`, wascmd invocation, pkgcmd+Home fallback, 130 Linux tests | **validated 2026-11-08 (tpk):** broker install creates the Home row/icon; broker uninstall (WAS and pkgcmd fallback) removes them. WGT still fails with `-4 Load archive info fail` through `pkgcmd`, `sdb install`, and `wascmd` (firmware limitation) |
@@ -483,7 +483,7 @@ Out of scope (documented to avoid creep): delta updates, mount-installed
 
 ## 12. M1 implementation notes (host-validated)
 
-Code (all under `root-broker/`):
+Code (all under `research/root-broker/`):
 
 - `daemon/src/protocol.rs` — protocol v2 requests and metadata, version gating,
   install validators, `kind`/`install` in `ui.prompt`, `invalid_decision`.

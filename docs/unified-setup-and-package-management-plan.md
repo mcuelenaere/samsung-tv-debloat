@@ -1,6 +1,6 @@
 # Unified TV setup and package management plan
 
-Status: proposed
+Status: implemented (host work and fixtures); TV hardware validation remains open
 
 ## Objective
 
@@ -25,6 +25,7 @@ bins/
   tv/                       Main host CLI and generic external-subcommand runner
   tv-pkg/                   On-TV component manager
   tv-sdb/                   Standalone SDB CLI
+  tv-bundle/                Component-package and setup-bundle builder
   tv-authd/
   tv-auth-cli/
   tv-auth-popupd/
@@ -48,6 +49,8 @@ rooting/
   payloads/
     fdet/                   Managed .NET 6 and .NET Core 3.1 payloads
     persistence/            AT-HUB hook and privileged boot-persistence assets
+    setup/                  Thin on-TV setup driver
+  packages/                 Reviewed component specs and fixed order
   docs/                     Root-specific research and validation records
 scripts/
   claude-worktree.sh        Create/remove a sparse Claude Code worktree
@@ -329,3 +332,26 @@ and the .NET SDK; release users require none of them.
 - No failure is allowed to silently replace an unknown persistence hook.
 - Cold boot starts all expected services and the manager/dock remains usable.
 - Historical cleanup introduces no production behavior changes by itself.
+
+## Implementation status
+
+The host work is implemented in the layout above and covered by host fixtures:
+
+- `bins/tv` has built-in `sdb` / `ssh-key` commands and external `tv-pkg`,
+  `tv-root` and `tv-setup` dispatch.
+- `rooting/` is a nested workspace with the managed FDET payload,
+  native-SDB capture, compatibility gates, bundle validation and `tv root`.
+- `rooting/bins/tv-setup` implements the bundle verification, target lock,
+  preflight, staging and one-shot driver execution.
+- `rooting/payloads/setup/setup-driver.sh` installs components through
+  `tv-pkg`, enrolls/reuses trust before the UI TPK, applies guarded persistence
+  last and verifies services, the alias, the broker socket and component state.
+- `bins/tv-bundle` and `rooting/build-suite-bundle.sh` emit reproducible
+  component packages and the setup manifest for every suite component.
+- `tv ssh-key add` shares the `tv-ssh-key` parser with `tv-authd`; on-TV
+  approval remains the only way a key is authorized.
+
+Hardware-only checks are listed in
+[`../rooting/docs/HARDWARE-VALIDATION.md`](../rooting/docs/HARDWARE-VALIDATION.md).
+`bins/tv-pkg` remains a separate implementation; this work only consumes its
+CLI and package format.

@@ -1,0 +1,10 @@
+[package]
+name = "tv-setup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "External `tv setup` one-shot suite installer"
+
+[dependencies]
+tv-root.workspace = true
+tv-sdb.workspace = true

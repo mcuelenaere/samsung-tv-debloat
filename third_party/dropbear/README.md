@@ -4,21 +4,24 @@ Tested on the TV at `192.0.2.10`: Tizen 6.5.0, Linux 5.4.77, `armv7l`.
 The server is **dropbear 2026.94**, built as a statically linked ARMv7
 multi-call binary. Root login uses public-key authentication only.
 
-This document covers the standalone SSH server build and manual SDB/root-shell
-launcher used during initial bring-up. For the current boot-persistent
-deployment (`/opt/tv-units/dropbear.service` running from the root-only
-`/opt/tv-sshd/bin/dropbear` via `BindReadOnlyPaths=`), see
-[`../persistence/README.md`](../persistence/README.md).
+This document covers the Dropbear build recipe and the technical reasons behind
+its runtime layout. The initial manual SDB launcher has been retired: it
+overwrote `authorized_keys` on every run. Its files are kept only as historical
+material under `research/legacy-dropbear/`.
+
+The supported path is the `tv-dropbear` component installed by `tv-pkg` as part
+of `tv setup`. Updates preserve `authorized_keys` and the host key. For the
+boot-persistent deployment (`/opt/tv-units/dropbear.service` running from the
+root-only `/opt/tv-sshd/bin/dropbear` via `BindReadOnlyPaths=`), see
+[`../../rooting/payloads/persistence/README.md`](../../rooting/payloads/persistence/README.md).
 
 ## Repository contents
 
 | File | Purpose |
 | --- | --- |
 | `build-dropbear.sh` | Reproducible Docker/QEMU ARMv7 static build. |
-| `install-dropbear.sh` | Pushes the binary and launcher to the TV with `sdb`. |
-| `tv-start-sshd.sh` | Idempotent on-TV launcher; contains the authorized public key. |
-| `authorized_keys` | Reference copy of the configured public key. |
 | `out/dropbear` | Generated binary, intentionally git-ignored. |
+| `research/legacy-dropbear/` | Retired manual launcher and reference key. |
 
 No prebuilt binary or private key is stored here.
 
@@ -74,7 +77,7 @@ Requirements on the host:
 Run:
 
 ```bash
-cd dropbear
+cd third_party/dropbear
 ./build-dropbear.sh
 ```
 
@@ -89,7 +92,7 @@ SHA-256: e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81
 Output:
 
 ```text
-dropbear/out/dropbear
+third_party/dropbear/out/dropbear
 ```
 
 The tested file identification is:
@@ -113,88 +116,22 @@ conflict with dropbear's default `-Wl,-pie` linker flags.
 
 ## Install or update the TV files
 
-Build first, then run:
+Do not use the retired manual launcher. Build the binary here, then install the
+`tv-dropbear` component through a setup bundle:
 
-```bash
-./install-dropbear.sh 192.0.2.10
+```sh
+./build-dropbear.sh
+TARGET_BUILD=<exact-reviewed-build> rooting/build-suite-bundle.sh
+tv setup <tv> --bundle <bundle-dir>
 ```
 
-If `sdb` is elsewhere:
+`tv-pkg` owns `/opt/tv-sshd/bin/dropbear` and the relative
+`dropbearkey -> dropbear` alias. The setup driver installs the Dropbear package
+first and the guarded persistence hook last. Existing keys, resources and the
+host key are never replaced by a Dropbear update.
 
-```bash
-SDB=/path/to/tizen-studio/tools/sdb ./install-dropbear.sh 192.0.2.10
-```
-
-The installer only stages files. It does not start the server or modify the TV
-boot configuration.
-
-Equivalent manual commands:
-
-```bash
-SDB=$HOME/tizen-studio/tools/sdb
-TV=192.0.2.10:26101
-"$SDB" connect "$TV"
-"$SDB" -s "$TV" push out/dropbear \
-  /home/owner/share/tmp/sdk_tools/dropbear
-"$SDB" -s "$TV" push tv-start-sshd.sh \
-  /home/owner/share/tmp/sdk_tools/tv-start-sshd.sh
-```
-
-## Start or restart
-
-From a root shell on the TV:
-
-```bash
-source /home/owner/share/tmp/sdk_tools/tv-start-sshd.sh
-```
-
-Use `source`, **not**:
-
-```bash
-bash /home/owner/share/tmp/sdk_tools/tv-start-sshd.sh
-```
-
-The latter trips Samsung's script-signature check on this firmware:
-
-```text
-[uep][bash] the file is NOT signed!!
-```
-
-Expected successful output includes:
-
-```text
-dropbear pid: <pid>
-tcp  0  0 0.0.0.0:22  0.0.0.0:*  LISTEN
-tcp6 0  0 :::22       :::*       LISTEN
-```
-
-The script is idempotent: it writes the configured public key, stops the PID in
-`/run/tv-sshd/dropbear.pid` if present, recreates the volatile runtime, and
-starts a new server. Existing host keys are preserved.
-
-## Connect
-
-Use the private key corresponding to the configured `your-key-comment` public
-key. With that key available to the normal SSH agent/configuration:
-
-```bash
-ssh root@192.0.2.10
-```
-
-A successful login is UID/GID 0. No password login is enabled.
-
-## Boot behavior
-
-The binary, launcher, authorized key, and host key are persistent. The running
-server is not: it disappears when the TV powers off, and `/run` is cleared.
-Run the launcher again as root after each boot. No TV-local systemd unit,
-`rc.local`, cron job, or other boot hook is installed by this package.
-
-`setsid` detaches the process from its session but does **not** move it to a new
-cgroup. Because root command execution originates through Samsung services,
-dropbear can appear in the originating service's cgroup. Restarting that service
-can therefore kill dropbear; rerun the launcher after the service and root
-access recover.
+The technical notes below describe the retired launcher's constraints and
+remain useful for the component's unit and bind-mount layout.
 
 ## Why the launcher has these workarounds
 
@@ -266,7 +203,7 @@ Before `exec`, the launcher:
 The resulting server retains only its listening sockets, log, `/dev/null`, and
 its own executable descriptor—not the exploit device or caller pipes.
 
-## Configuration and security
+## Configuration and security (legacy launcher)
 
 The active public key is present in both:
 
@@ -311,7 +248,7 @@ Common messages:
 | `Dropbear SSH multi-purpose ...` | The multi-binary was invoked with the wrong basename; check the symlinks. |
 | `wtmp_write ... /dev/null/wtmp` or `lastlog_openseek` | Harmless accounting-file warnings on this minimal TV userland. |
 
-## Remove the installation
+## Remove the legacy installation
 
 From a root shell, after replacing the example paths if customized:
 

@@ -1,0 +1,16 @@
+[package]
+name = "tv-bundle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reproducible .tvpkg component and setup-bundle builder"
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["flate2", "deflate-flate2"] }
+
+[dev-dependencies]
+tempfile = "3"

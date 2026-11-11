@@ -1,0 +1,13 @@
+[package]
+name = "tv"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Unified host command for the TV suite"
+
+[dependencies]
+tv-sdb.workspace = true
+tv-ssh-key.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

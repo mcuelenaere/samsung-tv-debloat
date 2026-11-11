@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "id": "tv-auth-popupd",
+  "version": "0.1.0",
+  "kind": "native",
+  "files": [
+    {"source": "tv-auth-popupd", "destination": "/opt/tv-suite/bin/tv-auth-popupd", "mode": "0755", "smack": "System::Shared"}
+  ],
+  "units": [
+    {"source": "tv-auth-popupd.service", "name": "tv-auth-popupd.service"}
+  ]
+}

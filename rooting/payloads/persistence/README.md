@@ -2,6 +2,11 @@
 
 *Target: S95B/PontusM, Tizen 6.5, build `T-PTMDEUC-REL-202602250226`.*
 
+`tv setup` applies this hook on the TV through the thin setup driver and
+`tv-apply.sh`; it does not use host SSH. `deploy.sh` remains the manual guarded
+install/rollback tool for an operator with an authorized root SSH session and
+off-device snapshots.
+
 ## Purpose
 
 `AT-HUB.service` runs `/opt/etc/parseinfo.sh` as root on every normal
@@ -55,7 +60,7 @@ policy, dependencies, and private `/run` bind mounts.
 unsigned ELFs whose path falls under `/opt`, `/tmp`, `/var`, or `/home`. The check
 is **path-scoped** (built with `d_path()`), so the same file reached through a
 bind mount under `/run` — outside those prefixes — is not verified. See
-[`../docs/samsung-tv-uep.md`](../docs/samsung-tv-uep.md).
+[`../../../docs/samsung-tv-uep.md`](../../../docs/samsung-tv-uep.md).
 
 So instead of copying the payload into `/run` at boot, each unit declares:
 
@@ -202,8 +207,8 @@ upgrade where the live hook is no longer pristine:
 export TV_HOST=root@tv-living.home
 export PRISTINE_HOOK=/secure/off-box/parseinfo.sh.original
 
-./persistence/deploy.sh check "$PRISTINE_HOOK"
-./persistence/deploy.sh install "$PRISTINE_HOOK"
+./deploy.sh check "$PRISTINE_HOOK"
+./deploy.sh install "$PRISTINE_HOOK"
 ```
 
 The pristine file is not stored in this repository. It must be a regular
@@ -238,14 +243,14 @@ through `PERSISTENCE_BACKUP_ROOT` inside the repository is ignored by Git, but
 Stop and resume optional services for the next boot:
 
 ```sh
-./persistence/deploy.sh disable
-./persistence/deploy.sh enable
+./deploy.sh disable
+./deploy.sh enable
 ```
 
 Rollback restores every file in a snapshot, not just the hook:
 
 ```sh
-./persistence/deploy.sh rollback \
+./deploy.sh rollback \
   "$HOME/.local/state/neon-lagoon/persistence-backups/<timestamp>-<hash>"
 ```
 

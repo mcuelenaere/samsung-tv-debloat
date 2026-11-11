@@ -1,13 +1,17 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "bins/*"]
-# Spikes keep their own lockfiles and toolchains.
-exclude = ["root-broker"]
+# `rooting/` is a nested workspace for privileged acquisition and setup work.
+# Research probes keep their own lockfiles and toolchains.
+exclude = ["research/root-broker", "rooting"]
 # Host builds: the EFL binaries only link against the TV sysroot (see
-# cross-build.sh), so plain `cargo build` skips them.
+# toolchain/cross-build.sh), so plain `cargo build` skips them.
 default-members = [
     "crates/tv-proto",
     "crates/tv-sdb",
+    "crates/tv-ssh-key",
+    "bins/tv",
+    "bins/tv-bundle",
     "bins/tv-authd",
     "bins/tv-auth-cli",
     "bins/tv-sdb",
@@ -22,6 +26,7 @@ tv-proto = { path = "crates/tv-proto" }
 tv-efl = { path = "crates/tv-efl" }
 tv-tizen = { path = "crates/tv-tizen" }
 tv-sdb = { path = "crates/tv-sdb" }
+tv-ssh-key = { path = "crates/tv-ssh-key" }
 
 [profile.release]
 opt-level = "z"

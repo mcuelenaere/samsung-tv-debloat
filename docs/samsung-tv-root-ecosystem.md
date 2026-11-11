@@ -211,7 +211,7 @@ present but no `Dlog_buffer.sh`, no DeviceTracker/`Dlog_buffer` reference in
 directly. The PR's boot trigger is therefore absent on this firmware, and its
 hardcoded original hash/firmware guard correctly rejects the S95B. This repo
 keeps the AT-HUB/systemd route; the useful deployment-safety ideas from the PR
-are documented in [`persistence/README.md`](../persistence/README.md).
+are documented in [`persistence/README.md`](../rooting/payloads/persistence/README.md).
 
 ---
 

@@ -1,0 +1,10 @@
+# Fixed reviewed suite order. The setup driver installs these in order; the
+# guard applies the AT-HUB persistence hook only after all of them.
+tv-dropbear packages/tv-dropbear.tvpkg
+tv-pkg packages/tv-pkg.tvpkg
+tv-authd packages/tv-authd.tvpkg
+tvauth-cli packages/tvauth-cli.tvpkg
+org.tvauth.ui packages/org.tvauth.ui.tvpkg
+tv-auth-popupd packages/tv-auth-popupd.tvpkg
+tv-blockd packages/tv-blockd.tvpkg
+tv-patchd packages/tv-patchd.tvpkg

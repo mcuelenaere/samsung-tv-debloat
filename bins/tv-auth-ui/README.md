@@ -261,11 +261,11 @@ See `docs/tv-launcher-plan.md`.
 ## Build
 
 ```sh
-../../sysroot/fetch-tv-sysroot.sh   # read-only TV access; needs authorization
+../../toolchain/toolchain/sysroot/fetch-tv-sysroot.sh   # read-only TV access; needs authorization
 ./build-ui.sh
 ```
 
-`build-ui.sh` runs `../../cross-build.sh gnueabi`, which uses
+`build-ui.sh` runs `../../toolchain/cross-build.sh gnueabi`, which uses
 `rust:1.85.0-slim-bullseye@sha256:a78439ac2ee14dc1c2c188fef0ff0b197e1cc1918d4b3daf486776ac0f60029a`,
 target `armv7-unknown-linux-gnueabi`, and Debian's soft-float
 `arm-linux-gnueabi-gcc`. It links against the TV's seven direct EFL libraries

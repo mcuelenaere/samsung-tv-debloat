@@ -1,6 +1,6 @@
 # Tizen root authorization broker
 
-This directory contains the implementation work for the SuperSU-like root broker proposed in [`../docs/tv-authd-plan.md`](../docs/tv-authd-plan.md).
+This directory contains the implementation work for the SuperSU-like root broker proposed in [`../docs/tv-authd-plan.md`](../../docs/tv-authd-plan.md).
 
 The M0 platform spikes, M1 headless broker, M2 approval UI, M3/Vetro cutover, and per-app toast branch are live and validated. M4 hardening is deployed on top of the live branch; package upgrade/reinstall, memory pressure, boot-input, and log-permission checks passed. All M4 checks, including cold boot, are complete; the manager-refresh UI is installed. Sources:
 
@@ -13,7 +13,7 @@ The M0 platform spikes, M1 headless broker, M2 approval UI, M3/Vetro cutover, an
 - `../crates/tv-proto/`: the broker wire protocol shared by the daemon and its clients.
 
 The production code moved into the repository's Cargo workspace (see
-[`../README.md`](../README.md)); this directory keeps the spikes, probes, and
+[`../README.md`](../../README.md)); this directory keeps the spikes, probes, and
 working notes.
 
 Each spike records its own build commands and validation results. Host builds and emulation do not count as on-TV validation.

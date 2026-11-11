@@ -4,7 +4,7 @@
 through `SO_PEERCRED`/`SO_PEERSEC`, and executes a shell command only after an
 exact package-level grant. M1 validated the headless broker. M2 added the
 interactive approval flow, persistent **Always allow** grants, and the managed
-.NET grant manager under `root-broker/ui/`. The live branch also has per-app
+.NET grant manager under `research/root-broker/ui/`. The live branch also has per-app
 execution toasts; M4 binds grants to the installed package signature and adds
 failure-path/probe coverage. Protocol v2 adds package management (see
 `../../docs/tv-authd-pkg-install-plan.md`): `pkg.install` with staging, manifest
@@ -336,10 +336,12 @@ READMEs for behavior, build, and deployment.
 ## Remote access
 
 `src/access.rs` keeps SSH (Dropbear) and SDB on or off, the SDB host, and the
-SSH keys, so every change to who can reach the TV is audited: the manager's
-System tab drives it through `access.*`, and a key pushed with `tv-sdb` is
-added only after the user allows it on the popup (`kind: "ssh_key"`). See
-`PROTOCOL.md`.
+SSH keys, so every change to who can reach the TV is audited. The focused
+enrollment path is `tv ssh-key add <tv> <public-key>`: the host validates the
+key and pushes it to the drop file; `tv-authd` parses it, shows the
+kind/comment/fingerprint prompt (`kind: "ssh_key"`) and merges only the keys the
+user allowed, atomically and without duplicates. The host never edits
+`authorized_keys` directly. See `PROTOCOL.md`.
 
 ## Test clients
 

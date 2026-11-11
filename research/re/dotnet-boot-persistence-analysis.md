@@ -6,8 +6,8 @@ Tizen 6.5.0 · Linux 5.4.77 `armv7l` · build `T-PTMDEUC-1720.7`
 (`/proc/uptime` = 861266 s). All work performed **read-only** over SSH; no file
 on the TV was created, modified, or executed.*
 
-Complements [`docs/samsung-tv-secure-boot.md`](../docs/samsung-tv-secure-boot.md) §6.3
-and [`docs/samsung-tv-root-ecosystem.md`](../docs/samsung-tv-root-ecosystem.md) §5
+Complements [`docs/samsung-tv-secure-boot.md`](../../docs/samsung-tv-secure-boot.md) §6.3
+and [`docs/samsung-tv-root-ecosystem.md`](../../docs/samsung-tv-root-ecosystem.md) §5
 (the levkropp "untethered" route).
 
 ---
@@ -597,10 +597,10 @@ restoring the symlinks/markers and `/opt/usr/dotnet/Tizen.Bixby/*`.
   `ssh root@192.0.2.10 'cat /usr/bin/X' > X`.
 
 ### Cross-references
-* [`docs/samsung-tv-secure-boot.md`](../docs/samsung-tv-secure-boot.md) — boot chain, §6.3.
-* [`docs/samsung-tv-uep.md`](../docs/samsung-tv-uep.md) — the exec gate.
-* [`docs/samsung-qn90b-architecture.md`](../docs/samsung-qn90b-architecture.md) §4–5.
-* [`docs/samsung-tv-root-ecosystem.md`](../docs/samsung-tv-root-ecosystem.md) §5.
+* [`docs/samsung-tv-secure-boot.md`](../../docs/samsung-tv-secure-boot.md) — boot chain, §6.3.
+* [`docs/samsung-tv-uep.md`](../../docs/samsung-tv-uep.md) — the exec gate.
+* [`docs/samsung-qn90b-architecture.md`](../../docs/samsung-qn90b-architecture.md) §4–5.
+* [`docs/samsung-tv-root-ecosystem.md`](../../docs/samsung-tv-root-ecosystem.md) §5.
 * [`re/qn90b-core-daemons/`](qn90b-core-daemons/) — `app-boot-manager`, `parseinfo.sh`.
 
 *All data gathered read-only over SSH on 2026-11-04; no changes were made to the

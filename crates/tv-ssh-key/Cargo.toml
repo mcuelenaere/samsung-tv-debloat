@@ -1,0 +1,10 @@
+[package]
+name = "tv-ssh-key"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Parse OpenSSH public keys and print their fingerprints"
+
+[dependencies]
+base64 = "0.22"
+sha2 = "0.10"

@@ -399,12 +399,12 @@ was left at its pre-test value. Key sources:
   `d_path` (`0xc01ac8f4`), prefix matcher (`0xc027e3cc`), prefix table
   (`0xc09f46b0`), and the on-device bind-mount test (§8).
 - Local repo: [`docs/samsung-qn90b-architecture.md`](samsung-qn90b-architecture.md) §3,
-  [`dropbear/README.md`](../dropbear/README.md), [`re/qn90b-core-daemons`](../re/qn90b-core-daemons/README.md).
+  [`dropbear/README.md`](../third_party/dropbear/README.md), [`re/qn90b-core-daemons`](../research/re/qn90b-core-daemons/README.md).
 
 ### Open questions
 
 > *Update 2026-11-04:* items 1, 3 and parts of 5 are resolved in
-> [re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md)
+> [re/at-hub-persistence-analysis.md](../research/re/at-hub-persistence-analysis.md)
 > (§2.5–2.6): `#RPA` is the `#RPAC=…` anti-tamper first-line tag on ~93 image unit
 > files (inert to systemd); the trailer layout is
 > `[signature][base64(len)][":UEP"]`; and the bash check is a **userspace** call into

@@ -214,7 +214,7 @@ Bluetooth framework stack (`bluetooth-frwk`, `ble`, `bt.connectionmanager`, …)
 | 7100 | `muse-server` | VD media/UI server |
 | 36669 | `spotifyd` | Spotify Connect (lightweight node service) |
 | 15500 | `acm-service` | — |
-| **22** | **dropbear** | **← our SSH; see [Dropbear setup](../dropbear/README.md)** |
+| **22** | **dropbear** | **← our SSH; see [Dropbear setup](../third_party/dropbear/README.md)** |
 
 Media pipeline: `media-server`, `mediacontroller`, `pulseaudio`,
 `speaker-manager`, `avocd-launcher` (AV output control), `sealayer` (parses
@@ -255,7 +255,7 @@ TV — it has to be either (a) re-triggered from the host after each boot via th
 same .NET root agent, or (b) hooked into some stock service that already execs
 from `/opt` (needs a targeted hunt). The concrete binary build, launcher,
 configuration, runtime paths, and workarounds are documented in
-[Dropbear SSH on the Samsung TV](../dropbear/README.md).
+[Dropbear SSH on the Samsung TV](../third_party/dropbear/README.md).
 
 ---
 

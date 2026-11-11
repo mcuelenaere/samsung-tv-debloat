@@ -445,7 +445,7 @@ Observed attributes:
   `/proc/target_version`.
 
 **Verified mechanics (full evidence in
-[re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md)):**
+[re/at-hub-persistence-analysis.md](../research/re/at-hub-persistence-analysis.md)):**
 
 - systemd does **not** use a shell: it `execve()`s the file and the kernel runs the
   `#!` handler. The trailing `&` is passed as **`argv[1]`** (harmless), not as
@@ -462,7 +462,7 @@ Observed attributes:
   contains the platform token `micom` (`tztv_micom`). Failure prints
   `[uep][bash] the file is NOT signed!! : <path>` and `exit(1)`. Sourcing (`.`) a
   file skips the check entirely — the same rule already recorded in
-  [dropbear/README.md](../dropbear/README.md).
+  [dropbear/README.md](../third_party/dropbear/README.md).
 - The trailer is `[signature][base64(len)][":UEP"]`, i.e. the last line
   `##UEP…:UEP`; editing the body invalidates it.
 - **The kernel `uep` module has no script path** — its symbols are ELF-only
@@ -496,7 +496,7 @@ would fail nothing else (the files are writable). So:
   available),
 - replacing **managed (.NET) IL** → **not** caught by UEP. The generic levkropp route
   ("replace the IL of a `dotnet-inhouse` app") maps onto this build as follows (full
-  evidence in [`re/dotnet-boot-persistence-analysis.md`](../re/dotnet-boot-persistence-analysis.md)):
+  evidence in [`re/dotnet-boot-persistence-analysis.md`](../research/re/dotnet-boot-persistence-analysis.md)):
   - the apphosts (`dotnet-launcher`, `dotnet-launcher-inhouse` — the same binary,
     `dotnet-loader`, `dotnet-hydra-loader`, `launchpad-starter`) are **UEP-signed
     ELFs — do not touch them**;
@@ -548,8 +548,8 @@ down dropbear too. Any "keep sshd up" scheme must either:
 ### 6.7 Safe, read-only checks — completed
 
 The following were carried out read-only (details and evidence in
-[re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md) and
-[re/dotnet-boot-persistence-analysis.md](../re/dotnet-boot-persistence-analysis.md)):
+[re/at-hub-persistence-analysis.md](../research/re/at-hub-persistence-analysis.md) and
+[re/dotnet-boot-persistence-analysis.md](../research/re/dotnet-boot-persistence-analysis.md)):
 
 - **Full inventory** of units whose `ExecStart` references a writable path, with their
   `User=`. Result: `AT-HUB.service` is the **only** root unit that executes a *script*
@@ -586,7 +586,7 @@ constraint):
    userspace library re-implements the RW-mount rule (`checkFileIsInRWUser`), which
    implies there is no kernel script path — but this is the one decisive test for
    route #1 (test plan in
-   [re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md) §5).
+   [re/at-hub-persistence-analysis.md](../research/re/at-hub-persistence-analysis.md) §5).
 4. **Does the app framework verify `author-signature.xml` at launch?** (`amd`'s real
    logic is in the unpulled `libamd.so.1`/`libaul-server.so.0`.) Decides whether the
    `.NET`-IL route (#3) survives a manifest/signature check.
@@ -597,7 +597,7 @@ constraint):
 
 *Resolved since the first draft: UEP's scope for `/opt` scripts, the root boot-hook
 inventory, and the `.NET` boot path — see the two analysis notes under
-[`re/`](../re/).*
+[`re/`](../research/re/).*
 
 ---
 
@@ -627,11 +627,11 @@ All gathered **read-only** over SSH; no files were changed on the TV. Key source
 - [Samsung QN90B — System Architecture](samsung-qn90b-architecture.md) — §2 boot, §3 security model.
 - [Samsung UEP on the TV](samsung-tv-uep.md) — the exec gate, `##UEP…:UEP`, `sfpmd`.
 - [Samsung QN90B SMACK Policy](samsung-tv-smack-policies.md) — labels, live policy.
-- [re/qn90b-core-daemons](../re/qn90b-core-daemons/README.md) — `parseinfo.sh` /
+- [re/qn90b-core-daemons](../research/re/qn90b-core-daemons/README.md) — `parseinfo.sh` /
   `AT-HUB` persistence lead; `FINDINGS.md` for other writable surfaces.
-- [re/at-hub-persistence-analysis.md](../re/at-hub-persistence-analysis.md) — deep-dive
+- [re/at-hub-persistence-analysis.md](../research/re/at-hub-persistence-analysis.md) — deep-dive
   of the `AT-HUB` / `parseinfo.sh` / gawk route (systemd exec, UEP internals, test plan).
-- [re/dotnet-boot-persistence-analysis.md](../re/dotnet-boot-persistence-analysis.md) —
+- [re/dotnet-boot-persistence-analysis.md](../research/re/dotnet-boot-persistence-analysis.md) —
   `.NET` IL/NI boot-persistence analysis (`org.tizen.art-app`, loaders, UEP coverage).
 - [samsung-tv-root ecosystem](samsung-tv-root-ecosystem.md) — §5 persistence routes
   (levkropp .NET, danielyc #17 gawk, kninetimmy #42, supersharp #29).

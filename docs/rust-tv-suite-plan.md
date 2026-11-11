@@ -39,7 +39,7 @@ Per [`docs/samsung-tv-uep.md`](docs/samsung-tv-uep.md), the Tizen kernel's UEP h
 | Target Triple | Linkage | Used For | Why |
 |---|---|---|---|
 | `armv7-unknown-linux-musleabihf` | Static (`musl`) | `tv-authd`, `tv-blockd`, `tv-patchd`, `cobalt-shim`, `tv-auth-cli` | Zero runtime shared-library dependencies; immune to firmware glibc/OpenSSL changes. |
-| `armv7-unknown-linux-gnueabi` | Dynamic (`glibc >= 2.4`, soft-float ABI) | `tv-auth-popupd`, `tv-manager`, `tv-launcher` | Links against the TV's `/usr/lib/libelementary.so.1`, `libevas.so.1`, `libecore.so.1`, `libvconf.so.0`, `libcapi-appfw-*.so.0`, and `libcurl.so.4` via [`root-broker/sysroot`](root-broker/sysroot/README.md). |
+| `armv7-unknown-linux-gnueabi` | Dynamic (`glibc >= 2.4`, soft-float ABI) | `tv-auth-popupd`, `tv-manager`, `tv-launcher` | Links against the TV's `/usr/lib/libelementary.so.1`, `libevas.so.1`, `libecore.so.1`, `libvconf.so.0`, `libcapi-appfw-*.so.0`, and `libcurl.so.4` via [`toolchain/sysroot`](toolchain/sysroot/README.md). |
 
 All crates use **synchronous/blocking Rust only** (no `tokio` or `async` runtimes). Headless daemons use `std::net::UnixListener` / `poll` / threads, and EFL binaries integrate sockets, pipes, and `evdev` file descriptors directly into the EFL main loop via `ecore_main_fd_handler_add`.
 
@@ -89,14 +89,14 @@ crates/
   tv-efl/                         # Safe Rust bindings for Elementary, Evas, Ecore, Wayland, and remote keygrabs
   tv-tizen/                       # Bindings for libvconf, libsqlite3 (pkgmgr/webappservice DBs), AppFW, libdlog, libcurl
 bins/
-  tv-authd/                       # Root broker daemon (migrated from root-broker/daemon)
+  tv-authd/                       # Root broker daemon (migrated from research/root-broker/daemon)
   tv-auth-cli/                    # Diagnostic CLI client
   tv-auth-popupd/                 # Persistent EFL overlay daemon for prompts & toasts
   tv-manager/                     # User-launched EFL app (Grant Manager + Apps2Samsung Store + Suite Settings)
   tv-blockd/                      # DNS ad/tracking blocker, OTN update blocker & telemetry service disabler
   tv-patchd/                      # On-the-fly app patcher daemon + cobalt_launcher wrapper shim
   tv-launcher/                    # Custom EFL Home screen dock daemon
-sysroot/                          # TV shared-library sysroot & fetch script (from root-broker/sysroot)
+toolchain/sysroot/                 # TV shared-library sysroot & fetch script
 docs/                             # Architecture & reverse-engineering documentation
 ```
 
@@ -105,12 +105,12 @@ docs/                             # Architecture & reverse-engineering documenta
 ## 4. Shared Crates Design
 
 ### 4.1 `crates/tv-proto`
-Extracted from [`root-broker/daemon/src/protocol.rs`](root-broker/daemon/src/protocol.rs):
+Extracted from [`research/root-broker/daemon/src/protocol.rs`](research/root-broker/daemon/src/protocol.rs):
 - Request/response types for `exec`, `grants.list`, `grants.set`, `grants.revoke`, `grants.audit`, `pkg.list`, `pkg.install`, `pkg.uninstall`, and the UI channel (`ui.hello`, `ui.prompt`, `ui.decision`, `ui.notice`).
 - Bounded newline-delimited JSON reader/writer (`MAX_LINE_BYTES`) and a synchronous `BrokerClient` helper used by `tv-auth-popupd`, `tv-manager`, `tv-launcher`, and `tv-auth-cli`.
 
 ### 4.2 `crates/tv-efl`
-Evolved from [`root-broker/spikes/efl-popup/src/efl.rs`](root-broker/spikes/efl-popup/src/efl.rs) and [`root-broker/ui/dotnet/Interop.cs`](root-broker/ui/dotnet/Interop.cs):
+Evolved from [`research/root-broker/spikes/efl-popup/src/efl.rs`](research/root-broker/spikes/efl-popup/src/efl.rs) and [`research/root-broker/ui/dotnet/Interop.cs`](research/root-broker/ui/dotnet/Interop.cs):
 - **Window & Wayland management:** `elm_win_add` (`ELM_WIN_NOTIFICATION` at layer `250` for overlays; `ELM_WIN_BASIC` for full-screen apps), `elm_win_alpha_set`, `elm_win_autodel_set`, `elm_win_raise`, `elm_win_activate`.
 - **Dynamic Remote Keygrabbing:** Safe RAII guard around `elm_win_keygrab_set` / `elm_win_keygrab_unset` (`XF86Back`, `Cancel`, `Escape`, `Return`, `KP_Enter`, `Up`, `Down`, `Left`, `Right`, `XF86Home`, color buttons) with `OR_EXCLUSIVE` mode so background daemons only intercept keys while an interactive surface is visible.
 - **Canvas & 9-Slice Card Primitives:** Raw Evas wrappers (`evas_object_rectangle_add`, `evas_object_text_add`, `evas_object_image_filled_add`, `evas_object_image_border_set` for rounded 9-slice card/button PNGs, `evas_object_clip_set` for scroll viewports).
@@ -131,8 +131,8 @@ Evolved from [`root-broker/spikes/efl-popup/src/efl.rs`](root-broker/spikes/efl-
 #### Why Split?
 Previously, `org.tvauth.ui` was a single TPK launched on-demand via `app_launcher -s org.tvauth.ui`, which required:
 - Waiting 1–3 seconds for `amd` to cold-start the UI process before a prompt or toast could appear.
-- A 750 ms startup delay heuristic to guess whether `tv-authd` launched it for a prompt or the user clicked its tile on the Home screen ([`root-broker/ui/README.md`](root-broker/ui/README.md#L10-L24)).
-- Complex retry/cooldown state in [`approval.rs`](root-broker/daemon/src/approval.rs) (`MAX_PROMPT_UI_RETRIES`, `ui_launch_timeout`, `launch_cooldown`).
+- A 750 ms startup delay heuristic to guess whether `tv-authd` launched it for a prompt or the user clicked its tile on the Home screen ([`research/root-broker/ui/README.md`](research/root-broker/ui/README.md#L10-L24)).
+- Complex retry/cooldown state in [`approval.rs`](research/root-broker/daemon/src/approval.rs) (`MAX_PROMPT_UI_RETRIES`, `ui_launch_timeout`, `launch_cooldown`).
 - Disrupting the foreground app's focus when showing a non-interactive `ui.notice` toast.
 
 #### New Design
@@ -145,7 +145,7 @@ Previously, `org.tvauth.ui` was a single TPK launched on-demand via `app_launche
 2. **Fixing `.wgt` Installation in `tv-authd`:**
    - Currently ([`docs/tv-authd-pkg-install-plan.md`](docs/tv-authd-pkg-install-plan.md#L889-L893)), `.tpk` installation works end-to-end, while `.wgt` installation fails with `install failed[118004][-4:Operation not allowed:Load archive info fail]`.
    - Investigation on `tv-bureau.home` traced this string to `/usr/lib/libapp-installers.so.1.35.17` (`src/common/archive_info.cc`), which calls `WgtArchiveInfo::LoadArchiveInfo()` in `/usr/lib/libwgt-installer.so` and `VdWgtArchiveInfo::ExtractPackageArchive()` in `/usr/lib/libvd-wgt-installer.so` inside `/usr/bin/wgt-backend`.
-   - Because `wascmd` talks over IPC to `webappservice` / `pkgmgr-server`, `/usr/bin/wgt-backend` is spawned in **PID 1's mount namespace** rather than `wascmd`'s `unshare -m` namespace. We will trace `dlogutil WGT_BACKEND VD_WGT_BACKEND APP_INSTALLERS` during a staged `.wgt` install and adjust [`wasinstall.rs`](root-broker/daemon/src/wasinstall.rs) / [`pkgsign.rs`](root-broker/daemon/src/pkgsign.rs) so `.wgt` archives install just like `.tpk` archives.
+   - Because `wascmd` talks over IPC to `webappservice` / `pkgmgr-server`, `/usr/bin/wgt-backend` is spawned in **PID 1's mount namespace** rather than `wascmd`'s `unshare -m` namespace. We will trace `dlogutil WGT_BACKEND VD_WGT_BACKEND APP_INSTALLERS` during a staged `.wgt` install and adjust [`wasinstall.rs`](research/root-broker/daemon/src/wasinstall.rs) / [`pkgsign.rs`](research/root-broker/daemon/src/pkgsign.rs) so `.wgt` archives install just like `.tpk` archives.
 
 ---
 
@@ -162,7 +162,7 @@ It is organized into three tabs navigated with the remote's `Left`/`Right`/`Up`/
    - Selecting **Install** or **Update** downloads the `.wgt`/`.tpk` to `/tmp/tv-store/<pkgid>.<ext>` on a background worker thread (streaming progress to the EFL loop via an `ecore` pipe) and calls `pkg.install` on `/run/tv-auth/broker.sock`.
    - `tv-authd` stages the archive, re-signs it on-device with `xmlsec1` and the TV's enrolled user CA, installs it via `wascmd`, and registers its tile on the Home screen.
 2. **Permissions & Grants (`Permissions` tab):**
-   - Port of the `.NET` Grant Manager screen ([`root-broker/ui/dotnet/Program.cs`](root-broker/ui/dotnet/Program.cs)): lists all known callers, toggles policies (`allow_always` / `prompt` / `deny`) and toast modes (`always` / `first` / `off`), revokes grants, and displays the recent `grants.audit` log.
+   - Port of the `.NET` Grant Manager screen ([`research/root-broker/ui/dotnet/Program.cs`](research/root-broker/ui/dotnet/Program.cs)): lists all known callers, toggles policies (`allow_always` / `prompt` / `deny`) and toast modes (`always` / `first` / `off`), revokes grants, and displays the recent `grants.audit` log.
 3. **System & Tweaks (`Tweaks` tab):**
    - Live status and toggles for `tv-blockd` (DNS ad/tracking blocker, OTN firmware update blocker, telemetry service brakes, bloatware package disabler) and `tv-patchd` (TizenTube patch for stock YouTube).
 
@@ -265,7 +265,7 @@ A native Rust EFL daemon (`/run/tv-suite/bin/tv-launcher`) replacing Vetro's `do
 
 | Phase | Deliverable | Key Tasks |
 |---|---|---|
-| **Phase 1** | **Cargo Workspace & Shared Crates** | Create root `Cargo.toml` workspace; extract `crates/tv-proto` from `root-broker/daemon`; promote `spikes/efl-popup` into `crates/tv-efl`; create `crates/tv-tizen` (`vconf`, SQLite pkgmgr reader, `app_control`, `libcurl`). |
+| **Phase 1** | **Cargo Workspace & Shared Crates** | Create root `Cargo.toml` workspace; extract `crates/tv-proto` from `research/root-broker/daemon`; promote `spikes/efl-popup` into `crates/tv-efl`; create `crates/tv-tizen` (`vconf`, SQLite pkgmgr reader, `app_control`, `libcurl`). |
 | **Phase 2** | **`tv-auth-popupd` Split & `.wgt` Install Fix** | Build `bins/tv-auth-popupd` (persistent EFL prompt + toast overlay daemon managed via its own `tv-auth-popupd.service` systemd unit); simplify `approval.rs` to use the persistent popup channel; diagnose and fix `.wgt` `Load archive info fail` in `tv-authd` (`wasinstall.rs`). |
 | **Phase 3** | **`tv-manager` (`org.tvauth.ui`) & `Apps2Samsung` Store** | Build `bins/tv-manager` in Rust + `tv-efl` replacing the `.NET` TPK; implement the **Permissions** tab (grants & audit log) and the **Store** tab (fetches `Apps2Samsung/tizen-community-packages`, shows installed/update state, downloads and installs `.wgt`/`.tpk` via `tv-authd`). |
 | **Phase 4** | **`tv-blockd` (DNS / Telemetry / OTN Blocker)** | Build `bins/tv-blockd` (`musl` static binary); implement OTN `vconf` lock, cross-namespace `/etc/hosts` bind-mounter (`/proc/*/ns/mnt`), systemd `ConditionPathExists=!` brake files, and bloatware disabler; wire toggles into `tv-manager`. |
@@ -282,18 +282,18 @@ The plan above was written against commit `7b39883` (managed `.NET` UI). By the
 time Phase 1 started, `main` already shipped the native Rust/EFL `org.tvauth.ui`
 with the validated `/run` bind-mount alias (`bins/tv-authd/src/ui_alias.rs`),
 so §2.1's `/bin/sh` wrapper is not needed for it. Paths in §3–§5 that name
-`root-broker/daemon`, `root-broker/ui`, or `spikes/efl-popup` now map to:
+`research/root-broker/daemon`, `research/root-broker/ui`, or `spikes/efl-popup` now map to:
 
 | Plan | Implemented |
 |---|---|
-| root `Cargo.toml` workspace | `Cargo.toml` (members `crates/*`, `bins/*`; `root-broker/` spikes excluded); one `Cargo.lock`; `cross-build.sh musl\|gnueabi` replaces the per-crate Docker invocations |
+| root `Cargo.toml` workspace | `Cargo.toml` (members `crates/*`, `bins/*`; `research/root-broker/` spikes excluded); one `Cargo.lock`; `toolchain/cross-build.sh musl\|gnueabi` replaces the per-crate Docker invocations |
 | `crates/tv-proto` | the former `daemon/src/protocol.rs` (requests, responses, `ui.*` messages, bounded framing), plus `NotifyMode`, label helpers, `ExecutionOutcome`, the client-side `ui` views (former UI `model.rs`), and a one-shot `call()` client. A test checks that daemon-serialized prompts/notices/grants parse as the client views. |
 | `crates/tv-efl` | the native UI's `efl.rs` FFI surface (the evolved form of `spikes/efl-popup`) |
 | `crates/tv-tizen` | `vconf` get/set (int/bool/str), read-only pkgmgr DB via `libsqlite3`, `app_control` launch + `aul_app_is_running`, `libcurl` GET; `examples/probe.rs` exercises each on the TV |
-| `bins/tv-authd` | moved from `root-broker/daemon`; `protocol.rs` re-exports `tv-proto` |
+| `bins/tv-authd` | moved from `research/root-broker/daemon`; `protocol.rs` re-exports `tv-proto` |
 | `bins/tv-auth-cli` | moved from `daemon/test-clients/rootcli`; builds requests with `serde_json`, sends them with `tv_proto::call` |
-| `bins/tv-auth-ui` | moved from `root-broker/ui/rust` (split into popupd + manager in Phases 2–3); reads broker messages with the bounded `tv_proto::read_message` |
-| `sysroot/` | moved from `root-broker/sysroot`; adds `libvconf`, `libsqlite3`, `libcapi-appfw-app-control`, `libaul`, `libcurl` |
+| `bins/tv-auth-ui` | moved from `research/root-broker/ui/rust` (split into popupd + manager in Phases 2–3); reads broker messages with the bounded `tv_proto::read_message` |
+| `toolchain/sysroot/` | moved from `research/root-broker/sysroot`; adds `libvconf`, `libsqlite3`, `libcapi-appfw-app-control`, `libaul`, `libcurl` |
 
 Validation (host: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 -D warnings`, 116 daemon + 18 `tv-proto` + 1 CLI + 8 UI tests; the 133

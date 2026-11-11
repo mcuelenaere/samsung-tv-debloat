@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "id": "tv-patchd",
+  "version": "0.1.0",
+  "kind": "native",
+  "directories": [
+    {"path": "/opt/tv-suite/var/patchd", "mode": "0700", "smack": "System::Shared"}
+  ],
+  "files": [
+    {"source": "tv-patchd", "destination": "/opt/tv-suite/bin/tv-patchd", "mode": "0755", "smack": "System::Shared"},
+    {"source": "patchd.json", "destination": "/opt/tv-suite/etc/patchd.json", "mode": "0600", "smack": "System::Shared"}
+  ],
+  "units": [
+    {"source": "tv-patchd.service", "name": "tv-patchd.service"}
+  ],
+  "undo_command": ["/run/opt/tv-suite/bin/tv-patchd", "undo"]
+}

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Cross-compile workspace members for the TV in a pinned Rust 1.85 container.
 #
-#   ./cross-build.sh musl    build --locked --release -p tv-authd
-#   ./cross-build.sh gnueabi build --locked --release -p tv-auth-ui
+#   toolchain/cross-build.sh musl    build --locked --release -p tv-authd
+#   toolchain/cross-build.sh gnueabi build --locked --release -p tv-auth-ui
 #
 # musl:    static armv7-unknown-linux-musleabihf, linked with rust-lld
 #          (.cargo/config.toml). Headless daemons and CLIs.
 # gnueabi: dynamic soft-float armv7-unknown-linux-gnueabi against the TV
-#          libraries in sysroot/tv-6.5 (sysroot/fetch-tv-sysroot.sh). EFL UIs
+#          libraries in toolchain/sysroot/tv-6.5
+#          (toolchain/sysroot/fetch-tv-sysroot.sh). EFL UIs
 #          and anything using tv-tizen.
 #
 # Output lands in target/cross-<flavor>/<triple>/.
 set -euo pipefail
 
-ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 flavor=${1:?usage: cross-build.sh musl|gnueabi <cargo args...>}
 shift
 
@@ -30,13 +31,13 @@ musl)
         ' sh "$@"
     ;;
 gnueabi)
-    if [[ ! -d "$ROOT/sysroot/tv-6.5/usr/lib" ]]; then
-        echo "missing sysroot/tv-6.5; run sysroot/fetch-tv-sysroot.sh first" >&2
+    if [[ ! -d "$ROOT/toolchain/sysroot/tv-6.5/usr/lib" ]]; then
+        echo "missing toolchain/sysroot/tv-6.5; run toolchain/sysroot/fetch-tv-sysroot.sh first" >&2
         exit 1
     fi
     exec docker run --rm --platform linux/amd64 \
         -v "$ROOT:/src" -w /src \
-        -v "$ROOT/sysroot/tv-6.5:/tv-sysroot:ro" \
+        -v "$ROOT/toolchain/sysroot/tv-6.5:/tv-sysroot:ro" \
         -e CARGO_TARGET_DIR=/src/target/cross-gnueabi \
         rust:1.85.0-slim-bullseye@sha256:a78439ac2ee14dc1c2c188fef0ff0b197e1cc1918d4b3daf486776ac0f60029a \
         sh -eu -c '

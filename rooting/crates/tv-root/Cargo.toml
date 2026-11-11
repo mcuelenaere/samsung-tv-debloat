@@ -1,0 +1,18 @@
+[package]
+name = "tv-root"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "One-shot FDET root acquisition, setup bundling and SSH-key enrollment"
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tv-sdb.workspace = true
+tv-ssh-key.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

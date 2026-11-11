@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "id": "org.tvauth.ui",
+  "version": "0.1.0",
+  "kind": "tpk",
+  "package": {
+    "source": "org.tvauth.ui-0.1.0.tpk",
+    "pkgid": "org.tvauth.ui"
+  }
+}

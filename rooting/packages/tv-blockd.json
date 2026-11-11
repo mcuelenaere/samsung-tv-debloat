@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "tv-blockd",
+  "version": "0.1.0",
+  "kind": "native",
+  "directories": [
+    {"path": "/opt/tv-suite/bin", "mode": "0755", "smack": "System::Shared"},
+    {"path": "/opt/tv-suite/etc", "mode": "0700", "smack": "System::Shared"},
+    {"path": "/opt/tv-suite/var", "mode": "0700", "smack": "System::Shared"}
+  ],
+  "files": [
+    {"source": "tv-blockd", "destination": "/opt/tv-suite/bin/tv-blockd", "mode": "0755", "smack": "System::Shared"},
+    {"source": "blockd.json", "destination": "/opt/tv-suite/etc/blockd.json", "mode": "0600", "smack": "System::Shared"}
+  ],
+  "units": [
+    {"source": "tv-blockd.service", "name": "tv-blockd.service"}
+  ],
+  "undo_command": ["/run/opt/tv-suite/bin/tv-blockd", "undo"]
+}

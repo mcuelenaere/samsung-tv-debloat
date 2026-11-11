@@ -50,7 +50,8 @@ verify the package identity, it fails closed and reports
 ### SSH key prompt
 
 `kind: "ssh_key"` comes from tv-authd itself when a key is pushed to
-`/home/owner/share/tmp/sdk_tools/ssh-key.pub` (requester `sdb-push`); its
+`/home/owner/share/tmp/sdk_tools/ssh-key.pub` (requester `sdb-push`, normally
+written by `tv ssh-key add`); its
 `command` lists the keys as `type fingerprint comment` lines. The popup shows
 them with a warning and offers **Deny** (focused) and **Allow** only.
 
@@ -106,7 +107,7 @@ starts it: a file written as root over SSH gets `System::Privileged`, which
 the popup's label cannot read, and systemd reports `203/EXEC`.
 
 ```sh
-./build-armv7.sh            # ../../cross-build.sh gnueabi; needs ../../sysroot
+./build-armv7.sh            # ../../toolchain/cross-build.sh gnueabi; needs ../../toolchain/sysroot
 ```
 
 On the TV (the unit maps `/opt/tv-auth` at `/run/opt/tv-auth` for UEP, like

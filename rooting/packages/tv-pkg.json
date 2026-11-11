@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "id": "tv-pkg",
+  "version": "0.1.0",
+  "kind": "native",
+  "files": [
+    {"source": "tv-pkg", "destination": "/opt/tv-suite/bin/tv-pkg", "mode": "0755", "smack": "System::Shared"}
+  ]
+}

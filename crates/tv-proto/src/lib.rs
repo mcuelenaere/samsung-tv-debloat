@@ -207,7 +207,7 @@ pub struct AccessView {
     pub sdb_running: bool,
     pub sdb_host: Option<String>,
     pub keys: Vec<SshKeyView>,
-    /// Where `tv-sdb push` puts a key to add.
+    /// Where `tv ssh-key add` (or `tv-sdb push`) puts a key to add.
     pub key_drop: String,
 }
 
