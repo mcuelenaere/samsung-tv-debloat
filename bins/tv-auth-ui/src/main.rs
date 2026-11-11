@@ -42,6 +42,8 @@ use tv_proto::markup::*;
 use tv_proto::ui::GrantInfo;
 use tv_proto::DEFAULT_SOCKET;
 
+mod dock;
+
 const COLOR_BACKGROUND: i32 = 0x10_12_17;
 const COLOR_ROW: i32 = 0x1c_1f_26;
 const COLOR_BUILD_ROW: i32 = 0x16_19_1f;
@@ -2099,14 +2101,17 @@ unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _
             return;
         }
         Some("patch:tizentube") => {
-            let on = state
+            // `set` replaces the whole config: keep the other settings.
+            let mut config = state
                 .patch
                 .as_ref()
-                .is_some_and(|patch| patch["config"]["tizentube"] == true);
+                .map_or_else(|| json!({}), |patch| patch["config"].clone());
+            let on = config["tizentube"] == true;
+            config["tizentube"] = json!(!on);
             state.set_status("Applying...");
             state.load_tweaks(
                 Service::Patch,
-                Some(json!({"method": "set", "config": {"tizentube": !on}})),
+                Some(json!({"method": "set", "config": config})),
                 Some(if on {
                     "TizenTube is off; YouTube is back to normal."
                 } else {
@@ -2256,10 +2261,27 @@ unsafe extern "C" fn on_refresh_clicked(
 
 fn main() {
     tv_efl::log::set_path("/tmp/tvauth-ui.log");
-    let status = run();
+    // One executable, two apps: AUL starts the dock under its own app id.
+    let status = if std::env::var("AUL_APPID").as_deref() == Ok(dock::APP_ID) {
+        run_dock()
+    } else {
+        run()
+    };
     if status != 0 {
         std::process::exit(status);
     }
+}
+
+fn run_dock() -> i32 {
+    let arguments: Vec<CString> = std::env::args_os()
+        .filter_map(|argument| CString::new(argument.as_encoded_bytes()).ok())
+        .collect();
+    let mut argv: Vec<*mut c_char> = arguments
+        .iter()
+        .map(|argument| argument.as_ptr() as *mut c_char)
+        .collect();
+    argv.push(ptr::null_mut());
+    dock::run(argv)
 }
 
 fn run() -> i32 {

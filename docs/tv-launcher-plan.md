@@ -223,6 +223,22 @@ No daemon, no evdev, no root at run time.
    - the Home target after updating and after uninstalling the package;
    - whether the app behind the dock keeps playing (else the dock goes
      full-screen).
+
+   **Done 2026-11-11** on tv-living, except the cold boot:
+   - Home over YouTube shows the dock across the bottom with YouTube still on
+     screen; Home again and BACK hide it.
+   - 100 Home presses: no launch event at all. Samsung's Home never started,
+     and the dock kept one process (AUL resumes it).
+   - The **Samsung Home** tile opens csfs, home.sidebar and home.media.
+   - The Home target survives reinstalling `org.tvauth.ui`.
+   - Uninstalling the package that is the target makes the firmware reset it
+     to csfs (tested with a throwaway `org.tvauth.probe` package).
+   - A target that names an app that was never installed leaves Home dead
+     (no fallback), so tv-patchd only sets it once `org.tvauth.home` is
+     installed.
+   - With the dock shown, YouTube's AUL state goes from focus (2) to visible
+     (3), not background (4), so playback continues behind it; not yet
+     confirmed by eye.
 2. **Catalog and refresh**. Check: install and uninstall from the store, a
    WGT and a TPK, with the dock open and closed; each appears or disappears
    within 1 s.

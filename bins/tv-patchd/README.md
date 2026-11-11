@@ -62,9 +62,27 @@ own when switched on. Vetro's files (`…/share/vyt`,
 `…/share/vetro-youtube`) are not touched; on tv-living they were deleted by
 hand on 2026-11-10.
 
+## Custom Home
+
+`custom_home: true` makes the suite's dock (`org.tvauth.home`, a second app in
+the `org.tvauth.ui` package) the Home key's target:
+- tvctx-manager launches the default app for
+  `http://tizen.org/appcontrol/operation/main`, which tv-patchd sets with
+  `app_operation_set_current_app`;
+- it is stored in `/opt/dbspace/user/5001/.appsvc.db`;
+- it is set only once the dock is installed (a target that names a missing
+  app leaves Home doing nothing);
+- it is checked on every pass;
+- `custom_home: false` or `undo` resets it with
+  `app_operation_reset_current_app`.
+
+Uninstalling the package resets it to Samsung's Home as well. See
+`docs/tv-launcher-plan.md`.
+
 ## Configuration and control
 
-`/opt/tv-suite/etc/patchd.json`: `{"tizentube": false}` by default.
+`/opt/tv-suite/etc/patchd.json`: `{"tizentube": false, "custom_home": false}`
+by default.
 Control socket `/run/tv-suite/patchd.sock` (`root:users 0660`; root or the
 `org.tvauth.ui` manager), newline-delimited JSON:
 `status`, `set` (`{"config":{"tizentube":true}}`), `undo`, `update`.

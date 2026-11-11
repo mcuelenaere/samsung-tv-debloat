@@ -5,6 +5,11 @@
     <label>TV suite</label>
     <icon>org.tvauth.ui.png</icon>
   </ui-application>
+  <!-- The dock; tv-patchd makes it the Home key's target. Same executable. -->
+  <ui-application appid="org.tvauth.home" exec="tv-auth-ui" type="capp" multiple="false" taskmanage="false" nodisplay="true" launch_mode="single">
+    <label>TV suite Home</label>
+    <icon>org.tvauth.ui.png</icon>
+  </ui-application>
   <privileges>
     <privilege>http://tizen.org/privilege/window.priority.set</privilege>
     <privilege>http://tizen.org/privilege/internet</privilege>

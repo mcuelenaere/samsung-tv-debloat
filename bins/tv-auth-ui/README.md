@@ -129,6 +129,19 @@ changed put back. See `bins/tv-blockd/README.md`.
 on and off, and **Update TizenTube** installs npm's latest release. See
 `bins/tv-patchd/README.md`.
 
+### Dock (`org.tvauth.home`)
+
+The same executable, started under the package's second app id (`main`
+checks `AUL_APPID`). When tv-patchd's `custom_home` is on, it is the Home
+key's target:
+- each Home press arrives as `app_control` and shows the dock, or hides it if
+  it is already shown;
+- it is a `NOTIFICATION_HIGH` window across the bottom of the screen;
+- BACK or 20 s idle also hides it;
+- tiles so far: **Samsung Home** (`com.samsung.tv.csfs`) and **TV suite**.
+
+See `docs/tv-launcher-plan.md`.
+
 ## Files
 
 | File | Purpose |

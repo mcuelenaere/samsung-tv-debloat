@@ -29,6 +29,8 @@ const LOG: &str = "/run/tv-suite/patchd.log";
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 const CA_BUNDLE: &str = "/etc/ssl/ca-bundle.pem";
 const COBALT_APP: &str = "com.samsung.tv.cobalt-yt";
+/// The suite's dock, `org.tvauth.ui`'s second app.
+const DOCK_APP: &str = "org.tvauth.home";
 
 const UI_LABEL: &str = "User::Pkg::org.tvauth.ui";
 const UI_UID: u32 = 5001;
@@ -98,6 +100,9 @@ struct Config {
     /// TizenTube in Samsung's YouTube.
     #[serde(default)]
     tizentube: bool,
+    /// The Home key opens the suite's dock instead of Samsung's Home.
+    #[serde(default)]
+    custom_home: bool,
 }
 
 /// The TizenTube release in use.
@@ -134,6 +139,8 @@ struct Report {
     /// Certificates, content copy and script ready, proxy patching.
     ready: bool,
     row: String,
+    /// The app the Home key launches.
+    home: String,
     errors: Vec<String>,
 }
 
@@ -332,13 +339,13 @@ impl Daemon {
     }
 
     fn apply(&mut self, config: Config) -> Value {
-        let changed = config != self.config;
+        let youtube_changed = config.tizentube != self.config.tizentube;
         self.config = config;
         if let Err(error) = save_json(CONFIG, &self.config) {
             log(&format!("config save: {error}"));
         }
         self.reconcile();
-        if changed {
+        if youtube_changed {
             // A running YouTube keeps its old flags until it restarts.
             let _ = Command::new("/usr/bin/app_launcher")
                 .args(["-t", COBALT_APP])
@@ -378,16 +385,63 @@ impl Daemon {
             self.setup_at = None;
         }
         report.row = self.reconcile_row(report.ready, &mut report).to_owned();
+        report.home = self.reconcile_home(&mut report);
         if !self.config.tizentube {
             remove_content(&mut report);
         }
         for error in &report.errors {
             log(error);
         }
-        if report.row != self.report.row || report.ready != self.report.ready {
-            log(&format!("ready={} row={}", report.ready, report.row));
+        if report.row != self.report.row
+            || report.ready != self.report.ready
+            || report.home != self.report.home
+        {
+            log(&format!(
+                "ready={} row={} home={}",
+                report.ready, report.row, report.home
+            ));
         }
         self.report = report;
+    }
+
+    /// Point the Home key at the dock while `custom_home` is on (and the
+    /// dock is installed), back at the firmware's default otherwise. Returns
+    /// the app the Home key launches.
+    fn reconcile_home(&self, report: &mut Report) -> String {
+        let current = match tv_tizen::app::home_app() {
+            Ok(current) => current,
+            Err(error) => {
+                report.errors.push(format!("Home app: {error}"));
+                return String::new();
+            }
+        };
+        let result = if self.config.custom_home && current != DOCK_APP {
+            let installed = tv_tizen::pkgdb::query_text(
+                tv_tizen::pkgdb::PKGMGR_PARSER_DB,
+                "SELECT app_id FROM package_app_info WHERE app_id = ?1",
+                &[DOCK_APP],
+            )
+            .is_ok_and(|rows| !rows.is_empty());
+            if !installed {
+                report.errors.push(format!("{DOCK_APP} is not installed"));
+                return current;
+            }
+            tv_tizen::app::set_home_app(DOCK_APP)
+        } else if !self.config.custom_home && current == DOCK_APP {
+            tv_tizen::app::reset_home_app()
+        } else {
+            return current;
+        };
+        match result.and_then(|()| tv_tizen::app::home_app()) {
+            Ok(now) => {
+                log(&format!("Home key: {current} -> {now}"));
+                now
+            }
+            Err(error) => {
+                report.errors.push(format!("Home app: {error}"));
+                current
+            }
+        }
     }
 
     /// Certificates, content copy, script and TLS server; whether all are

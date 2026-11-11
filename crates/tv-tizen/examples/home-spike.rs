@@ -19,6 +19,7 @@ use std::time::Instant;
 extern "C" {
     fn aul_app_get_pid(appid: *const c_char) -> c_int;
     fn aul_terminate_pid(pid: c_int) -> c_int;
+    fn aul_app_get_status(appid: *const c_char) -> c_int;
     fn aul_listen_app_launch_signal_v2(
         callback: extern "C" fn(c_int, *const c_char, *mut c_void) -> c_int,
         data: *mut c_void,
@@ -238,6 +239,12 @@ fn main() {
             let opaque = buffer.iter().filter(|pixel| *pixel >> 24 != 0).count();
             println!("{opaque} of {} pixels drawn", buffer.len());
         },
+        // 0 launching, 1 created, 2 focus, 3 visible, 4 bg, 5 dying (aul.h)
+        ["status", apps @ ..] => {
+            for app in apps {
+                println!("{app}: {}", unsafe { aul_app_get_status(c(app).as_ptr()) });
+            }
+        }
         ["home", action @ ..] => unsafe {
             let operation = c(MAIN);
             match action {
