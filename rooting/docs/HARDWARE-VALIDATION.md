@@ -62,6 +62,9 @@ Target: `T-PTMDEUC-REL-202602250226`, Linux `5.4.77`, `armv7l`,
   `package-name shell injection is blocked by this TV's sdbd plugin` instead of
   waiting for the callback deadline. The validator and conversion evidence is
   in [`sdb-foothold-blockers.md`](sdb-foothold-blockers.md).
+- Restarting `sdbd.service` on 2026-11-11 did not change the result; the
+  validator is part of the installed plugin binary, not transient daemon
+  state. A cold boot has not been tried.
 - `tv ssh-key add` validated the existing public key, pushed it to
   `/home/owner/share/tmp/sdk_tools/ssh-key.pub` and tv-authd logged
   `approval_queued label=sdb-push ... kind=ssh_key`. The prompt timed out, the
