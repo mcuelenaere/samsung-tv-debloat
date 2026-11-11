@@ -52,6 +52,7 @@ pub fn run<T: Transport>(transport: &mut T, options: &SetupOptions) -> Result<Se
     let bundle = Bundle::load(&options.bundle_root)?;
     let _lock = TargetLock::acquire(transport.target(), options.lock_dir.as_deref())?;
     let key = options.key.as_deref().map(read_key).transpose()?;
+    transport.require_shell_injection()?;
 
     let assessment = preflight(transport)?;
     let build = assessment

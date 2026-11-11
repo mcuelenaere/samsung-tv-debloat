@@ -49,6 +49,8 @@ fn main() -> ExitCode {
 fn run() -> Result<u8, String> {
     let args = parse()?;
     let mut transport = SdbTransport::new(&args.target, args.options.clone());
+    inject::require_shell_injection(&args.target, &args.options)
+        .map_err(|error| error.to_string())?;
 
     let capture = transport
         .capture(&QN90B.probe_command(), Duration::from_secs(30))

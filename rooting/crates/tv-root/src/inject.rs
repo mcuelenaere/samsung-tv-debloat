@@ -81,6 +81,73 @@ pub fn injection_argument_size(command: &str) -> Result<usize> {
     .len())
 }
 
+/// Verifies the sdbd package-name foothold before any payload is staged.
+///
+/// The control and delayed injections use separate connections. A build whose
+/// plugin rejects the injection characters typically refuses the service
+/// immediately, which is surfaced as a specific error instead of a generic
+/// callback timeout.
+pub fn require_shell_injection(target: &str, options: &Options) -> Result<()> {
+    const MINIMUM_DELTA: Duration = Duration::from_millis(1500);
+    let timeout = options.timeout.max(Duration::from_secs(7));
+    let (mut control_elapsed, control) = timed_injection(target, options, "/bin/true", timeout)?;
+    let (mut delayed_elapsed, delayed) = timed_injection(target, options, "/bin/sleep 2", timeout)?;
+    let mut delta = delayed_elapsed.saturating_sub(control_elapsed);
+    if delta < MINIMUM_DELTA && control_elapsed >= MINIMUM_DELTA {
+        let (again_control, _) = timed_injection(target, options, "/bin/true", timeout)?;
+        let (again_delayed, _) = timed_injection(target, options, "/bin/sleep 2", timeout)?;
+        control_elapsed = again_control;
+        delayed_elapsed = again_delayed;
+        delta = delayed_elapsed.saturating_sub(control_elapsed);
+    }
+    if delta < MINIMUM_DELTA {
+        let control = String::from_utf8_lossy(&control).trim().to_owned();
+        let delayed = String::from_utf8_lossy(&delayed).trim().to_owned();
+        let detail = [control, delayed]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Error::protocol(format!(
+            "SDB is connected, but package-name shell execution was not confirmed: control took {:.3}s and the 2s delay probe took {:.3}s (delta {:.3}s). This TV's sdbd plugin likely rejects the injection characters.{}",
+            control_elapsed.as_secs_f64(),
+            delayed_elapsed.as_secs_f64(),
+            delta.as_secs_f64(),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" Output: {detail}")
+            }
+        )));
+    }
+    Ok(())
+}
+
+fn timed_injection(
+    target: &str,
+    options: &Options,
+    command: &str,
+    timeout: Duration,
+) -> Result<(Duration, Vec<u8>)> {
+    let started = Instant::now();
+    let result = inject_once(target, options, command);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(output) => {
+            if elapsed > timeout {
+                return Err(Error::protocol("SDB injection timed out"));
+            }
+            Ok((elapsed, output))
+        }
+        Err(Error::Sdb(error)) if error.to_string().contains("refused service") => {
+            Err(Error::protocol(format!(
+                "SDB is connected, but the package-name shell injection is blocked by this TV's sdbd plugin ({error}); no root route can start"
+            )))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Runs one injection on an existing device connection.
 pub fn inject(device: &mut Device, command: &str) -> Result<Vec<u8>> {
     let injection = build_shell_injection(command, None)?;
@@ -404,6 +471,40 @@ mod tests {
         assert_eq!(shell_quote("id"), "id");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn a_blocked_foothold_is_reported_specifically() {
+        let sdb = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = sdb.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = sdb.accept().unwrap();
+            let cnxn = Frame::read(&mut stream).unwrap();
+            assert_eq!(cnxn.command, CNXN);
+            stream
+                .write_all(&Frame::new(CNXN, 0x0200_0000, 4096, *b"device::FAKE::0\0").encode())
+                .unwrap();
+            let open = Frame::read(&mut stream).unwrap();
+            assert_eq!(open.command, OPEN);
+            stream
+                .write_all(&Frame::new(CLSE, 0, open.arg0, Vec::new()).encode())
+                .unwrap();
+        });
+        let error = require_shell_injection(
+            &target,
+            &Options {
+                timeout: Duration::from_secs(2),
+                verbose: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("blocked by this TV's sdbd plugin"),
+            "{error}"
+        );
+        server.join().unwrap();
     }
 
     /// A scripted sdbd that opens the callback named in the injected command.

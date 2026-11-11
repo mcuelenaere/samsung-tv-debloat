@@ -9,6 +9,7 @@ use tv_sdb::{Device, Options};
 
 pub trait Transport {
     fn target(&self) -> &str;
+    fn require_shell_injection(&mut self) -> Result<()>;
     fn capture(&mut self, command: &str, timeout: Duration) -> Result<Capture>;
     fn push(&mut self, local: &Path, remote: &str) -> Result<()>;
     fn inject(&mut self, command: &str) -> Result<()>;
@@ -44,6 +45,10 @@ impl SdbTransport {
 impl Transport for SdbTransport {
     fn target(&self) -> &str {
         &self.target
+    }
+
+    fn require_shell_injection(&mut self) -> Result<()> {
+        inject::require_shell_injection(&self.target, &self.options)
     }
 
     fn capture(&mut self, command: &str, timeout: Duration) -> Result<Capture> {
@@ -98,6 +103,10 @@ impl FakeTransport {
 impl Transport for FakeTransport {
     fn target(&self) -> &str {
         &self.target
+    }
+
+    fn require_shell_injection(&mut self) -> Result<()> {
+        Ok(())
     }
 
     fn capture(&mut self, _command: &str, _timeout: Duration) -> Result<Capture> {
