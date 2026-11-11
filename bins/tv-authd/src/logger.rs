@@ -65,6 +65,7 @@ fn audit_lines(log: &str, limit: usize) -> Vec<String> {
         " result=failed",
         " denied=",
         " grant_revoked ",
+        " access=",
     ];
     let mut lines: Vec<String> = log
         .lines()
@@ -104,12 +105,14 @@ mod tests {
                    102 requester=User::Pkg::b request=2 approval=denied error=user_denied\n\
                    103 prompt_decision label=User::Pkg::c request=3 kind=exec decision=Once\n\
                    104 requester=System::Privileged request=4 pkgid=p version=1 backend=was result=installed\n\
-                   105 grant_revoked label=User::Pkg::c revoked=true\n";
+                   105 grant_revoked label=User::Pkg::c revoked=true\n\
+                   106 access_enforced ssh=off stopped=dropbear.service\n\
+                   107 access=ssh_key_added fingerprint=SHA256:x comment=me by=user\n";
         let lines = audit_lines(log, 3);
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("103 "));
-        assert!(lines[2].starts_with("105 "));
-        assert_eq!(audit_lines(log, 10).len(), 4);
+        assert!(lines[0].starts_with("104 "));
+        assert!(lines[2].starts_with("107 "), "access changes are audited");
+        assert_eq!(audit_lines(log, 10).len(), 5, "enforcement passes are not");
     }
 
     #[test]

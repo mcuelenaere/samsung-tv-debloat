@@ -47,6 +47,13 @@ invalidates the grant and the next request prompts again. If the daemon cannot
 verify the package identity, it fails closed and reports
 `package_identity_unavailable`.
 
+### SSH key prompt
+
+`kind: "ssh_key"` comes from tv-authd itself when a key is pushed to
+`/home/owner/share/tmp/sdk_tools/ssh-key.pub` (requester `sdb-push`); its
+`command` lists the keys as `type fingerprint comment` lines. The popup shows
+them with a warning and offers **Deny** (focused) and **Allow** only.
+
 ### Package prompt
 
 For `pkg.install` the daemon sends `kind: "install"` with an `install` object.
@@ -93,6 +100,10 @@ app from forging the decision message, but visual spoofing is outside this
 milestone.
 
 ## Build and deploy
+
+A replaced binary must be relabelled `_` (`chsmack -a _`) before the unit
+starts it: a file written as root over SSH gets `System::Privileged`, which
+the popup's label cannot read, and systemd reports `203/EXEC`.
 
 ```sh
 ./build-armv7.sh            # ../../cross-build.sh gnueabi; needs ../../sysroot

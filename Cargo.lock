@@ -411,11 +411,9 @@ dependencies = [
 name = "tv-blockd"
 version = "0.1.0"
 dependencies = [
- "base64",
  "libc",
  "serde",
  "serde_json",
- "sha2",
  "tv-proto",
  "tv-tizen",
 ]

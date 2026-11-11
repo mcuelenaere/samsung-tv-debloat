@@ -1,4 +1,4 @@
-//! `authorized_keys` handling for the System tab's SSH section: parsing,
+//! `authorized_keys` handling for `access`: parsing,
 //! OpenSSH-style fingerprints, adding and removing keys.
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
@@ -121,7 +121,7 @@ mod tests {
 
         let file = add("# mine\n", &[ed.clone(), ec.clone(), ed.clone()]);
         assert_eq!(file, format!("# mine\n{ED}\n{EC}\n"));
-        assert_eq!(add(&file, &[ed.clone()]), file, "no duplicates");
+        assert_eq!(add(&file, std::slice::from_ref(&ed)), file, "no duplicates");
         assert_eq!(
             remove(&file, &ed.fingerprint).unwrap(),
             format!("# mine\n{EC}\n")

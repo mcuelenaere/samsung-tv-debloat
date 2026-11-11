@@ -138,10 +138,9 @@ enum Action {
     Undo,
     /// Edit the host Samsung's developer mode lets use SDB.
     SdbHost,
-    /// Add the pushed SSH keys with these fingerprints.
-    SshAdd(Vec<String>),
-    /// Delete the pushed key file.
-    SshReject,
+    /// Switch SSH or SDB (tv-authd's `access.set`).
+    ToggleSsh,
+    ToggleSdb,
     /// Remove the SSH key with this fingerprint.
     SshRemove(String),
 }
@@ -161,6 +160,8 @@ enum Job {
     Tweaks(Service, Option<String>, Result<Value, String>),
     /// tv-blockd's `system` snapshot.
     System(Result<Value, String>),
+    /// tv-authd's `access` view, with the message for a change it answers.
+    Access(Option<String>, Result<Value, String>),
 }
 
 #[derive(Clone)]
@@ -226,6 +227,8 @@ struct Ui {
     /// tv-blockd's last `system` snapshot, and when the next was asked for.
     system: Option<Value>,
     system_asked: Option<Instant>,
+    /// tv-authd's `access` view: SSH, SDB and the keys.
+    access: Option<Value>,
     exiting: bool,
     connected: bool,
     app_control_count: u32,
@@ -254,6 +257,7 @@ impl Ui {
             patch: None,
             system: None,
             system_asked: None,
+            access: None,
             exiting: false,
             connected: false,
             app_control_count: 0,
@@ -357,6 +361,10 @@ impl Ui {
                             .map_err(|error| format!("tv-blockd sent bad JSON: {error}"))
                     });
                 let _ = jobs.send(Job::System(result));
+                let _ = jobs.send(Job::Access(
+                    None,
+                    access_call(json!({"method": "access.status"})),
+                ));
             });
         }
         if dirty {
@@ -476,10 +484,6 @@ impl Ui {
             }
             Job::Tweaks(service, message, Ok(status)) => {
                 let message = message.or_else(|| status["message"].as_str().map(str::to_owned));
-                // Key changes show at once, not at the next snapshot.
-                if let (Some(system), Some(ssh)) = (self.system.as_mut(), status.get("ssh")) {
-                    system["ssh"] = ssh.clone();
-                }
                 match service {
                     Service::Block => self.tweaks = Some(status),
                     Service::Patch => self.patch = Some(status),
@@ -493,6 +497,20 @@ impl Ui {
             Job::System(Ok(response)) => {
                 self.system = Some(response["system"].clone());
                 return self.tab == Tab::System;
+            }
+            Job::Access(message, Ok(view)) => {
+                self.access = Some(view);
+                if let Some(message) = message {
+                    self.set_status(message);
+                }
+                return self.tab == Tab::System;
+            }
+            Job::Access(message, Err(error)) => {
+                log_line(&error);
+                if message.is_some() {
+                    self.set_status(error);
+                }
+                return false;
             }
             Job::System(Err(error)) => {
                 log_line(&error);
@@ -952,7 +970,7 @@ impl Ui {
 
     fn system_page(&mut self) -> Vec<Block<Action>> {
         match &self.tweaks {
-            Some(status) => system_page(status, self.system.as_ref()),
+            Some(status) => system_page(status, self.system.as_ref(), self.access.as_ref()),
             None => vec![Block::Paragraph {
                 markup: "<muted>Asking tv-blockd...</muted>".into(),
                 size: 24,
@@ -1096,36 +1114,39 @@ impl Ui {
             }
             Action::Tweak(key) => self.apply_tweak(&key),
             Action::SdbHost => {
-                let host = self.tweaks.as_ref().map_or(String::new(), |status| {
-                    status["report"]["sdb_host"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_owned()
-                });
+                let host = self
+                    .access
+                    .as_ref()
+                    .and_then(|access| access["sdb_host"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
                 self.editing_host = true;
                 if let Some(screen) = self.screen.as_mut() {
                     screen.start_field(&host, on_field_done);
                 }
             }
-            Action::SshAdd(fingerprints) => {
-                self.set_status("Adding the key...");
-                self.load_tweaks(
-                    Service::Block,
-                    Some(json!({"method": "ssh_add", "fingerprints": fingerprints})),
-                    Some("Key added; it works for SSH right away."),
+            Action::ToggleSsh | Action::ToggleSdb => {
+                let (field, name) = if action == Action::ToggleSsh {
+                    ("ssh", "SSH")
+                } else {
+                    ("sdb", "SDB")
+                };
+                let on = self
+                    .access
+                    .as_ref()
+                    .is_some_and(|access| access[field] == true);
+                let mut request = json!({"method": "access.set"});
+                request[field] = json!(!on);
+                self.access_request(
+                    request,
+                    format!("{name} is {}.", if on { "off" } else { "on" }),
                 );
             }
-            Action::SshReject => self.load_tweaks(
-                Service::Block,
-                Some(json!({"method": "ssh_reject"})),
-                Some("Pushed key file deleted."),
-            ),
             Action::SshRemove(fingerprint) => {
                 self.set_status("Removing the key...");
-                self.load_tweaks(
-                    Service::Block,
-                    Some(json!({"method": "ssh_remove", "fingerprint": fingerprint})),
-                    Some("Key removed."),
+                self.access_request(
+                    json!({"method": "access.ssh_remove", "fingerprint": fingerprint}),
+                    "Key removed.".into(),
                 );
             }
             Action::Undo => {
@@ -1203,10 +1224,9 @@ impl Ui {
         };
         if std::mem::take(&mut self.editing_host) {
             self.set_status("Saving the SDB host...");
-            self.load_tweaks(
-                Service::Block,
-                Some(json!({"method": "sdb_host", "host": text.trim()})),
-                Some("SDB host saved; SDB restarted."),
+            self.access_request(
+                json!({"method": "access.set", "sdb_host": text.trim()}),
+                "SDB host saved; SDB restarted.".into(),
             );
             self.render();
             return;
@@ -1216,6 +1236,15 @@ impl Ui {
             self.arrange();
         }
         self.render();
+    }
+
+    /// Sends tv-authd an `access.*` request; `message` is shown once it
+    /// succeeds, its refusal otherwise.
+    fn access_request(&mut self, request: Value, message: String) {
+        let jobs = self.jobs_tx.clone();
+        spawn(move || {
+            let _ = jobs.send(Job::Access(Some(message), access_call(request)));
+        });
     }
 
     /// Sends a Tweaks daemon a request (`status` by default); `message` is
@@ -1485,7 +1514,7 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
     }
     let mut undo = Row::text(
         "Undo all changes",
-        "Everything above and SDB back as they were, permanent changes included",
+        "Everything above back as it was, permanent changes included",
     );
     undo.controls.push(Control::Button {
         label: "Undo".into(),
@@ -1499,7 +1528,11 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
 
 /// The System tab from tv-blockd's `status`.
 /// The System tab from tv-blockd's `status` and `system` snapshot.
-fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
+fn system_page(
+    status: &Value,
+    system: Option<&Value>,
+    access: Option<&Value>,
+) -> Vec<Block<Action>> {
     let config = &status["config"];
     let mb = |kb: &Value| format!("{} MB", (kb.as_u64().unwrap_or(0) + 512) / 1024);
     let mut blocks = Vec::new();
@@ -1638,43 +1671,46 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
         blocks.push(Block::Section("Largest in memory".into()));
         blocks.push(list("top_memory"));
     }
-    let ssh = system.map_or(&Value::Null, |system| &system["ssh"]);
-    let keys = ssh["keys"].as_array().cloned().unwrap_or_default();
+    let Some(access) = access else {
+        return blocks;
+    };
+    let keys = access["keys"].as_array().cloned().unwrap_or_default();
+    let running = |key: &str| {
+        if access[key] == true {
+            "running"
+        } else {
+            "not running"
+        }
+    };
     let mut rows = Vec::new();
     let mut switch = Row::text(
         "SSH",
         format!(
             "Dropbear on port 22, keys only \u{00b7} {} \u{00b7} {} key{}",
-            usage("ssh_off"),
+            running("ssh_running"),
             keys.len(),
             if keys.len() == 1 { "" } else { "s" }
         ),
     );
     switch.controls.push(Control::Switch {
-        on: config["ssh_off"] != true,
-        action: Action::Tweak("ssh_off".into()),
+        on: access["ssh"] == true,
+        action: Action::ToggleSsh,
     });
     rows.push(switch);
-    let describe = |key: &Value, prefix: &str| {
+    for key in &keys {
         let comment = key["comment"].as_str().unwrap_or_default();
-        Row::text(
-            format!(
-                "{prefix}{}",
-                if comment.is_empty() {
-                    key["kind"].as_str().unwrap_or("key")
-                } else {
-                    comment
-                }
-            ),
+        let mut row = Row::text(
+            if comment.is_empty() {
+                key["kind"].as_str().unwrap_or("key")
+            } else {
+                comment
+            },
             format!(
                 "{} \u{00b7} {}",
                 key["kind"].as_str().unwrap_or("?"),
                 key["fingerprint"].as_str().unwrap_or("?")
             ),
-        )
-    };
-    for key in &keys {
-        let mut row = describe(key, "");
+        );
         row.controls.push(Control::Button {
             label: "Remove".into(),
             tone: Tone::Danger,
@@ -1682,79 +1718,41 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
         });
         rows.push(row);
     }
-    let pending = ssh["pending"].as_array().cloned().unwrap_or_default();
-    let fingerprints: Vec<String> = pending
-        .iter()
-        .filter_map(|key| key["fingerprint"].as_str().map(str::to_owned))
-        .collect();
-    for (index, key) in pending.iter().enumerate() {
-        let mut row = describe(key, "Pushed: ");
-        if index + 1 == pending.len() {
-            row.controls.push(Control::Button {
-                label: "Reject".into(),
-                tone: Tone::Normal,
-                action: Action::SshReject,
-            });
-            row.controls.push(Control::Button {
-                label: if pending.len() == 1 {
-                    "Add".into()
-                } else {
-                    format!("Add {}", pending.len())
-                },
-                tone: Tone::Primary,
-                action: Action::SshAdd(fingerprints.clone()),
-            });
-        }
-        rows.push(row);
-    }
-    if let Some(error) = ssh["pending_error"].as_str() {
-        let mut row = Row::text("Pushed key file ignored", error.to_owned());
-        row.controls.push(Control::Button {
-            label: "Delete".into(),
-            tone: Tone::Normal,
-            action: Action::SshReject,
-        });
-        rows.push(row);
-    }
-    if system.is_some() {
-        blocks.push(Block::Section("SSH".into()));
-        blocks.push(Block::Rows(rows));
-        blocks.push(Block::Paragraph {
-            markup: format!(
-                "<muted>To add a key, push it from your computer, then check its fingerprint and \
-                 add it here:</muted><br/>tv-sdb -s &lt;TV address&gt; push ~/.ssh/id_ed25519.pub {}",
-                escape(ssh["drop"].as_str().unwrap_or("?"))
-            ),
-            size: 22,
-        });
-    }
+    blocks.push(Block::Section("SSH".into()));
+    blocks.push(Block::Rows(rows));
+    blocks.push(Block::Paragraph {
+        markup: format!(
+            "<muted>To add a key, push it from your computer; the TV then asks you to allow \
+             it:</muted><br/>tv-sdb -s &lt;TV address&gt; push ~/.ssh/id_ed25519.pub {}",
+            escape(access["key_drop"].as_str().unwrap_or("?"))
+        ),
+        size: 22,
+    });
     let mut sdb = Row::text(
         "SDB",
         format!(
             "Samsung's developer bridge, port 26101 \u{00b7} {}",
-            usage("sdb_off")
+            running("sdb_running")
         ),
     );
-    if config["sdb_off"] != true {
+    if access["sdb"] == true {
         sdb.controls.push(Control::Button {
-            label: format!(
-                "Host {}",
-                status["report"]["sdb_host"].as_str().unwrap_or("?")
-            ),
+            label: format!("Host {}", access["sdb_host"].as_str().unwrap_or("?")),
             tone: Tone::Normal,
             action: Action::SdbHost,
         });
     }
     sdb.controls.push(Control::Switch {
-        on: config["sdb_off"] != true,
-        action: Action::Tweak("sdb_off".into()),
+        on: access["sdb"] == true,
+        action: Action::ToggleSdb,
     });
     blocks.push(Block::Section("Developer access".into()));
     blocks.push(Block::Rows(vec![sdb]));
     blocks.push(Block::Paragraph {
         markup: "<muted>SDB runs only while Samsung's developer mode is on, and accepts only \
-                 the host shown. Off lasts until you switch it back on here; a reboot without TV \
-                 suite turns it back on.</muted>"
+                 the host shown. tv-authd keeps SSH and SDB off once switched off, and every \
+                 change is in the Permissions tab's log; without tv-authd a reboot turns them \
+                 back on.</muted>"
             .into(),
         size: 22,
     });
@@ -1818,6 +1816,25 @@ fn icon_path(digest: &str) -> PathBuf {
     Path::new(STORE_DIR)
         .join("icons")
         .join(format!("{digest}.png"))
+}
+
+/// One `access.*` request to tv-authd (blocks; worker threads): the
+/// `access` view, or why it was refused.
+fn access_call(mut request: Value) -> Result<Value, String> {
+    request["version"] = json!(2);
+    request["id"] = json!("access-1");
+    let response = broker_call(request)?;
+    if response["status"] == "ok" {
+        return Ok(response["access"].clone());
+    }
+    Err(match response["error"].as_str().unwrap_or("unknown") {
+        "last_key" => {
+            "The last key stays while SSH is on; add another or switch SSH off first.".into()
+        }
+        "invalid_host" => "That is not an IPv4 address.".into(),
+        "not_found" => "That key is already gone.".into(),
+        error => format!("tv-authd refused: {error}"),
+    })
 }
 
 /// One-shot broker request on its own connection (blocks; worker threads).

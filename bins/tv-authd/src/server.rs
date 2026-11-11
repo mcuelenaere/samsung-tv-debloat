@@ -11,9 +11,9 @@ use crate::pkgstage::{self, StageConfig, StageError};
 use crate::protocol::{
     is_valid_request_id, parse_request, prompt_text, read_message, validate_decision,
     validate_exec, validate_install, validate_label, validate_uninstall, write_response,
-    ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind, PackageType,
-    PackageView, ParseError, PromptKind, Request, Response, SignatureStatus, UninstallMeta,
-    UninstallRequest, MAX_PKGID_BYTES, MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES,
+    AccessView, ExecRequest, GrantView, InstallRequest, ListPackagesRequest, NoticeKind,
+    PackageType, PackageView, ParseError, PromptKind, Request, Response, SignatureStatus,
+    UninstallMeta, UninstallRequest, MAX_PKGID_BYTES, MAX_PKG_NAME_BYTES, MAX_PKG_VERSION_BYTES,
     MAX_REQUEST_BYTES,
 };
 use crate::trust::{self, TrustPaths};
@@ -100,6 +100,8 @@ pub struct Broker {
     pub approvals: ApprovalHandle,
     pub logger: Option<Arc<Logger>>,
     pub next_ui_token: AtomicU64,
+    /// SSH and SDB (`access.*`); `None` in tests that do not need it.
+    pub access: Option<Arc<crate::access::Access>>,
     /// Serializes package installs (staging + prompt + pkgcmd) globally.
     install_lock: Mutex<()>,
 }
@@ -115,8 +117,14 @@ impl Broker {
             approvals,
             logger,
             next_ui_token: AtomicU64::new(1),
+            access: None,
             install_lock: Mutex::new(()),
         }
+    }
+
+    pub fn with_access(mut self, access: Arc<crate::access::Access>) -> Self {
+        self.access = Some(access);
+        self
     }
 }
 
@@ -533,6 +541,36 @@ fn handle_ui_request(
             handle_uninstall(writer, identity, broker, config, request, true)?
         }
         Request::PkgList(request) => handle_list(writer, identity, broker, config, request)?,
+        Request::AccessStatus(request) => {
+            let response = match &broker.access {
+                Some(access) => Response::access(&request.id, access.view()),
+                None => Response::error(&request.id, "error", "access_unavailable"),
+            };
+            send(writer, &response)?;
+        }
+        Request::AccessSet(request) => {
+            let result = broker
+                .access
+                .as_ref()
+                .ok_or("access_unavailable")
+                .and_then(|access| {
+                    access.set(
+                        request.ssh,
+                        request.sdb,
+                        request.sdb_host.as_deref(),
+                        &identity.label,
+                    )
+                });
+            send(writer, &access_response(&request.id, result))?;
+        }
+        Request::AccessSshRemove(request) => {
+            let result = broker
+                .access
+                .as_ref()
+                .ok_or("access_unavailable")
+                .and_then(|access| access.remove_key(&request.fingerprint, &identity.label));
+            send(writer, &access_response(&request.id, result))?;
+        }
         Request::GrantsAudit(request) => {
             let lines = broker
                 .logger
@@ -555,6 +593,13 @@ fn handle_ui_request(
         }
     }
     Ok(())
+}
+
+fn access_response(id: &str, result: Result<AccessView, &'static str>) -> Response {
+    match result {
+        Ok(view) => Response::access(id, view),
+        Err(error) => Response::error(id, "error", error),
+    }
 }
 
 fn handle_app_request(
@@ -3047,6 +3092,11 @@ mod tests {
         let fixture = fixture();
         let (mut client, handle) = connect(&fixture, "User::Pkg::org.example.allowed", 5001);
         client.send(json!({"version": 2, "id": "audit-1", "method": "grants.audit"}));
+        assert_eq!(client.read()["error"], "not_ui");
+        // Access to SSH and SDB is the manager's too.
+        client.send(json!({"version": 2, "id": "acc-1", "method": "access.set", "ssh": true}));
+        assert_eq!(client.read()["error"], "not_ui");
+        client.send(json!({"version": 2, "id": "acc-2", "method": "access.ssh_remove", "fingerprint": "SHA256:x"}));
         assert_eq!(client.read()["error"], "not_ui");
         drop(client);
         handle.join().unwrap().unwrap();

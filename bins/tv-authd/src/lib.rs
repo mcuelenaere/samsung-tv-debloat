@@ -1,3 +1,4 @@
+pub mod access;
 pub mod approval;
 pub mod executor;
 pub mod grants;
@@ -11,10 +12,12 @@ pub mod pkgsign;
 pub mod pkgstage;
 pub mod protocol;
 pub mod server;
+pub mod ssh_keys;
 pub mod trust;
 pub mod ui_alias;
 pub mod wasinstall;
 
+pub use access::{Access, AccessPaths};
 pub use approval::{
     ApprovalConfig, ApprovalHandle, ApprovalManager, ApprovalRequest, ApprovalResult,
 };

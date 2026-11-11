@@ -36,12 +36,6 @@ Every 60 s, and right after each configuration change, it reconciles:
     unit does not start while Samsung's own `/tmp/multiview_low_memory`
     exists, which the firmware creates when memory runs low; it is Samsung's
     and left alone.
-  - **sdb_off** (off): `sdbd_tcp.socket`, `sdbd.socket`, `sdbd.service`.
-    SDB (TCP 26101) only starts while Samsung's developer mode is on (the
-    socket's `ConditionPathExists=…/com.samsung.tv.store/data/develop_mode`).
-  - **ssh_off** (off): `dropbear.service`, stopped but not masked: its unit
-    file is itself in `/run/systemd/system`, where a runtime mask would go,
-    and only the boot hook starts it.
 - **permanent options** (`DISABLES` in `src/daemon.rs`, all off): service
   apps that amd restarts, disabled in pkgmgr's database with
   `pkgcmd -D -t app -n <app> --global` (run with a 20 s limit). This outlives
@@ -93,8 +87,6 @@ but which can go without breaking the remote's microphone is untested.
 | `telemetry` | `true` | stop telemetry services |
 | `airplay` | `false` | turn off the AirPlay receiver |
 | `multiview_preload` | `false` | don't preload Multi View |
-| `sdb_off` | `false` | stop SDB |
-| `ssh_off` | `false` | stop Dropbear (SSH) |
 | `disable_hbbtv`, `disable_acr`, `disable_ads` | `false` | permanent app disables |
 
 ## Control
@@ -111,24 +103,9 @@ process names) with their memory and CPU. The GPU figure averages Mali's
 `dvfs_usage` (load over its last 20 ms, so one read is mostly 0), sampled
 every 25 ms by a thread that runs only while the System tab asks; the NPU
 has no load counter, so its activity is the `triv2` interrupt rate from
-`/proc/interrupts`. `{"method":"sdb_host","host":"a.b.c.d"}` (CLI:
-`tv-blockd sdb-host IP`) sets `db/sdk/develop/ip`, the one host Samsung's
-developer mode accepts on SDB (another host's connection is reset), and
-restarts `sdbd.service` if it runs. It is the TV's own setting, so `undo`
-leaves it alone.
-
-SSH keys (`/opt/tv-sshd/authorized_keys`, which Dropbear reads at each
-login): `status` and `system` carry `ssh` (the keys with type, comment and
-SHA-256 fingerprint as `ssh-keygen -l` prints it, plus any pushed ones).
-A key is added by pushing it with
-`tv-sdb push id.pub /home/owner/share/tmp/sdk_tools/ssh-key.pub`. That
-folder is world-writable, so the file is opened without following
-symlinks, must be a regular file under 16 KB, and nothing is added until
-`{"method":"ssh_add","fingerprints":[...]}` names the fingerprints the user
-confirmed on the TV (a file swapped in between adds nothing). The file is
-deleted after `ssh_add` or `{"method":"ssh_reject"}`.
-`{"method":"ssh_remove","fingerprint":"SHA256:..."}` removes a key, but
-never the last one while SSH is on. Just before an option first stops
+`/proc/interrupts`. SSH, SDB and SSH keys are tv-authd's (`access.*` in
+`bins/tv-authd/PROTOCOL.md`), so every change to who can reach the TV is
+in its audit log. Just before an option first stops
 its processes, tv-blockd records what they used in `changes.json`
 (`freed`). Callers: root, or uid 5001 with SMACK
 label `User::Pkg::org.tvauth.ui` (the manager's **Tweaks** tab).

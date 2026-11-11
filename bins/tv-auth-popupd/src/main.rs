@@ -193,6 +193,12 @@ impl Popup {
         self.hide_at = None;
         if package_operation {
             self.render_package_prompt();
+        } else if self
+            .current_prompt
+            .as_ref()
+            .is_some_and(PromptInfo::is_ssh_key)
+        {
+            self.render_ssh_key_prompt();
         } else {
             self.render_prompt();
         }
@@ -247,10 +253,11 @@ impl Popup {
         let eyebrow = match prompt.kind.as_str() {
             "uninstall" => "REMOVE PACKAGE",
             "install" => "INSTALL PACKAGE",
+            "ssh_key" => "SSH ACCESS",
             _ => "ROOT ACCESS",
         };
         match decision {
-            "once" if prompt.is_package_operation() => {
+            "once" if prompt.is_package_operation() || prompt.is_ssh_key() => {
                 self.set_header(eyebrow, "Approved", COLOR_ACCENT)
             }
             "once" => self.set_header(eyebrow, "Allowed once", COLOR_ACCENT),
@@ -621,6 +628,50 @@ impl Popup {
         );
         unsafe { elm_object_focus_set(deny, 1) };
     }
+    /// One-shot: Deny (focused) or Allow, never "always". The daemon adds
+    /// exactly the keys listed here.
+    fn render_ssh_key_prompt(&mut self) {
+        let Some(prompt) = self.current_prompt.clone() else {
+            return;
+        };
+        self.clear_content();
+        self.set_header("SSH ACCESS", "Allow a new SSH key?", COLOR_DANGER);
+        self.set_status(
+            "Only allow a key you just pushed yourself: it gives root access over the network.",
+        );
+        self.add_content(create_label(self.content_box, &small("KEY", "#8a8f99")));
+        let (key_panel, key_box) = panel(self.content_box, COLOR_INSET, 24, 14);
+        self.add_content(key_panel);
+        add_to_box(
+            key_box,
+            create_label(
+                key_box,
+                &format!(
+                    "<font=Monospace><font_size=22><color=#e8e8e8>{}</color></font_size></font>",
+                    command_markup(&prompt.command, prompt.command_truncated)
+                ),
+            ),
+        );
+        let footer = create_row(self.content_box);
+        self.add_content(footer);
+        self.last_countdown = -1;
+        self.countdown_label = create_label(footer, "");
+        unsafe { elm_box_pack_end(footer, self.countdown_label) };
+        let deny = create_button(
+            footer,
+            "Deny",
+            on_decision_clicked,
+            std::ptr::without_provenance_mut(1),
+        );
+        create_button(
+            footer,
+            "Allow",
+            on_decision_clicked,
+            std::ptr::without_provenance_mut(2),
+        );
+        unsafe { elm_object_focus_set(deny, 1) };
+    }
+
     fn render_package_prompt(&mut self) {
         let Some(prompt) = self.current_prompt.clone() else {
             return;

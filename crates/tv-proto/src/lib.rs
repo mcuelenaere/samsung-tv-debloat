@@ -151,6 +151,66 @@ pub struct GrantsAuditRequest {
     pub method: String,
 }
 
+/// `access.status` (UI identity only): SSH, SDB and the SSH keys.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessStatusRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+}
+
+/// `access.set` (UI identity only): any of the fields; each change is
+/// applied and audited.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessSetRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+    #[serde(default)]
+    pub ssh: Option<bool>,
+    #[serde(default)]
+    pub sdb: Option<bool>,
+    /// The one host Samsung's developer mode lets use SDB (IPv4).
+    #[serde(default)]
+    pub sdb_host: Option<String>,
+}
+
+/// `access.ssh_remove` (UI identity only).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessSshRemoveRequest {
+    pub version: u32,
+    pub id: String,
+    pub method: String,
+    pub fingerprint: String,
+}
+
+/// One SSH key, as `access.*` responses list it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SshKeyView {
+    /// `ssh-ed25519`, `ecdsa-sha2-nistp256`, ...
+    pub kind: String,
+    pub comment: String,
+    /// `SHA256:...`, as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+}
+
+/// The `access` object of `access.*` responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccessView {
+    /// SSH is wanted on (`false`: tv-authd keeps Dropbear stopped).
+    pub ssh: bool,
+    pub ssh_running: bool,
+    pub sdb: bool,
+    pub sdb_running: bool,
+    pub sdb_host: Option<String>,
+    pub keys: Vec<SshKeyView>,
+    /// Where `tv-sdb push` puts a key to add.
+    pub key_drop: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
@@ -206,6 +266,9 @@ pub enum PromptKind {
     Exec,
     Install,
     Uninstall,
+    /// A key pushed over SDB asks to be added to SSH's authorized keys.
+    #[serde(rename = "ssh_key")]
+    SshKey,
 }
 
 impl PromptKind {
@@ -214,6 +277,7 @@ impl PromptKind {
             Self::Exec => "exec",
             Self::Install => "install",
             Self::Uninstall => "uninstall",
+            Self::SshKey => "ssh_key",
         }
     }
 
@@ -288,6 +352,9 @@ pub enum Request {
     PkgInstall(InstallRequest),
     PkgUninstall(UninstallRequest),
     PkgList(ListPackagesRequest),
+    AccessStatus(AccessStatusRequest),
+    AccessSet(AccessSetRequest),
+    AccessSshRemove(AccessSshRemoveRequest),
 }
 
 impl Request {
@@ -303,6 +370,9 @@ impl Request {
             Self::PkgInstall(request) => &request.id,
             Self::PkgUninstall(request) => &request.id,
             Self::PkgList(request) => &request.id,
+            Self::AccessStatus(request) => &request.id,
+            Self::AccessSet(request) => &request.id,
+            Self::AccessSshRemove(request) => &request.id,
         }
     }
 }
@@ -361,6 +431,15 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ParseError> {
         }
         "pkg.list" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
             serde_json::from_slice::<ListPackagesRequest>(bytes).map(Request::PkgList)
+        }
+        "access.status" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<AccessStatusRequest>(bytes).map(Request::AccessStatus)
+        }
+        "access.set" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<AccessSetRequest>(bytes).map(Request::AccessSet)
+        }
+        "access.ssh_remove" if peek.version >= PACKAGE_PROTOCOL_VERSION => {
+            serde_json::from_slice::<AccessSshRemoveRequest>(bytes).map(Request::AccessSshRemove)
         }
         // A v1 client asking for a v2-only method is a version problem, not an
         // unknown method: the client should learn that it must upgrade.
@@ -476,6 +555,9 @@ pub struct Response {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `access.*` result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessView>,
 }
 
 impl Response {
@@ -499,6 +581,7 @@ impl Response {
             packages: None,
             detail: None,
             error: None,
+            access: None,
         }
     }
 
@@ -528,6 +611,7 @@ impl Response {
             packages: None,
             detail: None,
             error: None,
+            access: None,
         }
     }
 
@@ -583,6 +667,12 @@ impl Response {
     pub fn grants(id: &str, grants: Vec<GrantView>) -> Self {
         let mut response = Self::base(id, "ok");
         response.grants = Some(grants);
+        response
+    }
+
+    pub fn access(id: &str, view: AccessView) -> Self {
+        let mut response = Self::base(id, "ok");
+        response.access = Some(view);
         response
     }
 

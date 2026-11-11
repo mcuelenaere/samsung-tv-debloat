@@ -153,12 +153,13 @@ tab is open:
   stopped, what they used when tv-blockd stopped them;
 - **Busiest now** and **Largest in memory**: the top eight processes, named
   by app id where they are apps;
-- **SSH**: the switch (tv-blockd's `ssh_off`, on means Dropbear runs), each
-  key with its fingerprint and **Remove**, and a key pushed with `tv-sdb`
-  with **Add** and **Reject**; the push command is shown under it;
-- **Developer access**: **SDB** (tv-blockd's `sdb_off`, shown the other way
-  round: on means SDB runs) and, while it is on, **Host**: the one address
-  Samsung's developer mode lets connect, edited with the TV keyboard.
+- **SSH** and **Developer access**, from tv-authd (`access.status`, polled
+  with the snapshot; changes with `access.set` and `access.ssh_remove`, all
+  in the Permissions tab's log): the SSH switch, each key with its
+  fingerprint and **Remove**, and the `tv-sdb push` command for adding one
+  (tv-authd's popup then asks); the SDB switch and, while SDB is on, **Host**:
+  the one address Samsung's developer mode lets connect, edited with the TV
+  keyboard.
 
 ### Dock (`org.tvauth.home`)
 

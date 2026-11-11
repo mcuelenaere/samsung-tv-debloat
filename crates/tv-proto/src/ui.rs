@@ -82,6 +82,12 @@ impl PromptInfo {
     pub fn is_package_operation(&self) -> bool {
         self.kind == "install" || self.kind == "uninstall"
     }
+
+    /// A key pushed over SDB asks to be added to SSH's authorized keys;
+    /// `command` lists it as `type fingerprint comment` lines.
+    pub fn is_ssh_key(&self) -> bool {
+        self.kind == "ssh_key"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

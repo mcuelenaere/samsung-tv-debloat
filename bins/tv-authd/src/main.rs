@@ -9,8 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use tv_authd::{
-    identity, pkglist, pkgsign, pkgstage, trust, ui_alias, wasinstall, ApprovalConfig,
-    ApprovalManager, Broker, GrantStore, Logger, PackageConfig, ServerConfig, UiAliasConfig,
+    identity, pkglist, pkgsign, pkgstage, trust, ui_alias, wasinstall, Access, AccessPaths,
+    ApprovalConfig, ApprovalManager, Broker, GrantStore, Logger, PackageConfig, ServerConfig,
+    UiAliasConfig,
 };
 
 struct Args {
@@ -123,11 +124,14 @@ fn run(args: Args) -> io::Result<()> {
         Arc::clone(&grants),
         Some(Arc::clone(&logger)),
     )?;
-    let broker = Arc::new(Broker::new(
-        grants,
-        manager.handle(),
+    let access = Arc::new(Access::new(
+        AccessPaths::default(),
         Some(Arc::clone(&logger)),
     ));
+    access.start(manager.handle(), args.approval.approval_wait_timeout());
+    let broker = Arc::new(
+        Broker::new(grants, manager.handle(), Some(Arc::clone(&logger))).with_access(access),
+    );
 
     prepare_socket_directory(&args.socket)?;
     if let Some(alias) = &args.server.ui_alias {

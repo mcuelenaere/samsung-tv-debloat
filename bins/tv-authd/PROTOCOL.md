@@ -371,8 +371,8 @@ requester cannot supply it. The command is a display copy only: control and
 bidirectional formatting characters are replaced with U+FFFD, and long commands
 are truncated with `command_truncated: true`.
 
-`kind` is `exec`, `install`, or `uninstall`; a v1 prompt without the field means
-`exec`. Only `kind: "install"` carries the `install` object; only
+`kind` is `exec`, `install`, `uninstall`, or `ssh_key` (see `access.*`); a v1
+prompt without the field means `exec`. Only `kind: "install"` carries the `install` object; only
 `kind: "uninstall"` carries `uninstall`:
 
 ```json
@@ -552,9 +552,56 @@ UI identity only, protocol v2:
 
 Response: `{"version": 2, "id": "audit-1", "status": "ok", "audit": ["1794260185 requester=… result=installed", …]}`
 — up to 30 recent daemon log lines (oldest first, `<unix seconds> <event>`)
-for approval outcomes, prompt decisions, package changes, denials, and
-revocations; per-exec lines of granted apps are left out. Errors:
+for approval outcomes, prompt decisions, package changes, denials,
+revocations and `access=` changes; per-exec lines of granted apps are left
+out. Errors:
 `audit_unavailable`.
+
+## `access.status`, `access.set`, `access.ssh_remove`
+
+UI identity only, protocol v2. Remote access to the TV:
+
+```json
+{"version": 2, "id": "a-1", "method": "access.status"}
+{"version": 2, "id": "a-2", "method": "access.set", "ssh": false, "sdb": true, "sdb_host": "192.168.1.20"}
+{"version": 2, "id": "a-3", "method": "access.ssh_remove", "fingerprint": "SHA256:…"}
+```
+
+`access.set` takes any of its fields. Each answers with the current view:
+
+```json
+{"version": 2, "id": "a-1", "status": "ok", "access": {
+  "ssh": true, "ssh_running": true, "sdb": true, "sdb_running": true,
+  "sdb_host": "172.17.2.206",
+  "keys": [{"kind": "ecdsa-sha2-nistp256", "comment": "me", "fingerprint": "SHA256:…"}],
+  "key_drop": "/home/owner/share/tmp/sdk_tools/ssh-key.pub"}}
+```
+
+- `ssh: false` stops `dropbear.service` and keeps it stopped (re-checked every
+  10 s; the boot hook starts it after the daemon). The unit is not masked:
+  its file is itself in `/run/systemd/system`.
+- `sdb: false` runtime-masks and stops `sdbd_tcp.socket`, `sdbd.socket` and
+  `sdbd.service`; `true` unmasks and starts the TCP socket (it only starts
+  while Samsung's developer mode is on) and then `sdbd.service`.
+- `sdb_host` (IPv4) is `db/sdk/develop/ip`, the one host developer mode lets
+  connect; `sdbd.service` is restarted to read it.
+- `access.ssh_remove` never removes the last key while SSH is on.
+
+The on/off state is `/opt/tv-auth/access.json`; without the daemon a reboot
+brings SSH and SDB back. Errors: `access_unavailable`, `invalid_host`,
+`sdb_host_failed`, `state_save_failed`, `not_found`, `last_key`,
+`keys_save_failed`.
+
+Keys are added only through a prompt. The daemon looks for `key_drop` every
+2 s (where `tv-sdb push` can write; the folder is world-writable), opens it
+without following symlinks, accepts a regular file under 16 KiB with at least
+one public key, and queues a `ui.prompt` with `kind: "ssh_key"`, label and
+package `sdb-push`, and `command` listing the keys as `type fingerprint
+comment` lines. **Allow** (`once`; `always` is rejected) appends exactly the
+keys shown to `/opt/tv-sshd/authorized_keys`; the file is deleted whatever the
+answer. Every change is logged as `access=…` (`ssh_on`/`ssh_off`,
+`sdb_on`/`sdb_off`, `sdb_host`, `ssh_key_added`, `ssh_key_denied`,
+`ssh_key_removed`, `ssh_key_file_ignored`) and returned by `grants.audit`.
 
 ## `grants.revoke`
 

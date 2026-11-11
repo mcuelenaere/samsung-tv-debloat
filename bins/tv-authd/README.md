@@ -333,6 +333,14 @@ installed manager binary through a `/run` bind mount, and the popup unit maps
 `/opt/tv-auth` at `/run/opt/tv-auth` like this daemon's unit. See the two
 READMEs for behavior, build, and deployment.
 
+## Remote access
+
+`src/access.rs` keeps SSH (Dropbear) and SDB on or off, the SDB host, and the
+SSH keys, so every change to who can reach the TV is audited: the manager's
+System tab drives it through `access.*`, and a key pushed with `tv-sdb` is
+added only after the user allows it on the popup (`kind: "ssh_key"`). See
+`PROTOCOL.md`.
+
 ## Test clients
 
 `test-clients/` contains two managed `.NET` service applications that send a
