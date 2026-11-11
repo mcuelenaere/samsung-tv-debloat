@@ -9,6 +9,11 @@ use std::ptr;
 extern "C" {
     fn app_control_create(handle: *mut *mut c_void) -> c_int;
     fn app_control_set_app_id(handle: *mut c_void, app_id: *const c_char) -> c_int;
+    fn app_control_add_extra_data(
+        handle: *mut c_void,
+        key: *const c_char,
+        value: *const c_char,
+    ) -> c_int;
     fn app_control_send_launch_request(
         handle: *mut c_void,
         reply: *const c_void,
@@ -34,13 +39,27 @@ extern "C" {
 
 /// Ask `amd` to launch (or resume) `app_id`.
 pub fn launch(app_id: &str) -> Result<(), String> {
+    launch_with(app_id, &[])
+}
+
+/// [`launch`] with `extras` as app_control extra data.
+pub fn launch_with(app_id: &str, extras: &[(&str, &str)]) -> Result<(), String> {
     let id = c_string(app_id)?;
+    let extras = extras
+        .iter()
+        .map(|(key, value)| Ok((c_string(key)?, c_string(value)?)))
+        .collect::<Result<Vec<_>, String>>()?;
     let mut handle = ptr::null_mut();
     let status = unsafe { app_control_create(&mut handle) };
     if status != 0 {
         return Err(format!("app_control_create: {status}"));
     }
     let mut status = unsafe { app_control_set_app_id(handle, id.as_ptr()) };
+    for (key, value) in &extras {
+        if status == 0 {
+            status = unsafe { app_control_add_extra_data(handle, key.as_ptr(), value.as_ptr()) };
+        }
+    }
     if status == 0 {
         status = unsafe { app_control_send_launch_request(handle, ptr::null(), ptr::null_mut()) };
     }

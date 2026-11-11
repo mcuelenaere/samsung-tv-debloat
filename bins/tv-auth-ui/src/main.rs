@@ -294,6 +294,7 @@ impl Ui {
     }
 
     fn create_window(&mut self) -> bool {
+        instant_focus_scrolling();
         unsafe {
             let window = elm_win_add(ptr::null_mut(), APP_ID.as_ptr().cast(), ELM_WIN_BASIC);
             if window.is_null() {

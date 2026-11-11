@@ -9,6 +9,7 @@ pub mod http;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod pkgdb;
+pub mod svg;
 pub mod tls;
 pub mod vconf;
 #[cfg(target_os = "linux")]

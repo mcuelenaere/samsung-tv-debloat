@@ -138,8 +138,23 @@ key's target:
   it is already shown;
 - it is a `NOTIFICATION_HIGH` window across the bottom of the screen;
 - BACK or 20 s idle also hides it;
-- tiles: **Samsung Home** (`com.samsung.tv.csfs`), the apps, **TV suite**.
-  The focused tile's name shows above the row; the row scrolls with focus.
+- tiles: **Samsung Home** (`com.samsung.tv.csfs`), **Settings**
+  (`org.tizen.menu`), the inputs, the apps, **TV suite**. The focused tile's
+  name shows above the row; the row scrolls with focus.
+
+The inputs are the HDMI sources in Home's row, in that order, then TV, from
+Home's `.sourceCache` (mirrored as `/run/tv-suite/home-sources`):
+- name: `EditName`, else `DetectedName`, else the source id;
+- icon: `LauncherUnfocusedIconPath` (Samsung's launcher art, e.g. Xbox and
+  Nintendo), else `IconPath`. PNGs load directly. Samsung's SVGs (gamepad,
+  TV, the Settings gear) are rasterised with thorvg (`tv_tizen::svg`) onto a
+  light backdrop, because evas has no SVG loader here and the icons are dark;
+- OK sends tv-viewer Samsung's own source-change request (`change_source`,
+  `sourceType`, `sourceName`, `sourceIcon`, `mbrIndex`,
+  `__K_EX_LAUNCH_REQUESTOR=user`).
+
+Both UIs set Elementary's focus autoscroll to SHOW: a scroller jumps to the
+focused widget instead of animating there, which lagged behind key repeat.
 
 The apps are Samsung Home's own catalog (`src/catalog.rs`):
 - webappservice's `widgetinfo` rows with `is_hidden = 0` (sideloaded apps
@@ -150,9 +165,10 @@ The apps are Samsung Home's own catalog (`src/catalog.rs`):
   then the rest by title.
 
 A thread watches `/opt/dbspace` (`.webappservice.db*`) and `/run/tv-suite`
-(`home-row`) with inotify, reads the catalog again 300 ms after the last
-change and wakes the main loop through an `ecore_pipe`. The tiles are rebuilt
-and focus stays on the same app. An install or uninstall shows within about
+(`home-row`, `home-sources`) with inotify and reads the catalog again 300 ms
+after the last change. Only when apps or inputs differ (webappservice writes
+on every launch too) does it wake the main loop through an `ecore_pipe`. The
+tiles are rebuilt and focus stays on the same tile. An install or uninstall shows within about
 2–3 s of its start, before `tvauth-cli` returns.
 
 The TV's button theme has no icon part, draws its focus above any content and

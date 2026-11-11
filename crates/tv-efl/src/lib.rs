@@ -27,6 +27,9 @@ pub const EEXT_CALLBACK_BACK: c_int = 0;
 pub const ECORE_WL2_WINDOW_TYPE_TOPLEVEL: c_int = 1;
 pub const ECORE_WL2_WINDOW_TYPE_NOTIFICATION: c_int = 5;
 pub const ELM_WRAP_WORD: c_int = 2;
+/// `Elm_Focus_Autoscroll_Mode`: SHOW jumps a scroller to the focused widget;
+/// BRING_IN (2) animates there.
+pub const ELM_FOCUS_AUTOSCROLL_MODE_SHOW: c_int = 0;
 /// `efl_util_notification_level_e`. These go to e20 unchanged; anything else
 /// (the deprecated 0-2, or the 1-4 this crate used to send) lands in
 /// E_LAYER_CLIENT_NOTIFICATION_LOW or NORMAL, below Samsung's own overlays.
@@ -154,6 +157,7 @@ extern "C" {
     pub fn elm_object_part_text_set(object: *mut c_void, part: *const c_char, text: *const c_char);
     pub fn elm_object_focus_set(object: *mut c_void, focus: EinaBool);
     pub fn elm_object_scale_set(object: *mut c_void, scale: c_double);
+    pub fn elm_config_focus_autoscroll_mode_set(mode: c_int);
 }
 
 #[link(name = "evas")]
@@ -170,6 +174,18 @@ extern "C" {
     );
     pub fn evas_object_evas_get(object: *mut c_void) -> *mut c_void;
     pub fn evas_object_rectangle_add(evas: *mut c_void) -> *mut c_void;
+    pub fn evas_object_image_filled_add(evas: *mut c_void) -> *mut c_void;
+    pub fn evas_object_image_size_set(object: *mut c_void, width: c_int, height: c_int);
+    pub fn evas_object_image_alpha_set(object: *mut c_void, alpha: EinaBool);
+    /// Copies premultiplied ARGB pixels of the image's size.
+    pub fn evas_object_image_data_copy_set(object: *mut c_void, data: *mut c_void);
+    pub fn evas_object_image_data_update_add(
+        object: *mut c_void,
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+    );
     pub fn evas_object_color_set(
         object: *mut c_void,
         red: c_int,
@@ -182,6 +198,8 @@ extern "C" {
     pub fn evas_object_hide(object: *mut c_void);
     pub fn evas_object_move(object: *mut c_void, x: EvasCoord, y: EvasCoord);
     pub fn evas_object_del(object: *mut c_void);
+    pub fn evas_object_raise(object: *mut c_void);
+    pub fn evas_object_lower(object: *mut c_void);
     pub fn evas_object_smart_callback_add(
         object: *mut c_void,
         event: *const c_char,

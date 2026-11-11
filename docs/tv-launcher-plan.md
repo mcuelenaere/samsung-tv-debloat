@@ -277,10 +277,38 @@ No daemon, no evdev, no root at run time.
      is therefore missing from Samsung's own Home**. The pkgmgr main app is
      still `org.tvauth.ui`. Listing the dock first with `main="true"` on the
      manager does not help: this pkgmgr ignores `main`, so the dock became
-     the main app and still got the row. Not fixed yet.
+     the main app and still got the row.
+     - Worse than it looked: Samsung's launcher sends every launch of
+       `org.tvauth.ui` through that row, so the manager could not be opened
+       at all (the dock's TV suite tile, `app_launcher -s`, anything): the
+       dock started instead, also with Custom Home off. Shown by pointing
+       the row back by hand, after which `org.tvauth.ui` started as itself.
+     - A separate exec for the dock (a `bin/tv-auth-home` symlink) did not
+       help and cannot ship: the install flattens the symlink into a 10-byte
+       file and the dock no longer starts.
+     - **Fixed** in tv-patchd: it repairs the row whenever webappservice
+       writes and on every pass (`bins/tv-patchd/README.md`). After an
+       install it is right again about 1 s later. The cleaner home for this
+       is tv-authd's installer.
 3. **Sources**. Check: XBOX SeriesX|S, PlayStation 5, Nintendo Switch with
    Samsung's art; switching to each; renaming a source in Samsung's source
    menu updates the tile.
+
+   **Built 2026-11-11** (with the Settings tile of step 4, after user
+   feedback that neither inputs nor Settings were reachable):
+   - Tiles in order: Samsung Home, Settings, XBOX SeriesX|S (launcher art),
+     PlayStation 5 (Samsung's gamepad SVG via thorvg), Nintendo Switch
+     (launcher art), TV (SVG), then the apps, then TV suite. HDMI3, the
+     soundbar, is not in Home's row and not shown.
+   - OK on Xbox switched the TV to HDMI1 (`memory/system/source_type` 14 to
+     13, Samsung's input banner shown); OK on PlayStation 5 switched back
+     (14).
+   - Settings opens `org.tizen.menu`.
+   - Not done: renaming a source (the mirror and the watcher are in place),
+     marking the current input.
+   - Focus scrolling is instant (Elementary autoscroll SHOW) in the dock and
+     the manager, after the user found scrolling slow once items had to come
+     into view. Not yet confirmed by the user.
 4. **Samsung Home, Settings, TV suite tiles**. Check: Samsung Home opens with
    its sidebar 20 times out of 20; the next Home press shows the dock.
 5. **Tweaks toggle and Undo**. Check: off returns stock Home behaviour at

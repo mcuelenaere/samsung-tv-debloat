@@ -1,14 +1,19 @@
 //! The dock's app list: webappservice's catalog (the one Samsung's Home
 //! shows, sideloaded apps included), in Home's row order, then by title.
+//! And its inputs: the sources in Home's row, named as Home names them.
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const DATABASE: &str = "/opt/dbspace/.webappservice.db";
 /// Samsung Home's row, mirrored by tv-patchd.
 pub const ROW: &str = "/run/tv-suite/home-row";
+/// Samsung Home's `.sourceCache`, mirrored by tv-patchd.
+pub const SOURCES: &str = "/run/tv-suite/home-sources";
 
 /// One row per app Home shows; fields joined with U+001F.
 pub const SQL: &str = "SELECT id || char(31) || title || char(31) || tizen_id || char(31) || \
-     icon_path FROM widgetinfo WHERE is_hidden = 0 AND tizen_id != ''";
+     icon_path FROM widgetinfo WHERE is_hidden = 0 AND tizen_id != '' \
+     AND tizen_id NOT IN ('org.tvauth.ui', 'org.tvauth.home')";
 
 /// Sizes in webappservice's icon folders, best fit for a dock tile first.
 const ICONS: &[&str] = &["152x152.png", "224x224.png", "icon.png", "104x104.png"];
@@ -54,6 +59,50 @@ pub fn row_ids(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// One input, as Samsung's Home shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    /// The cache's `SourceType` (TV 0, HDMI1 13 ... HDMI4 16).
+    pub kind: i64,
+    /// The cache's `MbrActivityIndex`.
+    pub mbr: i64,
+    /// Samsung's launcher art, else its source icon (PNG or SVG).
+    pub icon: Option<String>,
+    /// `IconPath`, which tv-viewer wants as `sourceIcon`.
+    pub source_icon: String,
+}
+
+/// The sources in Home's row (`s/source.layer.hdmi@<key>` lines), in order,
+/// then TV. `cache` is Home's `.sourceCache` JSON.
+pub fn sources(cache: &str, row: &str) -> Vec<Source> {
+    let Ok(Value::Object(cache)) = serde_json::from_str::<Value>(cache) else {
+        return Vec::new();
+    };
+    let keys = row
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("s/source.layer.hdmi@"))
+        .chain(["TV"]);
+    keys.filter_map(|key| {
+        let entry = cache.get(key)?;
+        let text = |field: &str| entry[field].as_str().filter(|text| !text.is_empty());
+        let name = text("EditName")
+            .or(text("DetectedName"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| key.split('/').next().unwrap_or(key).to_owned());
+        Some(Source {
+            name,
+            kind: entry["SourceType"].as_i64()?,
+            mbr: entry["MbrActivityIndex"].as_i64().unwrap_or(-2),
+            icon: text("LauncherUnfocusedIconPath")
+                .or(text("IconPath"))
+                .map(str::to_owned),
+            source_icon: text("IconPath").unwrap_or_default().to_owned(),
+        })
+    })
+    .collect()
+}
+
 /// Home's row first, then the rest by title.
 pub fn order(mut apps: Vec<App>, row: &[&str]) -> Vec<App> {
     apps.sort_by_cached_key(|app| {
@@ -93,6 +142,28 @@ mod tests {
         ];
         let titles: Vec<_> = order(apps, &ids).into_iter().map(|app| app.title).collect();
         assert_eq!(titles, ["YouTube", "Netflix", "Apple TV", "kodi"]);
+    }
+
+    #[test]
+    fn sources_follow_the_row_then_tv() {
+        let cache = r#"{
+            "TV": {"SourceType": 0, "MbrActivityIndex": -2, "IconPath": "/i/tv.svg"},
+            "HDMI1/0": {"EditName": "XBOX SeriesX|S", "SourceType": 13, "MbrActivityIndex": 0,
+                        "IconPath": "/i/x.png", "LauncherUnfocusedIconPath": "/i/x_n.png"},
+            "HDMI2": {"EditName": "", "DetectedName": "PlayStation 5", "SourceType": 14,
+                      "MbrActivityIndex": -2, "IconPath": "/i/pad.svg"},
+            "HDMI3": {"EditName": "HW-Q930B", "SourceType": 15},
+            "HDMI4": {"SourceType": 16}
+        }"#;
+        let row = "s/livetv@TVPLUS\nd/webapp@1\ns/source.layer.hdmi@HDMI1/0\n\
+                   s/source.layer.hdmi@HDMI4\ns/source.layer.hdmi@HDMI2\nEOFCOBA";
+        let found = sources(cache, row);
+        let names: Vec<_> = found.iter().map(|source| source.name.as_str()).collect();
+        assert_eq!(names, ["XBOX SeriesX|S", "HDMI4", "PlayStation 5", "TV"]);
+        assert_eq!(found[0].icon.as_deref(), Some("/i/x_n.png"));
+        assert_eq!((found[0].kind, found[0].mbr), (13, 0));
+        assert_eq!(found[2].icon.as_deref(), Some("/i/pad.svg"));
+        assert!(sources("not json", row).is_empty());
     }
 
     #[test]

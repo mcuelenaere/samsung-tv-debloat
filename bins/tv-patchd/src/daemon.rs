@@ -31,6 +31,8 @@ const CA_BUNDLE: &str = "/etc/ssl/ca-bundle.pem";
 const COBALT_APP: &str = "com.samsung.tv.cobalt-yt";
 /// The suite's dock, `org.tvauth.ui`'s second app.
 const DOCK_APP: &str = "org.tvauth.home";
+/// The manager, `org.tvauth.ui`'s main app.
+const SUITE_APP: &str = "org.tvauth.ui";
 /// Samsung Home's row and source caches. Only Home's own SMACK label may read
 /// them, so while Custom Home is on they are mirrored for the dock as
 /// `/run/tv-suite/home-row` and `home-sources`.
@@ -404,6 +406,11 @@ impl Daemon {
         if let Err(error) = mirror_home(self.config.custom_home) {
             report.errors.push(format!("mirror Home's caches: {error}"));
         }
+        if let Err(error) = repair_suite_row() {
+            report
+                .errors
+                .push(format!("TV suite's webappservice row: {error}"));
+        }
         report.home = self.reconcile_home(&mut report);
         if !self.config.tizentube {
             remove_content(&mut report);
@@ -643,12 +650,43 @@ fn smack_label(path: &str) -> Option<Vec<u8>> {
     (length > 0).then(|| buffer[..length as usize].to_vec())
 }
 
-/// Compare-and-swap the YouTube row, then give the database and its journal
-/// back the owner and SMACK label webappservice expects.
+/// Compare-and-swap the YouTube row.
 fn write_row(from: &str, to: &str) -> Result<(), String> {
+    match write_was(row::UPDATE, &[to, row::WRAPPER, from])? {
+        1 => Ok(()),
+        _ => Err("the row changed while it was being written".into()),
+    }
+}
+
+/// webappservice gives a multi-app TPK's row (Home's tile, and the target of
+/// every launch of the package's id) to an app of its own choosing; for
+/// `org.tvauth.ui` that is the hidden dock, which made the manager both
+/// invisible in Samsung's Home and unlaunchable. Points it back at the
+/// manager. Returns whether it changed anything.
+fn repair_suite_row() -> Result<bool, String> {
+    let wrong = tv_tizen::pkgdb::query_text(
+        row::DATABASE,
+        "SELECT id FROM widgetinfo WHERE id = ?1 AND (tizen_id != ?1 OR is_hidden != 0)",
+        &[SUITE_APP],
+    )?;
+    if wrong.is_empty() {
+        return Ok(false);
+    }
+    write_was(
+        "UPDATE widgetinfo SET tizen_id = ?1, is_hidden = 0 WHERE id = ?1",
+        &[SUITE_APP],
+    )?;
+    log("repaired TV suite's webappservice row");
+    Ok(true)
+}
+
+/// One write to webappservice's database, then the database and its journal
+/// get back the owner and SMACK label webappservice expects. Returns the
+/// number of changed rows.
+fn write_was(sql: &str, parameters: &[&str]) -> Result<usize, String> {
     let metadata = fs::metadata(row::DATABASE).map_err(|error| error.to_string())?;
     let label = smack_label(row::DATABASE);
-    let changed = tv_tizen::pkgdb::execute(row::DATABASE, row::UPDATE, &[to, row::WRAPPER, from])?;
+    let changed = tv_tizen::pkgdb::execute(row::DATABASE, sql, parameters)?;
     for path in [
         row::DATABASE.to_owned(),
         format!("{}-journal", row::DATABASE),
@@ -672,11 +710,7 @@ fn write_row(from: &str, to: &str) -> Result<(), String> {
             };
         }
     }
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err("the row changed while it was being written".into())
-    }
+    Ok(changed)
 }
 
 /// Copies Samsung Home's caches to [`MIRRORS`] (readable by every app label),
@@ -726,17 +760,26 @@ fn mirror_home(on: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Thread: mirror again whenever Home rewrites a cache.
+/// Thread: mirror again whenever Home rewrites a cache, and repair the
+/// suite's webappservice row whenever webappservice writes (an install of
+/// the suite rewrites it).
 fn mirror_changes(on: &AtomicBool) {
-    let watch = match tv_tizen::watch::Watch::new(&[HOME_DATA]) {
+    let watch = match tv_tizen::watch::Watch::new(&[HOME_DATA, "/opt/dbspace"]) {
         Ok(watch) => watch,
-        Err(error) => return log(&format!("mirror: {error}; mirroring once a minute only")),
+        Err(error) => return log(&format!("watch: {error}; checking once a minute only")),
     };
-    let wanted = |name: &str| name.starts_with(".appLayerCache.") || name == ".sourceCache";
+    let wanted = |name: &str| {
+        name.starts_with(".appLayerCache.")
+            || name == ".sourceCache"
+            || name.starts_with(".webappservice.db")
+    };
     loop {
         if let Err(error) = watch.wait(wanted, Duration::from_millis(300)) {
-            log(&format!("mirror watch: {error}"));
+            log(&format!("watch: {error}"));
             thread::sleep(TICK);
+        }
+        if let Err(error) = repair_suite_row() {
+            log(&format!("TV suite's webappservice row: {error}"));
         }
         if on.load(Ordering::Relaxed) {
             if let Err(error) = mirror_home(true) {

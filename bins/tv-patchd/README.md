@@ -87,6 +87,18 @@ reads the copies. A thread re-copies them 300 ms after Home rewrites one
 (inotify), and every pass checks them. Off or `undo` deletes them. See
 `docs/tv-launcher-plan.md`.
 
+## TV suite's webappservice row
+
+webappservice gives a multi-app TPK's row to an app of its own choosing, and
+for `org.tvauth.ui` it picks the hidden dock (`tizen_id=org.tvauth.home`,
+`is_hidden=1`). Samsung's launcher sends every launch of `org.tvauth.ui`
+through that row, so the manager started the dock instead and was missing
+from Samsung's Home. tv-patchd points the row back at the manager
+(`tizen_id=org.tvauth.ui`, `is_hidden=0`) whenever webappservice writes
+(inotify on `/opt/dbspace`) and on every pass, whatever the configuration.
+Owner and SMACK label are restored as for the YouTube row. An install of the
+suite rewrites the row, and it is repaired about 1 s later.
+
 ## Configuration and control
 
 `/opt/tv-suite/etc/patchd.json`: `{"tizentube": false, "custom_home": false}`

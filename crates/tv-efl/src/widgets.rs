@@ -112,6 +112,12 @@ pub fn create_button(
     }
 }
 
+/// Scrollers jump to the focused widget instead of animating there: the
+/// animation runs slower than key repeat, so holding a direction key lags.
+pub fn instant_focus_scrolling() {
+    unsafe { elm_config_focus_autoscroll_mode_set(ELM_FOCUS_AUTOSCROLL_MODE_SHOW) };
+}
+
 pub fn set_text(object: *mut c_void, text: &str) {
     if object.is_null() {
         return;
