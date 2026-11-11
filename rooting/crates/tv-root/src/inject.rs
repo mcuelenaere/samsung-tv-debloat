@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::io::Read;
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 use tv_sdb::{connection::with_default_port, Device, Options};
 
@@ -147,13 +147,40 @@ pub fn capture(
     let target_owned = target.to_owned();
     let options = options.clone();
     let launch_for_thread = launch.clone();
-    let injection = std::thread::spawn(move || -> Result<()> {
+    let mut injection = Some(std::thread::spawn(move || -> Result<()> {
         inject_once(&target_owned, &options, &launch_for_thread).map(|_| ())
-    });
+    }));
 
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + config.timeout;
-    let (mut stream, peer) = accept_until(&listener, deadline)?;
+    let (mut stream, peer) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // A refused or failed injection can never produce a callback.
+                // Surface that error immediately instead of waiting out the
+                // whole callback deadline.
+                if injection
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    let finished = injection.take().expect("checked above");
+                    match finished.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => return Err(Error::protocol("injection thread panicked")),
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::protocol(
+                        "TV did not connect to the callback within the deadline; check the inbound firewall and Developer Mode host IP",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(Error::sdb(error)),
+        }
+    };
     if !ips.contains(&peer.ip()) {
         return Err(Error::protocol(format!(
             "callback came from {}, not the resolved TV address",
@@ -169,9 +196,11 @@ pub fn capture(
     let output = read_bounded(&mut stream, config.max_output, deadline)?;
     let _ = stream.shutdown(Shutdown::Both);
 
-    injection
-        .join()
-        .map_err(|_| Error::protocol("injection thread panicked"))??;
+    if let Some(injection) = injection {
+        injection
+            .join()
+            .map_err(|_| Error::protocol("injection thread panicked"))??;
+    }
     Ok(Capture {
         output: String::from_utf8_lossy(&output).into_owned(),
         marker_token: token,
@@ -203,23 +232,6 @@ pub fn route_callback_host(target: &str) -> Result<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(Error::sdb)?;
     socket.connect((host, 9)).map_err(Error::sdb)?;
     Ok(socket.local_addr().map_err(Error::sdb)?.ip().to_string())
-}
-
-fn accept_until(listener: &TcpListener, deadline: Instant) -> Result<(TcpStream, SocketAddr)> {
-    loop {
-        match listener.accept() {
-            Ok(accepted) => return Ok(accepted),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(Error::protocol(
-                        "TV did not connect to the callback within the deadline; check the inbound firewall and Developer Mode host IP",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(Error::sdb(error)),
-        }
-    }
 }
 
 fn read_bounded(stream: &mut TcpStream, maximum: usize, deadline: Instant) -> Result<Vec<u8>> {
@@ -424,6 +436,44 @@ mod tests {
             validate_exit(&capture, "deadbeefdeadbeef").unwrap(),
             ("hello".into(), 0)
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_injection_does_not_wait_for_the_callback_deadline() {
+        let sdb = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = sdb.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = sdb.accept().unwrap();
+            let cnxn = Frame::read(&mut stream).unwrap();
+            assert_eq!(cnxn.command, CNXN);
+            stream
+                .write_all(&Frame::new(CNXN, 0x0200_0000, 4096, *b"device::FAKE::0\0").encode())
+                .unwrap();
+            let open = Frame::read(&mut stream).unwrap();
+            assert_eq!(open.command, OPEN);
+            stream
+                .write_all(&Frame::new(CLSE, 0, open.arg0, Vec::new()).encode())
+                .unwrap();
+        });
+        let started = Instant::now();
+        let error = capture(
+            &target,
+            &Options {
+                timeout: Duration::from_secs(5),
+                verbose: false,
+            },
+            "echo hello",
+            &CaptureConfig {
+                callback_host: Some("127.0.0.1".into()),
+                bind_host: Some("127.0.0.1".into()),
+                timeout: Duration::from_secs(5),
+                ..CaptureConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refused service"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
         server.join().unwrap();
     }
 
