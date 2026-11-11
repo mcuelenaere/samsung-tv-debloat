@@ -350,6 +350,15 @@ impl<A: Clone + PartialEq> Screen<A> {
         self.tab = tab;
         unsafe { kit::set_text_value(self.title.raw, title) };
         let layout = page::layout(blocks, self.view_width(), &*self);
+        // Where focus was, for when its action is gone (a removed key).
+        let was = (!new_tab)
+            .then(|| {
+                self.layout
+                    .focusables
+                    .get(self.focus)
+                    .map(|focusable| focusable.rect)
+            })
+            .flatten();
         for part in self.parts.drain(..) {
             for (object, _) in part.objects {
                 object.delete();
@@ -372,6 +381,7 @@ impl<A: Clone + PartialEq> Screen<A> {
                     .iter()
                     .position(|focusable| &focusable.action == action)
             })
+            .or_else(|| was.and_then(|rect| page::nearest(&layout.focusables, rect)))
             .unwrap_or(0);
         if layout.focusables.is_empty() {
             self.in_rail = true;

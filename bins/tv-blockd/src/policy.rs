@@ -170,6 +170,9 @@ pub struct Config {
     /// SDB (the developer bridge, TCP 26101) stopped and runtime-masked.
     #[serde(default)]
     pub sdb_off: bool,
+    /// Dropbear (SSH, port 22) stopped.
+    #[serde(default)]
+    pub ssh_off: bool,
     /// Permanent: apps disabled in pkgmgr's database (`pkgcmd -D --global`),
     /// which outlives a reboot and tv-blockd. See `DISABLES` in the daemon.
     #[serde(default)]
@@ -188,6 +191,7 @@ impl Config {
             "airplay" => self.airplay,
             "multiview_preload" => self.multiview_preload,
             "sdb_off" => self.sdb_off,
+            "ssh_off" => self.ssh_off,
             "disable_hbbtv" => self.disable_hbbtv,
             "disable_acr" => self.disable_acr,
             "disable_ads" => self.disable_ads,
@@ -325,7 +329,7 @@ mod tests {
         let config = Config::default();
         assert!(config.hosts && config.otn_lock && config.telemetry);
         // The services that break features are opt-in.
-        assert!(!config.airplay && !config.multiview_preload && !config.sdb_off);
+        assert!(!config.airplay && !config.multiview_preload && !config.sdb_off && !config.ssh_off);
         // Nothing permanent unless asked for.
         assert!(!config.disable_hbbtv && !config.disable_acr && !config.disable_ads);
         assert!(

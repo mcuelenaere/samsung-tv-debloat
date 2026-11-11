@@ -49,6 +49,9 @@ struct Services {
     /// `ConditionPathExists=!` files under /tmp (gone at reboot) that keep
     /// units from starting.
     brakes: &'static [&'static str],
+    /// Runtime-mask the units. Not for units whose file is itself in
+    /// /run/systemd/system, where the mask would go.
+    mask: bool,
 }
 
 const SERVICES: &[Services] = &[
@@ -77,6 +80,7 @@ const SERVICES: &[Services] = &[
         processes: &["EdgeScraper", "contents-ott-detector"],
         apps: &[],
         brakes: &["/tmp/eltlaunch.cond"],
+        mask: true,
     },
     Services {
         key: "airplay",
@@ -89,6 +93,7 @@ const SERVICES: &[Services] = &[
         processes: &[],
         apps: &["com.samsung.tv.airplay-app", "com.samsung.tv.airplay-app-2"],
         brakes: &[],
+        mask: true,
     },
     Services {
         key: "multiview_preload",
@@ -96,6 +101,7 @@ const SERVICES: &[Services] = &[
         processes: &[],
         apps: &["com.samsung.tv.multiscreen"],
         brakes: &[],
+        mask: true,
     },
     Services {
         // Starts only while Samsung's developer mode is on (the socket's
@@ -105,8 +111,27 @@ const SERVICES: &[Services] = &[
         processes: &[],
         apps: &[],
         brakes: &[],
+        mask: true,
+    },
+    Services {
+        // The boot hook copies dropbear.service into /run/systemd/system and
+        // starts it; nothing else starts it, so a stop is enough.
+        key: "ssh_off",
+        units: &["dropbear.service"],
+        processes: &[],
+        apps: &[],
+        brakes: &[],
+        mask: false,
     },
 ];
+
+/// Dropbear's key file (`-D /opt/tv-sshd`).
+const AUTHORIZED_KEYS: &str = "/opt/tv-sshd/authorized_keys";
+/// Where `tv-sdb push` puts a key to add. The directory is world-writable,
+/// so the file is only read, never trusted: nothing is added until the
+/// user confirms its fingerprints on the TV.
+const KEY_DROP: &str = "/home/owner/share/tmp/sdk_tools/ssh-key.pub";
+const MAX_KEY_DROP: u64 = 16 * 1024;
 
 /// Permanent options: service apps that amd restarts, disabled in pkgmgr's
 /// database with `pkgcmd -D --global`. That outlives a reboot and tv-blockd,
@@ -455,6 +480,30 @@ impl Daemon {
         let response = match request["method"].as_str() {
             Some("status") => self.status(),
             Some("system") => self.system(),
+            Some("ssh_add") => {
+                let wanted: Vec<String> = request["fingerprints"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect();
+                log(&format!("ssh_add by uid={uid} label={label}"));
+                self.ssh_add(&wanted)
+            }
+            Some("ssh_reject") => {
+                let _ = fs::remove_file(KEY_DROP);
+                log(&format!("ssh key file rejected by uid={uid} label={label}"));
+                self.status()
+            }
+            Some("ssh_remove") => match request["fingerprint"].as_str() {
+                Some(fingerprint) => {
+                    log(&format!(
+                        "ssh_remove {fingerprint} by uid={uid} label={label}"
+                    ));
+                    self.ssh_remove(fingerprint)
+                }
+                None => json!({"status": "error", "error": "fingerprint missing"}),
+            },
             Some("sdb_host") => match request["host"]
                 .as_str()
                 .and_then(|host| host.trim().parse::<std::net::Ipv4Addr>().ok())
@@ -484,6 +533,7 @@ impl Daemon {
                     airplay: false,
                     multiview_preload: false,
                     sdb_off: false,
+                    ssh_off: false,
                     disable_hbbtv: false,
                     disable_acr: false,
                     disable_ads: false,
@@ -514,7 +564,7 @@ impl Daemon {
             })
             .collect();
         json!({"status": "ok", "config": self.config, "report": self.report,
-               "changes": self.changes, "groups": groups})
+               "changes": self.changes, "groups": groups, "ssh": ssh_state()})
     }
 
     fn reconcile(&mut self) {
@@ -710,7 +760,9 @@ impl Daemon {
                 self.changes.created.remove(position);
             }
         }
-        let _ = systemctl(&["unmask", "--runtime"], &units);
+        if services.mask {
+            let _ = systemctl(&["unmask", "--runtime"], &units);
+        }
         let (start, keep): (Vec<String>, Vec<String>) = self
             .changes
             .stopped
@@ -758,10 +810,12 @@ impl Daemon {
             if self.masked.insert(services.key) {
                 self.measure(services.key);
                 // Runtime masks live in /run: re-applied after every boot.
-                if let Err(error) = systemctl(&["mask", "--runtime"], &units) {
-                    report
-                        .errors
-                        .push(format!("mask {}: {error}", services.key));
+                if services.mask {
+                    if let Err(error) = systemctl(&["mask", "--runtime"], &units) {
+                        report
+                            .errors
+                            .push(format!("mask {}: {error}", services.key));
+                    }
                 }
                 for app in services.apps {
                     let _ = Command::new("/usr/bin/app_launcher")
@@ -979,7 +1033,101 @@ fn option_pids(
     pids
 }
 
+/// The keys in `KEY_DROP`; `None` when there is no such file.
+fn read_drop() -> Result<Option<Vec<tv_blockd::ssh::Key>>, String> {
+    use std::io::Read;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(KEY_DROP);
+    let mut file = match file {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("unreadable ({error})")),
+        Ok(file) => file,
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_KEY_DROP {
+        return Err("not a small regular file".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|_| "not text".to_owned())?;
+    let keys = tv_blockd::ssh::parse(&text);
+    if keys.is_empty() {
+        return Err("no public key in it".into());
+    }
+    Ok(Some(keys))
+}
+
+fn ssh_state() -> Value {
+    let describe = |key: &tv_blockd::ssh::Key| json!({"kind": key.kind, "comment": key.comment, "fingerprint": key.fingerprint});
+    let keys = fs::read_to_string(AUTHORIZED_KEYS)
+        .map(|text| tv_blockd::ssh::parse(&text))
+        .unwrap_or_default();
+    let (pending, pending_error) = match read_drop() {
+        Ok(keys) => (keys.unwrap_or_default(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    json!({"keys": keys.iter().map(describe).collect::<Vec<_>>(),
+           "pending": pending.iter().map(describe).collect::<Vec<_>>(),
+           "pending_error": pending_error,
+           "drop": KEY_DROP})
+}
+
+fn write_authorized_keys(text: &str) -> io::Result<()> {
+    let temporary = format!("{AUTHORIZED_KEYS}.tmp");
+    fs::write(&temporary, text)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(temporary, AUTHORIZED_KEYS)
+}
+
 impl Daemon {
+    /// Adds the pushed keys whose fingerprints the user confirmed (the file
+    /// may have changed since it was shown), then deletes the file.
+    fn ssh_add(&mut self, fingerprints: &[String]) -> Value {
+        let pushed = match read_drop() {
+            Ok(Some(keys)) => keys,
+            Ok(None) => return json!({"status": "error", "error": "no key file pushed"}),
+            Err(error) => return json!({"status": "error", "error": format!("key file {error}")}),
+        };
+        let chosen: Vec<_> = pushed
+            .into_iter()
+            .filter(|key| fingerprints.contains(&key.fingerprint))
+            .collect();
+        if chosen.is_empty() {
+            return json!({"status": "error", "error": "the key file changed; check it again"});
+        }
+        let existing = fs::read_to_string(AUTHORIZED_KEYS).unwrap_or_default();
+        if let Err(error) = write_authorized_keys(&tv_blockd::ssh::add(&existing, &chosen)) {
+            return json!({"status": "error", "error": format!("{AUTHORIZED_KEYS}: {error}")});
+        }
+        let _ = fs::remove_file(KEY_DROP);
+        for key in &chosen {
+            log(&format!(
+                "ssh key added: {} {}",
+                key.fingerprint, key.comment
+            ));
+        }
+        self.status()
+    }
+
+    /// Removes a key, but never the last one while SSH is on.
+    fn ssh_remove(&mut self, fingerprint: &str) -> Value {
+        let existing = fs::read_to_string(AUTHORIZED_KEYS).unwrap_or_default();
+        if !self.config.ssh_off && tv_blockd::ssh::parse(&existing).len() <= 1 {
+            return json!({"status": "error",
+                          "error": "the last key stays while SSH is on; add another or switch SSH off first"});
+        }
+        let Some(text) = tv_blockd::ssh::remove(&existing, fingerprint) else {
+            return json!({"status": "error", "error": "no such key"});
+        };
+        if let Err(error) = write_authorized_keys(&text) {
+            return json!({"status": "error", "error": format!("{AUTHORIZED_KEYS}: {error}")});
+        }
+        log(&format!("ssh key removed: {fingerprint}"));
+        self.status()
+    }
+
     /// Samsung's developer-mode host, as its own dialog sets it; SDB is
     /// restarted (if running) to pick it up. Not part of `undo`: it is the
     /// TV's setting, not one of tv-blockd's changes.
@@ -1133,6 +1281,7 @@ impl Daemon {
             "top_cpu": by_cpu.iter().take(8).map(|p| entry(p)).collect::<Vec<_>>(),
             "top_memory": by_memory.iter().take(8).map(|p| entry(p)).collect::<Vec<_>>(),
             "options": options,
+            "ssh": ssh_state(),
         });
         self.sampled = Some(now);
         json!({"status": "ok", "system": system})

@@ -4,3 +4,5 @@
 pub mod policy;
 
 pub mod sysinfo;
+
+pub mod ssh;

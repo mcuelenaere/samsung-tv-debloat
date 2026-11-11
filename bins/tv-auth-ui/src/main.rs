@@ -138,6 +138,12 @@ enum Action {
     Undo,
     /// Edit the host Samsung's developer mode lets use SDB.
     SdbHost,
+    /// Add the pushed SSH keys with these fingerprints.
+    SshAdd(Vec<String>),
+    /// Delete the pushed key file.
+    SshReject,
+    /// Remove the SSH key with this fingerprint.
+    SshRemove(String),
 }
 
 /// Results from worker threads.
@@ -470,6 +476,10 @@ impl Ui {
             }
             Job::Tweaks(service, message, Ok(status)) => {
                 let message = message.or_else(|| status["message"].as_str().map(str::to_owned));
+                // Key changes show at once, not at the next snapshot.
+                if let (Some(system), Some(ssh)) = (self.system.as_mut(), status.get("ssh")) {
+                    system["ssh"] = ssh.clone();
+                }
                 match service {
                     Service::Block => self.tweaks = Some(status),
                     Service::Patch => self.patch = Some(status),
@@ -1097,6 +1107,27 @@ impl Ui {
                     screen.start_field(&host, on_field_done);
                 }
             }
+            Action::SshAdd(fingerprints) => {
+                self.set_status("Adding the key...");
+                self.load_tweaks(
+                    Service::Block,
+                    Some(json!({"method": "ssh_add", "fingerprints": fingerprints})),
+                    Some("Key added; it works for SSH right away."),
+                );
+            }
+            Action::SshReject => self.load_tweaks(
+                Service::Block,
+                Some(json!({"method": "ssh_reject"})),
+                Some("Pushed key file deleted."),
+            ),
+            Action::SshRemove(fingerprint) => {
+                self.set_status("Removing the key...");
+                self.load_tweaks(
+                    Service::Block,
+                    Some(json!({"method": "ssh_remove", "fingerprint": fingerprint})),
+                    Some("Key removed."),
+                );
+            }
             Action::Undo => {
                 self.set_status("Undoing...");
                 self.load_tweaks(Service::Patch, Some(json!({"method": "undo"})), None);
@@ -1606,6 +1637,96 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
         blocks.push(list("top_cpu"));
         blocks.push(Block::Section("Largest in memory".into()));
         blocks.push(list("top_memory"));
+    }
+    let ssh = system.map_or(&Value::Null, |system| &system["ssh"]);
+    let keys = ssh["keys"].as_array().cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut switch = Row::text(
+        "SSH",
+        format!(
+            "Dropbear on port 22, keys only \u{00b7} {} \u{00b7} {} key{}",
+            usage("ssh_off"),
+            keys.len(),
+            if keys.len() == 1 { "" } else { "s" }
+        ),
+    );
+    switch.controls.push(Control::Switch {
+        on: config["ssh_off"] != true,
+        action: Action::Tweak("ssh_off".into()),
+    });
+    rows.push(switch);
+    let describe = |key: &Value, prefix: &str| {
+        let comment = key["comment"].as_str().unwrap_or_default();
+        Row::text(
+            format!(
+                "{prefix}{}",
+                if comment.is_empty() {
+                    key["kind"].as_str().unwrap_or("key")
+                } else {
+                    comment
+                }
+            ),
+            format!(
+                "{} \u{00b7} {}",
+                key["kind"].as_str().unwrap_or("?"),
+                key["fingerprint"].as_str().unwrap_or("?")
+            ),
+        )
+    };
+    for key in &keys {
+        let mut row = describe(key, "");
+        row.controls.push(Control::Button {
+            label: "Remove".into(),
+            tone: Tone::Danger,
+            action: Action::SshRemove(key["fingerprint"].as_str().unwrap_or_default().into()),
+        });
+        rows.push(row);
+    }
+    let pending = ssh["pending"].as_array().cloned().unwrap_or_default();
+    let fingerprints: Vec<String> = pending
+        .iter()
+        .filter_map(|key| key["fingerprint"].as_str().map(str::to_owned))
+        .collect();
+    for (index, key) in pending.iter().enumerate() {
+        let mut row = describe(key, "Pushed: ");
+        if index + 1 == pending.len() {
+            row.controls.push(Control::Button {
+                label: "Reject".into(),
+                tone: Tone::Normal,
+                action: Action::SshReject,
+            });
+            row.controls.push(Control::Button {
+                label: if pending.len() == 1 {
+                    "Add".into()
+                } else {
+                    format!("Add {}", pending.len())
+                },
+                tone: Tone::Primary,
+                action: Action::SshAdd(fingerprints.clone()),
+            });
+        }
+        rows.push(row);
+    }
+    if let Some(error) = ssh["pending_error"].as_str() {
+        let mut row = Row::text("Pushed key file ignored", error.to_owned());
+        row.controls.push(Control::Button {
+            label: "Delete".into(),
+            tone: Tone::Normal,
+            action: Action::SshReject,
+        });
+        rows.push(row);
+    }
+    if system.is_some() {
+        blocks.push(Block::Section("SSH".into()));
+        blocks.push(Block::Rows(rows));
+        blocks.push(Block::Paragraph {
+            markup: format!(
+                "<muted>To add a key, push it from your computer, then check its fingerprint and \
+                 add it here:</muted><br/>tv-sdb -s &lt;TV address&gt; push ~/.ssh/id_ed25519.pub {}",
+                escape(ssh["drop"].as_str().unwrap_or("?"))
+            ),
+            size: 22,
+        });
     }
     let mut sdb = Row::text(
         "SDB",

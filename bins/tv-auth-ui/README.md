@@ -153,6 +153,9 @@ tab is open:
   stopped, what they used when tv-blockd stopped them;
 - **Busiest now** and **Largest in memory**: the top eight processes, named
   by app id where they are apps;
+- **SSH**: the switch (tv-blockd's `ssh_off`, on means Dropbear runs), each
+  key with its fingerprint and **Remove**, and a key pushed with `tv-sdb`
+  with **Add** and **Reject**; the push command is shown under it;
 - **Developer access**: **SDB** (tv-blockd's `sdb_off`, shown the other way
   round: on means SDB runs) and, while it is on, **Host**: the one address
   Samsung's developer mode lets connect, edited with the TV keyboard.

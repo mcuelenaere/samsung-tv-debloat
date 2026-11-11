@@ -686,6 +686,20 @@ pub fn neighbor<A>(
 /// The scroll offset that shows `rect` in a `view` high window over a page
 /// `height` high: unchanged if it is fully visible with `margin` to spare,
 /// else as close to the middle as the page allows.
+/// The focusable closest to `rect`: nearest line first, then column.
+pub fn nearest<A>(focusables: &[Focusable<A>], rect: Rect) -> Option<usize> {
+    focusables
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, focusable)| {
+            (
+                (focusable.rect.y - rect.y).abs(),
+                (focusable.rect.x - rect.x).abs(),
+            )
+        })
+        .map(|(index, _)| index)
+}
+
 pub fn scroll_to(rect: Rect, current: i32, view: i32, height: i32, margin: i32) -> i32 {
     let max = (height - view).max(0);
     if rect.y - margin >= current && rect.y + rect.h + margin <= current + view {
@@ -712,6 +726,41 @@ mod tests {
         let mut row = Row::text(title, "note");
         row.controls.push(Control::Switch { on: true, action });
         row
+    }
+
+    #[test]
+    fn nearest_prefers_the_same_line() {
+        let at = |x, y| Focusable {
+            rect: Rect { x, y, w: 10, h: 10 },
+            action: 0u32,
+            whole_row: false,
+        };
+        let focusables = [at(0, 0), at(500, 100), at(0, 130)];
+        assert_eq!(
+            nearest(
+                &focusables,
+                Rect {
+                    x: 600,
+                    y: 100,
+                    w: 10,
+                    h: 10
+                }
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            nearest(
+                &focusables,
+                Rect {
+                    x: 0,
+                    y: 125,
+                    w: 10,
+                    h: 10
+                }
+            ),
+            Some(2)
+        );
+        assert_eq!(nearest::<u32>(&[], Rect::default()), None);
     }
 
     #[test]
