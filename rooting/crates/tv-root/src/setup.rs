@@ -181,7 +181,7 @@ fn stage_and_execute<T: Transport>(
     pushed?;
 
     let mut command = format!(
-        "/bin/sh {}/setup-driver.sh --root {} --run {} --plan {}/setup-plan",
+        "cat {}/setup-driver.sh | /bin/sh -s -- --root {} --run {} --plan {}/setup-plan",
         inject::shell_quote(staging),
         inject::shell_quote(staging),
         inject::shell_quote(run_dir),
@@ -191,18 +191,29 @@ fn stage_and_execute<T: Transport>(
         command.push_str(" --adopt-existing");
     }
     let invocation = fdet::invocation(&format!("{staging}/FdetProbe.dll"), &command)?;
-    let capture = transport.capture(&invocation, options.timeout)?;
-    let (body, status) = inject::validate_exit(&capture, &capture.marker_token)?;
-    if status != 0 {
-        return Err(Error::protocol(format!("setup driver exited {status}")));
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let capture = transport.capture(&invocation, options.timeout)?;
+        let (body, status) = inject::validate_exit(&capture, &capture.marker_token)?;
+        if let Err(error) = RootEvidence::validate(&body) {
+            last_error = Some(error);
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+            return Err(last_error.expect("set above"));
+        }
+        if status != 0 {
+            return Err(Error::protocol(format!("setup driver exited {status}")));
+        }
+        if !body.lines().any(|line| line.trim() == "setup-status=ok") {
+            return Err(Error::protocol(
+                "setup driver did not report setup-status=ok",
+            ));
+        }
+        return Ok(body);
     }
-    RootEvidence::validate(&body)?;
-    if !body.lines().any(|line| line.trim() == "setup-status=ok") {
-        return Err(Error::protocol(
-            "setup driver did not report setup-status=ok",
-        ));
-    }
-    Ok(body)
+    Err(last_error.unwrap_or_else(|| Error::protocol("setup did not run")))
 }
 
 pub fn plan(

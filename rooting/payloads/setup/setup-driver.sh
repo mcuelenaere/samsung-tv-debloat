@@ -125,7 +125,9 @@ for line in $(sed -n 's/^package //p' "$PLAN"); do
     # daemon exists. Existing material is reused, never regenerated.
     if [ "$id" = tv-authd ]; then
         [ -x /opt/tv-auth/tv-authd ] || fail "tv-authd binary missing after install"
-        /opt/tv-auth/tv-authd --enroll-trust >/dev/null || fail "trust enrollment failed"
+        cp /opt/tv-auth/tv-authd "$RUN/tv-authd"
+        chmod 700 "$RUN/tv-authd"
+        "$RUN/tv-authd" --enroll-trust >/dev/null || fail "trust enrollment failed"
         systemctl try-restart tv-authd.service >/dev/null 2>&1 || true
     fi
 done
@@ -169,7 +171,7 @@ ACCEPTED_HOOK_SHA="$accepted_hook_sha" \
 TARGET_HOOK_SHA="$target_hook_sha" \
 STAGED_HOOK=parseinfo.sh \
 UNIT_ROWS="$unit_rows" \
-    sh "$stage/tv-apply.sh" || fail "persistence apply failed"
+    sh -s < "$stage/tv-apply.sh" || fail "persistence apply failed"
 
 for unit in tv-authd.service dropbear.service tv-auth-popupd.service tv-blockd.service tv-patchd.service; do
     systemctl is-active --quiet "$unit" || fail "service is not active: $unit"
