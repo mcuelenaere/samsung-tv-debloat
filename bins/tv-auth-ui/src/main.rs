@@ -136,6 +136,8 @@ enum Action {
     /// `patch:tizentube`, `patch:update`, `patch:custom_home`.
     Tweak(String),
     Undo,
+    /// Edit the host Samsung's developer mode lets use SDB.
+    SdbHost,
 }
 
 /// Results from worker threads.
@@ -221,6 +223,8 @@ struct Ui {
     exiting: bool,
     connected: bool,
     app_control_count: u32,
+    /// The text field edits the SDB host, not the store search.
+    editing_host: bool,
 }
 
 impl Ui {
@@ -247,6 +251,7 @@ impl Ui {
             exiting: false,
             connected: false,
             app_control_count: 0,
+            editing_host: false,
         }
     }
 
@@ -1080,6 +1085,18 @@ impl Ui {
                 self.refresh_grants();
             }
             Action::Tweak(key) => self.apply_tweak(&key),
+            Action::SdbHost => {
+                let host = self.tweaks.as_ref().map_or(String::new(), |status| {
+                    status["report"]["sdb_host"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned()
+                });
+                self.editing_host = true;
+                if let Some(screen) = self.screen.as_mut() {
+                    screen.start_field(&host, on_field_done);
+                }
+            }
             Action::Undo => {
                 self.set_status("Undoing...");
                 self.load_tweaks(Service::Patch, Some(json!({"method": "undo"})), None);
@@ -1153,6 +1170,16 @@ impl Ui {
         let Some(text) = self.screen.as_mut().and_then(Screen::finish_field) else {
             return;
         };
+        if std::mem::take(&mut self.editing_host) {
+            self.set_status("Saving the SDB host...");
+            self.load_tweaks(
+                Service::Block,
+                Some(json!({"method": "sdb_host", "host": text.trim()})),
+                Some("SDB host saved; SDB restarted."),
+            );
+            self.render();
+            return;
+        }
         if text != self.store.query {
             self.store.query = text;
             self.arrange();
@@ -1515,8 +1542,13 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
             ]));
             blocks.push(Block::Paragraph {
                 markup: format!(
-                    "<muted>{} cores \u{00b7} storage {} KB/s read, {} KB/s written \u{00b7} swap {} KB/s in, {} KB/s out \u{00b7} {} processes</muted>",
+                    "<muted>{} cores{} \u{00b7} storage {} KB/s read, {} KB/s written \u{00b7} swap {} KB/s in, {} KB/s out \u{00b7} {} processes</muted>",
                     system["cores"],
+                    match system["npu_per_s"].as_f64() {
+                        None => String::new(),
+                        Some(0.0) => " \u{00b7} NPU idle".into(),
+                        Some(rate) => format!(" \u{00b7} NPU active, {rate:.0} interrupts/s"),
+                    },
                     kbs("disk_read_kbs"),
                     kbs("disk_write_kbs"),
                     kbs("swap_in_kbs"),
@@ -1582,6 +1614,16 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
             usage("sdb_off")
         ),
     );
+    if config["sdb_off"] != true {
+        sdb.controls.push(Control::Button {
+            label: format!(
+                "Host {}",
+                status["report"]["sdb_host"].as_str().unwrap_or("?")
+            ),
+            tone: Tone::Normal,
+            action: Action::SdbHost,
+        });
+    }
     sdb.controls.push(Control::Switch {
         on: config["sdb_off"] != true,
         action: Action::Tweak("sdb_off".into()),
@@ -1589,8 +1631,9 @@ fn system_page(status: &Value, system: Option<&Value>) -> Vec<Block<Action>> {
     blocks.push(Block::Section("Developer access".into()));
     blocks.push(Block::Rows(vec![sdb]));
     blocks.push(Block::Paragraph {
-        markup: "<muted>SDB runs only while Samsung's developer mode is on. Off lasts until \
-                 you switch it back on here; a reboot without TV suite turns it back on.</muted>"
+        markup: "<muted>SDB runs only while Samsung's developer mode is on, and accepts only \
+                 the host shown. Off lasts until you switch it back on here; a reboot without TV \
+                 suite turns it back on.</muted>"
             .into(),
         size: 22,
     });

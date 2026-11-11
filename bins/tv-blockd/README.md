@@ -103,7 +103,15 @@ System tab: CPU, memory, swap, GPU and IO rates since the previous call (or
 over half a second), the top processes by CPU and by memory, and per option
 the processes it covers (its units' cgroups under
 `/sys/fs/cgroup/systemd/system.slice`, its apps from `app_launcher -S`, its
-process names) with their memory and CPU. Just before an option first stops
+process names) with their memory and CPU. The GPU figure averages Mali's
+`dvfs_usage` (load over its last 20 ms, so one read is mostly 0), sampled
+every 25 ms by a thread that runs only while the System tab asks; the NPU
+has no load counter, so its activity is the `triv2` interrupt rate from
+`/proc/interrupts`. `{"method":"sdb_host","host":"a.b.c.d"}` (CLI:
+`tv-blockd sdb-host IP`) sets `db/sdk/develop/ip`, the one host Samsung's
+developer mode accepts on SDB (another host's connection is reset), and
+restarts `sdbd.service` if it runs. It is the TV's own setting, so `undo`
+leaves it alone. Just before an option first stops
 its processes, tv-blockd records what they used in `changes.json`
 (`freed`). Callers: root, or uid 5001 with SMACK
 label `User::Pkg::org.tvauth.ui` (the manager's **Tweaks** tab).

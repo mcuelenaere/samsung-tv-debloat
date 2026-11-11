@@ -146,14 +146,16 @@ Each switch or chip sends the daemon's whole edited config with `set`
 A live view, refreshed every 3 s from tv-blockd's `system` request while the
 tab is open:
 - tiles: CPU (all cores) and load, memory and swap in use, GPU (Mali
-  `dvfs_usage`); a line with storage and swap IO rates and the process count;
+  `dvfs_usage`, averaged); a line with NPU activity, storage and swap IO
+  rates and the process count;
 - **What the tweaks save**: each service and permanent option with its
   switch, and what its processes use now (memory, swap, CPU), or, once
   stopped, what they used when tv-blockd stopped them;
 - **Busiest now** and **Largest in memory**: the top eight processes, named
   by app id where they are apps;
 - **Developer access**: **SDB** (tv-blockd's `sdb_off`, shown the other way
-  round: on means SDB runs).
+  round: on means SDB runs) and, while it is on, **Host**: the one address
+  Samsung's developer mode lets connect, edited with the TV keyboard.
 
 ### Dock (`org.tvauth.home`)
 

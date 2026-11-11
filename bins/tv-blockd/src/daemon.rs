@@ -9,6 +9,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tv_blockd::policy::{self, Config, HOSTS_MARKER, HOST_GROUPS};
 use tv_blockd::sysinfo;
@@ -140,6 +141,34 @@ const DISABLES: &[Disable] = &[
 
 const PKGMGR_DB: &str = "/opt/dbspace/.pkgmgr_parser.db";
 
+/// The one host Samsung's developer mode lets connect to SDB.
+const SDB_HOST_KEY: &str = "db/sdk/develop/ip";
+
+/// Mali's load over its last 20 ms DVFS window; one read is mostly 0.
+const GPU_USAGE: &str = "/sys/class/misc/mali0/device/dvfs_usage";
+/// Sum and count of GPU readings since the last `system` call, and until
+/// when (unix seconds) the sampler runs: only while the System tab asks.
+static GPU_SUM: AtomicU64 = AtomicU64::new(0);
+static GPU_COUNT: AtomicU64 = AtomicU64::new(0);
+static GPU_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+fn gpu_sampler() {
+    loop {
+        if unix_now() > GPU_UNTIL.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if let Some(value) = fs::read_to_string(GPU_USAGE)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+        {
+            GPU_SUM.fetch_add(value, Ordering::Relaxed);
+            GPU_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Brake files older builds made under /opt, where they outlived a reboot;
 /// removed once (`Changes::created` records which were tv-blockd's).
 const PERSISTENT_PREFIX: &str = "/opt/";
@@ -185,6 +214,8 @@ struct Report {
     disabled: BTreeMap<String, Vec<String>>,
     /// Permanent options none of whose apps this TV has.
     missing: Vec<String>,
+    /// `db/sdk/develop/ip`.
+    sdb_host: Option<String>,
     lists: Vec<ListReport>,
     errors: Vec<String>,
 }
@@ -273,7 +304,11 @@ struct Daemon {
 
 pub fn main() {
     if let Err(error) = run() {
-        log(&format!("fatal: {error}"));
+        // Client commands report to stderr; only the daemon's own failure
+        // belongs in its log.
+        if std::env::args().len() == 1 {
+            log(&format!("fatal: {error}"));
+        }
         eprintln!("tv-blockd: {error}");
         std::process::exit(1);
     }
@@ -290,6 +325,7 @@ fn run() -> io::Result<()> {
         [] => {}
         ["status"] => return client(json!({"method": "status"})),
         ["undo"] => return client(json!({"method": "undo"})),
+        ["sdb-host", host] => return client(json!({"method": "sdb_host", "host": host})),
         ["set", config] => {
             let config: Value = serde_json::from_str(config)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -301,6 +337,7 @@ fn run() -> io::Result<()> {
                  \x20      tv-blockd status     print config and last reconcile\n\
                  \x20      tv-blockd set JSON   replace the whole config\n\
                  \x20      tv-blockd undo       switch everything off and restore what it changed\n\
+                 \x20      tv-blockd sdb-host IP the host Samsung's developer mode lets use SDB\n\
                  config: {CONFIG}; control socket: {SOCKET}"
             );
             return Ok(());
@@ -344,6 +381,9 @@ fn run() -> io::Result<()> {
     let path = CString::new(SOCKET).unwrap();
     unsafe { libc::chown(path.as_ptr(), 0, USERS_GID) };
     log("started");
+    if Path::new(GPU_USAGE).exists() {
+        std::thread::spawn(gpu_sampler);
+    }
 
     daemon.reconcile();
     let mut next = Instant::now() + TICK;
@@ -415,6 +455,16 @@ impl Daemon {
         let response = match request["method"].as_str() {
             Some("status") => self.status(),
             Some("system") => self.system(),
+            Some("sdb_host") => match request["host"]
+                .as_str()
+                .and_then(|host| host.trim().parse::<std::net::Ipv4Addr>().ok())
+            {
+                Some(host) => {
+                    log(&format!("sdb host {host} by uid={uid} label={label}"));
+                    self.set_sdb_host(host)
+                }
+                None => json!({"status": "error", "error": "not an IPv4 address"}),
+            },
             Some("set") => match serde_json::from_value::<Config>(request["config"].clone()) {
                 Ok(config) => match config.validate() {
                     Ok(()) => {
@@ -478,6 +528,7 @@ impl Daemon {
         self.reconcile_otn(&mut report);
         self.reconcile_services(&mut report);
         self.reconcile_disables(&mut report);
+        report.sdb_host = tv_tizen::vconf::get_str(SDB_HOST_KEY).ok();
         for error in &report.errors {
             log(error);
         }
@@ -818,6 +869,8 @@ struct Sample {
     disk: (u64, u64),
     /// Pages swapped in and out.
     swap: (u64, u64),
+    /// NPU (Trinity) interrupts so far.
+    npu: Option<u64>,
 }
 
 struct Process {
@@ -927,6 +980,18 @@ fn option_pids(
 }
 
 impl Daemon {
+    /// Samsung's developer-mode host, as its own dialog sets it; SDB is
+    /// restarted (if running) to pick it up. Not part of `undo`: it is the
+    /// TV's setting, not one of tv-blockd's changes.
+    fn set_sdb_host(&mut self, host: std::net::Ipv4Addr) -> Value {
+        if let Err(error) = tv_tizen::vconf::set_str(SDB_HOST_KEY, &host.to_string()) {
+            return json!({"status": "error", "error": format!("{SDB_HOST_KEY}: {error}")});
+        }
+        let _ = systemctl(&["try-restart"], &["sdbd.service".to_owned()]);
+        self.report.sdb_host = tv_tizen::vconf::get_str(SDB_HOST_KEY).ok();
+        self.status()
+    }
+
     /// Records what an option's processes use, just before they are
     /// stopped; nothing running keeps the previous record.
     fn measure(&mut self, key: &str) {
@@ -973,8 +1038,12 @@ impl Daemon {
                 ticks: processes.iter().map(|p| (p.pid, p.ticks)).collect(),
                 disk,
                 swap,
+                npu: fs::read_to_string("/proc/interrupts")
+                    .ok()
+                    .and_then(|text| sysinfo::interrupts(&text, "triv2")),
             }
         };
+        GPU_UNTIL.store(unix_now() + 10, Ordering::Relaxed);
         let before = match self.sampled.take() {
             Some(sample) if sample.at.elapsed() < Duration::from_secs(30) => sample,
             _ => {
@@ -1035,9 +1104,13 @@ impl Daemon {
             })
             .collect();
         let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let gpu = fs::read_to_string("/sys/class/misc/mali0/device/dvfs_usage")
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok());
+        let count = GPU_COUNT.swap(0, Ordering::Relaxed);
+        let sum = GPU_SUM.swap(0, Ordering::Relaxed);
+        let gpu = (count > 0).then(|| (sum as f64 / count as f64).round() as u64);
+        let npu = now
+            .npu
+            .zip(before.npu)
+            .map(|(now, was)| (now.saturating_sub(was) as f64 / seconds).round());
         let system = json!({
             "cores": fs::read_to_string("/proc/cpuinfo")
                 .map(|text| text.lines().filter(|line| line.starts_with("processor")).count())
@@ -1051,6 +1124,7 @@ impl Daemon {
             "swap_total_kb": sysinfo::kb(&meminfo, "SwapTotal"),
             "swap_free_kb": sysinfo::kb(&meminfo, "SwapFree"),
             "gpu": gpu,
+            "npu_per_s": npu,
             "disk_read_kbs": rate(now.disk.0, before.disk.0, 0.5),
             "disk_write_kbs": rate(now.disk.1, before.disk.1, 0.5),
             "swap_in_kbs": rate(now.swap.0, before.swap.0, 4.0),

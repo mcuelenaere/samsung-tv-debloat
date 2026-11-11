@@ -76,6 +76,22 @@ pub fn running_apps(text: &str) -> Vec<(String, i32)> {
         .collect()
 }
 
+/// Interrupts so far on every `/proc/interrupts` line naming `device`, or
+/// `None` when no line does.
+pub fn interrupts(text: &str, device: &str) -> Option<u64> {
+    let counts: Vec<u64> = text
+        .lines()
+        .filter(|line| line.split_whitespace().any(|field| field == device))
+        .map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .map_while(|field| field.parse::<u64>().ok())
+                .sum()
+        })
+        .collect();
+    (!counts.is_empty()).then(|| counts.iter().sum())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +107,11 @@ mod tests {
         let status = "Name:\tacr\nVmRSS:\t   45000 kB\nVmSwap:\t  1200 kB\n";
         assert_eq!((kb(status, "VmRSS"), kb(status, "VmSwap")), (45000, 1200));
         assert_eq!(kb(status, "VmPeak"), 0);
+        let irqs = " 77:   0  5312  0  0  GIC-0  83 Level  triv2  (85us)\n\
+                    78:   1  7745  0  0  GIC-0  84 Level  triv2  (78us)\n\
+                    74:  99  0  0  0  GIC-0  70 Level  sdp_gpu  (13us)\n";
+        assert_eq!(interrupts(irqs, "triv2"), Some(13058));
+        assert_eq!(interrupts(irqs, "npu"), None);
         assert_eq!(vmstat("pswpin 10\npswpout 20\n", "pswpout"), 20);
         let disks = "179 0 mmcblk0 1 2 100 4 5 6 200 8\n179 1 mmcblk0p1 1 2 50 4 5 6 70 8\n\
                      8 0 sda 1 2 10 4 5 6 20 8\n254 0 zram0 1 2 999 4 5 6 999 8\n";
