@@ -36,6 +36,21 @@ Every 60 s, and right after each configuration change, it reconciles:
     unit does not start while Samsung's own `/tmp/multiview_low_memory`
     exists, which the firmware creates when memory runs low; it is Samsung's
     and left alone.
+  - **sdb_off** (off): `sdbd_tcp.socket`, `sdbd.socket`, `sdbd.service`.
+    SDB (TCP 26101) only starts while Samsung's developer mode is on (the
+    socket's `ConditionPathExists=…/com.samsung.tv.store/data/develop_mode`).
+- **permanent options** (`DISABLES` in `src/daemon.rs`, all off): service
+  apps that amd restarts, disabled in pkgmgr's database with
+  `pkgcmd -D -t app -n <app> --global` (run with a 20 s limit). This outlives
+  a reboot and tv-blockd, so `changes.json` records each app tv-blockd
+  disabled; switching the option off (or `undo`) runs `pkgcmd -A` and starts
+  exactly those again. Apps disabled by something else are left alone. State
+  is read from `/opt/dbspace/.pkgmgr_parser.db` with the TV's `sqlite3`.
+  - **disable_hbbtv**: `org.tizen.hbbtv-service` (it relaunches HbbTV at boot
+    and on source changes); closes `org.tizen.hbbtv`. HbbTV also runs
+    Samsung TV Plus on this firmware.
+  - **disable_acr**: `com.samsung.tv.acr`.
+  - **disable_ads**: `com.samsung.tv.targeted-ad-service`.
 
   On tv-living the services the defaults stop took about 23 MB of RSS and
   27 MB of swap; AirPlay and the Multi View preload about 17 + 28 and
@@ -58,10 +73,8 @@ which outlived a reboot without tv-blockd. Every pass removes any such file
 or directory that `changes.json` records as tv-blockd's (on tv-living: four,
 on 2026-11-11).
 
-Not done (would be permanent): ACR, analytics and voice apps are amd service
-apps that restart when closed; only `pkgcmd -D --global` or editing
-pkgmgr's database stops them, and both outlive a reboot. HbbTV runs Samsung
-TV Plus on this firmware.
+Not done: voice apps (Bixby and friends) are also restarting service apps,
+but which can go without breaking the remote's microphone is untested.
 
 ## Configuration
 
@@ -77,6 +90,8 @@ TV Plus on this firmware.
 | `telemetry` | `true` | stop telemetry services |
 | `airplay` | `false` | turn off the AirPlay receiver |
 | `multiview_preload` | `false` | don't preload Multi View |
+| `sdb_off` | `false` | stop SDB |
+| `disable_hbbtv`, `disable_acr`, `disable_ads` | `false` | permanent app disables |
 
 ## Control
 
@@ -107,7 +122,7 @@ mount because UEP rejects unsigned ELFs under `/opt`.
 
 ## Not included
 
-A bloatware app disabler. `pkgcmd -D` (package level) hangs when run as root,
-and `pkgcmd -D -t app … --uid 5001` reports success but changes nothing
-visible, after which `-A` fails with -999. Without a working disable path the
-feature was dropped.
+A general bloatware disabler. `pkgcmd -D` (package level) hangs when run as
+root, and `pkgcmd -D -t app … --uid 5001` reports success but changes
+nothing visible; the app-level `--global` form the permanent options use
+works (tv-living, 2026-11-11: about 140 ms each way).

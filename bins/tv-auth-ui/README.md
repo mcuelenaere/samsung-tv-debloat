@@ -52,8 +52,8 @@ is re-established on every daemon start.
 
 ## Behavior
 
-A rail of tabs on the left (Store, Permissions, Tweaks; System, greyed out,
-is a placeholder for a dev mode) and the tab's page on the right. Up and Down
+A rail of tabs on the left (Store, Permissions, Tweaks, System) and the
+tab's page on the right. Up and Down
 on the rail switch tabs; Right or OK enters the page; Left at a page's left
 edge, or BACK, returns to the rail; BACK on the rail exits.
 
@@ -126,6 +126,11 @@ running, what the Home key opens), any daemon error, then sections:
 - **Blocking**: `tv-blockd`'s host blocking switch, with each built-in host
   group as a chip under it (dimmed while blocking is off);
 - **Updates and telemetry**: the auto-update lock and telemetry;
+- **Background services**: AirPlay and the Multi View preload;
+- **Permanent changes**: **Disable HbbTV**, **Disable ACR**, **Disable
+  targeted ads**, under a warning that they outlive a reboot and TV suite;
+  each subtitle starts with "Permanent" and says whether the app is
+  disabled, running normally, or not on this TV;
 - **YouTube** (`tv-patchd`): **TizenTube** and **Update TizenTube**;
 - **Home**: **Custom Home** (`custom_home`; the Home key opens the dock
   below, or Samsung's Home again);
@@ -135,6 +140,12 @@ running, what the Home key opens), any daemon error, then sections:
 Each switch or chip sends the daemon's whole edited config with `set`
 (`/run/tv-suite/blockd.sock`, `/run/tv-suite/patchd.sock`). See
 `bins/tv-blockd/README.md` and `bins/tv-patchd/README.md`.
+
+### System
+
+**SDB** (tv-blockd's `sdb_off`, shown the other way round: on means SDB
+runs), with whether it is running. Processes and resource use (a dev mode)
+are planned here.
 
 ### Dock (`org.tvauth.home`)
 

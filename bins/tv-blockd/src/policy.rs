@@ -167,16 +167,30 @@ pub struct Config {
     /// Multi View's preloaded app closed and its unit runtime-masked.
     #[serde(default)]
     pub multiview_preload: bool,
+    /// SDB (the developer bridge, TCP 26101) stopped and runtime-masked.
+    #[serde(default)]
+    pub sdb_off: bool,
+    /// Permanent: apps disabled in pkgmgr's database (`pkgcmd -D --global`),
+    /// which outlives a reboot and tv-blockd. See `DISABLES` in the daemon.
+    #[serde(default)]
+    pub disable_hbbtv: bool,
+    #[serde(default)]
+    pub disable_acr: bool,
+    #[serde(default)]
+    pub disable_ads: bool,
 }
 
 impl Config {
-    /// A service option by its key (`telemetry`, `airplay`,
-    /// `multiview_preload`).
+    /// A service or disable option by its key.
     pub fn service(&self, key: &str) -> bool {
         match key {
             "telemetry" => self.telemetry,
             "airplay" => self.airplay,
             "multiview_preload" => self.multiview_preload,
+            "sdb_off" => self.sdb_off,
+            "disable_hbbtv" => self.disable_hbbtv,
+            "disable_acr" => self.disable_acr,
+            "disable_ads" => self.disable_ads,
             _ => false,
         }
     }
@@ -311,7 +325,9 @@ mod tests {
         let config = Config::default();
         assert!(config.hosts && config.otn_lock && config.telemetry);
         // The services that break features are opt-in.
-        assert!(!config.airplay && !config.multiview_preload);
+        assert!(!config.airplay && !config.multiview_preload && !config.sdb_off);
+        // Nothing permanent unless asked for.
+        assert!(!config.disable_hbbtv && !config.disable_acr && !config.disable_ads);
         assert!(
             config.service("telemetry")
                 && !config.service("airplay")

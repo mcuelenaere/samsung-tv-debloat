@@ -111,6 +111,7 @@ enum Tab {
     Store,
     Permissions,
     Tweaks,
+    System,
 }
 
 /// What a focusable part of a page does on OK.
@@ -278,7 +279,7 @@ impl Ui {
                 ("Store", true),
                 ("Permissions", true),
                 ("Tweaks", true),
-                ("System", false),
+                ("System", true),
             ]);
             self.screen = Some(screen);
             evas_object_event_callback_add(window, EVAS_CALLBACK_KEY_DOWN, on_key, ptr::null());
@@ -446,7 +447,7 @@ impl Ui {
                     self.set_status(message);
                 }
                 // Re-rendered in place: focus and scroll position stay.
-                return self.tab == Tab::Tweaks;
+                return matches!(self.tab, Tab::Tweaks | Tab::System);
             }
             Job::Tweaks(_, _, Err(error)) => {
                 log_line(&error);
@@ -579,6 +580,7 @@ impl Ui {
             (Tab::Store, None) => ("Store".to_owned(), self.store_page()),
             (Tab::Permissions, _) => ("Permissions".to_owned(), self.permissions_page()),
             (Tab::Tweaks, _) => ("Tweaks".to_owned(), self.tweaks_page()),
+            (Tab::System, _) => ("System".to_owned(), self.system_page()),
         };
         let status = self.status.clone();
         if let Some(screen) = self.screen.as_mut() {
@@ -899,6 +901,16 @@ impl Ui {
         blocks
     }
 
+    fn system_page(&mut self) -> Vec<Block<Action>> {
+        match &self.tweaks {
+            Some(status) => system_page(status),
+            None => vec![Block::Paragraph {
+                markup: "<muted>Asking tv-blockd...</muted>".into(),
+                size: 24,
+            }],
+        }
+    }
+
     fn tweaks_page(&mut self) -> Vec<Block<Action>> {
         match &self.tweaks {
             Some(status) => tweak_page(status, self.patch.as_ref()),
@@ -919,6 +931,7 @@ impl Ui {
                 self.load_tweaks(Service::Block, None, None);
                 self.load_tweaks(Service::Patch, None, None);
             }
+            Tab::System => self.load_tweaks(Service::Block, None, None),
             Tab::Store => {}
         }
         self.render();
@@ -932,7 +945,7 @@ impl Ui {
             ScreenEvent::None => {}
             ScreenEvent::Action(action) => self.act(action),
             ScreenEvent::Tab(index) => {
-                let tab = [Tab::Store, Tab::Permissions, Tab::Tweaks]
+                let tab = [Tab::Store, Tab::Permissions, Tab::Tweaks, Tab::System]
                     .get(index)
                     .copied();
                 if let Some(tab) = tab {
@@ -1288,6 +1301,55 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
             config["multiview_preload"] == true,
         ),
     ]));
+    blocks.push(Block::Section("Permanent changes".into()));
+    blocks.push(Block::Paragraph {
+        markup: "<warn>Permanent:</warn> these disable apps in the TV's app registry. They stay \
+                 after a reboot and after TV suite is removed, until switched off here or with Undo."
+            .into(),
+        size: 22,
+    });
+    let missing = |key: &str| {
+        report["missing"]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|value| value == key))
+    };
+    let permanent = |key: &str, title: &str, what: &str| {
+        let state = if missing(key) {
+            "not on this TV"
+        } else if report["disabled"][key]
+            .as_array()
+            .is_some_and(|apps| !apps.is_empty())
+        {
+            "disabled"
+        } else {
+            "running normally"
+        };
+        let mut row = switch(
+            key,
+            title,
+            &format!("Permanent \u{00b7} {what} \u{00b7} {state}"),
+            config[key] == true,
+        );
+        row.dim = missing(key);
+        row
+    };
+    blocks.push(Block::Rows(vec![
+        permanent(
+            "disable_hbbtv",
+            "Disable HbbTV",
+            "red-button apps on broadcasts; may stop Samsung TV Plus",
+        ),
+        permanent(
+            "disable_acr",
+            "Disable ACR",
+            "reports what is on screen to Samsung",
+        ),
+        permanent(
+            "disable_ads",
+            "Disable targeted ads",
+            "Samsung's ad-targeting service",
+        ),
+    ]));
     if let Some(patch) = patch {
         let on = patch["config"]["tizentube"] == true;
         let version = patch["script"]["version"].as_str().unwrap_or("?");
@@ -1331,7 +1393,7 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
     }
     let mut undo = Row::text(
         "Undo all changes",
-        "Everything above off; hosts, services, auto-update, YouTube and the Home key put back",
+        "Everything above and SDB back as they were, permanent changes included",
     );
     undo.controls.push(Control::Button {
         label: "Undo".into(),
@@ -1341,6 +1403,35 @@ fn tweak_page(status: &Value, patch: Option<&Value>) -> Vec<Block<Action>> {
     blocks.push(Block::Section("Reset".into()));
     blocks.push(Block::Rows(vec![undo]));
     blocks
+}
+
+/// The System tab from tv-blockd's `status`.
+fn system_page(status: &Value) -> Vec<Block<Action>> {
+    let config = &status["config"];
+    let running = status["report"]["services"]["sdb_off"]
+        .as_array()
+        .is_some_and(|units| !units.is_empty());
+    let mut sdb = Row::text(
+        "SDB",
+        format!(
+            "Samsung's developer bridge, port 26101 \u{00b7} {}",
+            if running { "running" } else { "not running" }
+        ),
+    );
+    sdb.controls.push(Control::Switch {
+        on: config["sdb_off"] != true,
+        action: Action::Tweak("sdb_off".into()),
+    });
+    vec![
+        Block::Section("Developer access".into()),
+        Block::Rows(vec![sdb]),
+        Block::Paragraph {
+            markup: "<muted>SDB runs only while Samsung's developer mode is on. Off lasts until \
+                     you switch it back on here; a reboot without TV suite turns it back on.</muted>"
+                .into(),
+            size: 22,
+        },
+    ]
 }
 
 fn or_unknown(error: &str) -> &str {

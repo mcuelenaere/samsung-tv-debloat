@@ -478,7 +478,10 @@ actual TizenTube update (1.15.2 is the latest), and long playback.
   (`bins/tv-blockd/README.md`). Still open: `org.tizen.tv.sp-kpi`,
   `screen-analysis-service-manager`, context-aware and activity-inference
   services (some are D-Bus activated); `issue_report_agent`,
-  `stability-monitor`, `dlogutil`. Vetro left `org.tizen.hbbtv-service`
-  globally disabled on tv-living (it fails at every boot); re-enabling it
-  (`pkgcmd -A -t app -n org.tizen.hbbtv-service --global`) is the user's
-  call.
+  `stability-monitor`, `dlogutil`. Vetro's traces on tv-living were removed
+  on 2026-11-11: `org.tizen.hbbtv-service` re-enabled (`pkgcmd -A -t app -n
+  org.tizen.hbbtv-service --global`), `db/menu/system/data-service` back from
+  Vetro's Off (19) to On (20), its `vetro*` files under
+  `/opt/usr/home/owner/share` and `/opt/share/signatures/vetrotvapp_backup.txt`
+  deleted. HbbTV, ACR and targeted ads are now opt-in permanent options, and
+  SDB has a switch in the System tab.

@@ -95,7 +95,49 @@ const SERVICES: &[Services] = &[
         apps: &["com.samsung.tv.multiscreen"],
         brakes: &[],
     },
+    Services {
+        // Starts only while Samsung's developer mode is on (the socket's
+        // ConditionPathExists); the USB socket has no port on a TV.
+        key: "sdb_off",
+        units: &["sdbd_tcp.socket", "sdbd.socket", "sdbd.service"],
+        processes: &[],
+        apps: &[],
+        brakes: &[],
+    },
 ];
+
+/// Permanent options: service apps that amd restarts, disabled in pkgmgr's
+/// database with `pkgcmd -D --global`. That outlives a reboot and tv-blockd,
+/// so `Changes::disabled` records each app tv-blockd disabled; switching the
+/// option off enables and starts exactly those. Apps missing on a TV are
+/// skipped.
+struct Disable {
+    key: &'static str,
+    apps: &'static [&'static str],
+    /// Closed once after the disable (nothing starts them again).
+    close: &'static [&'static str],
+}
+
+const DISABLES: &[Disable] = &[
+    Disable {
+        // hbbtv-service relaunches the HbbTV app at boot and on source changes.
+        key: "disable_hbbtv",
+        apps: &["org.tizen.hbbtv-service"],
+        close: &["org.tizen.hbbtv"],
+    },
+    Disable {
+        key: "disable_acr",
+        apps: &["com.samsung.tv.acr"],
+        close: &[],
+    },
+    Disable {
+        key: "disable_ads",
+        apps: &["com.samsung.tv.targeted-ad-service"],
+        close: &[],
+    },
+];
+
+const PKGMGR_DB: &str = "/opt/dbspace/.pkgmgr_parser.db";
 
 /// Brake files older builds made under /opt, where they outlived a reboot;
 /// removed once (`Changes::created` records which were tv-blockd's).
@@ -138,6 +180,10 @@ struct Report {
     telemetry_active: Vec<String>,
     /// Running units of every service option, on or off.
     services: BTreeMap<String, Vec<String>>,
+    /// Disabled apps of every permanent option, on or off.
+    disabled: BTreeMap<String, Vec<String>>,
+    /// Permanent options none of whose apps this TV has.
+    missing: Vec<String>,
     lists: Vec<ListReport>,
     errors: Vec<String>,
 }
@@ -166,6 +212,9 @@ struct Changes {
     /// Units that were running when tv-blockd stopped them.
     #[serde(default)]
     stopped: Vec<String>,
+    /// Apps tv-blockd disabled in pkgmgr's database (permanent options).
+    #[serde(default)]
+    disabled: Vec<String>,
 }
 
 impl Changes {
@@ -368,6 +417,10 @@ impl Daemon {
                     telemetry: false,
                     airplay: false,
                     multiview_preload: false,
+                    sdb_off: false,
+                    disable_hbbtv: false,
+                    disable_acr: false,
+                    disable_ads: false,
                     ..self.config.clone()
                 };
                 self.apply(config)
@@ -408,6 +461,7 @@ impl Daemon {
         self.reconcile_hosts(&remote, &mut report);
         self.reconcile_otn(&mut report);
         self.reconcile_services(&mut report);
+        self.reconcile_disables(&mut report);
         for error in &report.errors {
             log(error);
         }
@@ -669,6 +723,113 @@ impl Daemon {
             .cloned()
             .unwrap_or_default();
     }
+}
+
+impl Daemon {
+    fn reconcile_disables(&mut self, report: &mut Report) {
+        let mut states = app_disabled(DISABLES.iter().flat_map(|disable| disable.apps));
+        for disable in DISABLES {
+            let present: Vec<&str> = disable
+                .apps
+                .iter()
+                .copied()
+                .filter(|app| states.contains_key(*app))
+                .collect();
+            if present.is_empty() {
+                report.missing.push(disable.key.to_owned());
+                continue;
+            }
+            let wanted = self.config.service(disable.key);
+            let mut closed = false;
+            for app in present {
+                let disabled = states[app];
+                let ours = self.changes.disabled.iter().any(|known| known == app);
+                if wanted && !disabled {
+                    match pkgcmd("-D", app) {
+                        Ok(()) => {
+                            states.insert(app.to_owned(), true);
+                            self.changes.disabled.push(app.to_owned());
+                            self.changes.save();
+                            log(&format!("{}: disabled {app} (permanent)", disable.key));
+                            closed = true;
+                        }
+                        Err(error) => report.errors.push(error.to_string()),
+                    }
+                } else if !wanted && disabled && ours {
+                    match pkgcmd("-A", app) {
+                        Ok(()) => {
+                            states.insert(app.to_owned(), false);
+                            self.changes.disabled.retain(|known| known != app);
+                            self.changes.save();
+                            let _ = Command::new("/usr/bin/app_launcher")
+                                .args(["-s", app])
+                                .output();
+                            log(&format!("{}: enabled and started {app}", disable.key));
+                        }
+                        Err(error) => report.errors.push(error.to_string()),
+                    }
+                }
+            }
+            if closed {
+                for app in disable.apps.iter().chain(disable.close) {
+                    let _ = Command::new("/usr/bin/app_launcher")
+                        .args(["-t", app])
+                        .output();
+                }
+            }
+            let disabled = disable
+                .apps
+                .iter()
+                .filter(|app| states.get(**app) == Some(&true))
+                .map(|app| app.to_string())
+                .collect();
+            report.disabled.insert(disable.key.to_owned(), disabled);
+        }
+    }
+}
+
+/// `app_disable` of each of `apps` that pkgmgr knows, read with the TV's
+/// sqlite3 (the ids are compile-time constants).
+fn app_disabled<'a>(apps: impl Iterator<Item = &'a &'a str>) -> BTreeMap<String, bool> {
+    let list: Vec<String> = apps.map(|app| format!("'{app}'")).collect();
+    let query = format!(
+        "SELECT app_id, app_disable FROM package_app_info WHERE app_id IN ({})",
+        list.join(",")
+    );
+    let Ok(output) = Command::new("/usr/bin/sqlite3")
+        .args(["-readonly", PKGMGR_DB, &query])
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .map(|(app, disabled)| (app.to_owned(), disabled == "true"))
+        .collect()
+}
+
+/// `pkgcmd <flag> -t app -n <app> --global`, given 20 s: the package-level
+/// form hangs when run as root, so a hang must not stall the daemon.
+fn pkgcmd(flag: &str, app: &str) -> io::Result<()> {
+    let mut child = Command::new("/usr/bin/pkgcmd")
+        .args([flag, "-t", "app", "-n", app, "--global"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    for _ in 0..200 {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!("pkgcmd {flag} {app}: {status}")))
+            };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(io::Error::other(format!("pkgcmd {flag} {app}: timed out")))
 }
 
 /// The TV's own `/etc/hosts`, saved before the first mount.
