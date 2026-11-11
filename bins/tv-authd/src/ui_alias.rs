@@ -190,9 +190,15 @@ fn ensure_with(
     }
 
     // Re-mount unconditionally: `/run` is wiped on every boot and an upgrade
-    // changes the inode.  A failure here means the old mount (if any) stays;
-    // remove it before binding the new source.
-    let _ = run(config, &config.umount, &[alias_path.as_os_str()]);
+    // changes the inode.  Detach the old mount lazily: a running UI (the
+    // manager or the dock) keeps it busy, a plain umount then fails, and
+    // binding over a mount whose file the installer deleted fails with
+    // ENOENT, leaving the alias on the deleted binary.
+    let _ = run(
+        config,
+        &config.umount,
+        &[OsStr::new("-l"), alias_path.as_os_str()],
+    );
     run(
         config,
         &config.mount,
@@ -284,7 +290,12 @@ fn restore_with(
     // `rename` replaces the symlink atomically with the packaged file.
     fs::rename(&real_path, &bin_path).map_err(UiAliasError::Io)?;
     let alias_path = config.alias_dir.join(&config.exec_name);
-    let _ = run(config, &config.umount, &[alias_path.as_os_str()]);
+    // Lazily, as in `ensure`: a running UI keeps the mount busy.
+    let _ = run(
+        config,
+        &config.umount,
+        &[OsStr::new("-l"), alias_path.as_os_str()],
+    );
     Ok(())
 }
 
@@ -381,7 +392,9 @@ mod tests {
             return Ok(());
         }
         if program == config.umount {
-            let target = Path::new(arguments[0]);
+            // Always lazy: a running UI keeps the mount busy.
+            assert_eq!(arguments.first(), Some(&OsStr::new("-l")));
+            let target = Path::new(arguments[1]);
             match fs::remove_file(target) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
