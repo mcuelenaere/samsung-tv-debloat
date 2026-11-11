@@ -8,6 +8,7 @@
 //! home-spike open main | app ID | appmain ID
 //! home-spike source TYPE NAME ICON MBR      switch input through tv-viewer
 //! home-spike svg IN.svg SIZE                rasterise with thorvg
+//! home-spike home get | set APPID | reset   the default app for operation/main
 //! ```
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -65,6 +66,14 @@ extern "C" {
         callback: extern "C" fn(*mut c_void) -> u8,
         data: *const c_void,
     ) -> *mut c_void;
+}
+
+#[link(name = "capi-appfw-app-operation-tv")]
+extern "C" {
+    fn app_operation_get_current_app(operation: *const c_char, app_id: *mut *mut c_char) -> c_int;
+    fn app_operation_get_default_app(operation: *const c_char, app_id: *mut *mut c_char) -> c_int;
+    fn app_operation_set_current_app(operation: *const c_char, app_id: *const c_char) -> c_int;
+    fn app_operation_reset_current_app(operation: *const c_char) -> c_int;
 }
 
 #[link(name = "thorvg")]
@@ -228,6 +237,35 @@ fn main() {
             );
             let opaque = buffer.iter().filter(|pixel| *pixel >> 24 != 0).count();
             println!("{opaque} of {} pixels drawn", buffer.len());
+        },
+        ["home", action @ ..] => unsafe {
+            let operation = c(MAIN);
+            match action {
+                ["set", app] => println!(
+                    "set {}",
+                    app_operation_set_current_app(operation.as_ptr(), c(app).as_ptr())
+                ),
+                ["reset"] => println!(
+                    "reset {}",
+                    app_operation_reset_current_app(operation.as_ptr())
+                ),
+                _ => {}
+            }
+            let (mut current, mut default) = (ptr::null_mut(), ptr::null_mut());
+            let got_current = app_operation_get_current_app(operation.as_ptr(), &mut current);
+            let got_default = app_operation_get_default_app(operation.as_ptr(), &mut default);
+            let text = |p: *mut c_char| {
+                if p.is_null() {
+                    "-".to_owned()
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            println!(
+                "current {got_current} {} default {got_default} {}",
+                text(current),
+                text(default)
+            );
         },
         _ => eprintln!("see the module doc"),
     }

@@ -64,6 +64,9 @@ copy_as /usr/lib/libcapi-appfw-app-manager.so.0.12.1 libcapi-appfw-app-manager.s
     4526b5a9d8f51c30e518e65b52d7ec8e7d5c8a9b6450813dc7ca574e66887cf7
 copy_as /usr/lib/libthorvg.so.0.6.99 libthorvg.so \
     4d390a02c047e9429308b44fe8ff785e89085ec0bfa9d44571337fd0f0a63483
+# tv-launcher: the default app for operation/main (the Home key's target).
+copy_as /usr/lib/libcapi-appfw-app-operation-tv.so.0.1.0 libcapi-appfw-app-operation-tv.so \
+    2c879c2865c33723652108f870c2ecfd918986dae75e8ac3fbafb08e48642e70
 # tv-patchd: TLS for the YouTube proxy.
 copy_as /usr/lib/libssl.so.1.1 libssl.so \
     ffda6cbac6b90ac18c88e0516b36eb0648d7243c63b43818b3a68e958b32bee6
