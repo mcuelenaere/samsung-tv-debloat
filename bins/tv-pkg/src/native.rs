@@ -6,11 +6,14 @@ use crate::manifest::{Manifest, STATE_DIR, UNIT_MODE, UNIT_SMACK};
 use crate::state::{self, inspect, Current, State};
 use crate::systemd::Systemd;
 use crate::{Context, Error};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
 const RUNTIME_UNIT_MODE: u32 = 0o644;
@@ -183,7 +186,7 @@ pub fn install(
         .map(|unit| unit.name.clone())
         .collect();
 
-    let mut txn = Transaction::begin(ctx)?;
+    let mut txn = Transaction::begin(ctx, &new_state)?;
     let staged = match stage(ctx, archive, &txn.dir) {
         Ok(staged) => staged,
         Err(error) => {
@@ -197,7 +200,7 @@ pub fn install(
             let _ = fs::remove_dir_all(&txn.dir);
             Ok(true)
         }
-        Err(error) => Err(txn.rollback(&manifest, error)),
+        Err(error) => Err(txn.rollback(error)),
     }
 }
 
@@ -321,7 +324,8 @@ fn apply(
     let declared_units = manifest.units.iter().map(|u| u.name.clone());
     for name in declared_units.chain(stale_units.iter().cloned()).rev() {
         if systemd.is_active(&name)? {
-            txn.was_running.push(name.clone());
+            txn.journal.was_running.push(name.clone());
+            txn.save()?;
             systemd.stop(&name)?;
         }
     }
@@ -332,18 +336,17 @@ fn apply(
         let live = ctx.path(&directory.path);
         match fs::symlink_metadata(&live) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                txn.record(Undo::RemoveDir(live.clone()))?;
                 DirBuilder::new()
                     .mode(0o700)
                     .create(&live)
                     .map_err(|e| Error::io(format!("create {}", directory.path), e))?;
-                txn.undo.push(Undo::RemoveDir(live.clone()));
             }
             Err(error) => return Err(Error::io(format!("inspect {}", directory.path), error)),
             Ok(metadata) => {
                 // ponytail: owner and label of an existing directory are not
                 // rolled back, only its mode.
-                txn.undo
-                    .push(Undo::Mode(live.clone(), metadata.mode() & 0o7777));
+                txn.record(Undo::Mode(live.clone(), metadata.mode() & 0o7777))?;
             }
         }
         set_mode(&live, directory.mode.0)?;
@@ -386,6 +389,7 @@ fn apply(
     for unit in &manifest.units {
         systemd.start(&unit.name)?;
     }
+    wait_settled(ctx, manifest)?;
 
     let problems = health(ctx, new_state)?;
     if !problems.is_empty() {
@@ -394,9 +398,35 @@ fn apply(
             problems.join("; ")
         )));
     }
+    // Committing: recovery treats a journal whose digest is recorded as done.
     state::save(ctx, new_state)
 }
 
+/// A unit that dies (or enters a restart loop) within `ctx.settle` of being
+/// started fails the install.
+fn wait_settled(ctx: &Context, manifest: &Manifest) -> Result<(), Error> {
+    let systemd = Systemd(ctx.runner);
+    let deadline = Instant::now() + ctx.settle;
+    loop {
+        for unit in &manifest.units {
+            if !systemd.is_active(&unit.name)? {
+                return Err(Error::failed(format!(
+                    "{} stopped right after starting",
+                    unit.name
+                )));
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(500)));
+    }
+}
+
+/// One reversible step. Every step is written to the journal before it is
+/// performed, so undoing a step that never happened must be harmless.
+#[derive(Debug, Serialize, Deserialize)]
 enum Undo {
     /// Move the backup back over the live path.
     Restore {
@@ -407,37 +437,78 @@ enum Undo {
     Remove(PathBuf),
     RemoveDir(PathBuf),
     Mode(PathBuf, u32),
-    /// Runtime unit copy on /run: previous bytes, if any.
-    Runtime(PathBuf, Option<Vec<u8>>),
+    /// Runtime unit copy on /run, with a backup of the previous copy if any.
+    Runtime {
+        live: PathBuf,
+        backup: Option<PathBuf>,
+    },
 }
 
-/// A private directory on /opt holding staged files and backups.
+/// `journal.json` in the transaction directory.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    id: String,
+    /// Digest being installed; once the state records it, the transaction
+    /// committed and only the directory is left to delete.
+    digest: String,
+    /// Units the new version starts, stopped again on rollback.
+    units: Vec<String>,
+    was_running: Vec<String>,
+    undo: Vec<Undo>,
+}
+
+const JOURNAL: &str = "journal.json";
+
+/// A private directory on /opt holding staged files, backups and the journal.
 struct Transaction<'a> {
     ctx: &'a Context<'a>,
     dir: PathBuf,
-    undo: Vec<Undo>,
-    was_running: Vec<String>,
+    journal: Journal,
 }
 
 impl<'a> Transaction<'a> {
-    fn begin(ctx: &'a Context<'a>) -> Result<Self, Error> {
-        let parent = ctx.path(STATE_DIR);
-        state::create_private_dir(&parent)?;
-        let dir = parent.join(format!("txn-{}", std::process::id()));
+    fn begin(ctx: &'a Context<'a>, state: &State) -> Result<Self, Error> {
+        let dir = ctx
+            .path(STATE_DIR)
+            .join(format!("txn-{}", std::process::id()));
+        state::create_private_dir(dir.parent().expect("state directory"))?;
         DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .map_err(|e| Error::io(format!("create {}", dir.display()), e))?;
+        let units = state
+            .manifest
+            .units
+            .iter()
+            .map(|u| u.name.clone())
+            .collect();
         Ok(Self {
             ctx,
             dir,
-            undo: Vec::new(),
-            was_running: Vec::new(),
+            journal: Journal {
+                id: state.manifest.id.clone(),
+                digest: state.digest.clone(),
+                units,
+                was_running: Vec::new(),
+                undo: Vec::new(),
+            },
         })
     }
 
+    fn save(&self) -> Result<(), Error> {
+        let bytes = serde_json::to_vec(&self.journal).expect("journal serializes");
+        state::write_atomic(&self.dir.join(JOURNAL), &bytes, 0o600)
+    }
+
+    /// Journal `step` before the caller performs it.
+    fn record(&mut self, step: Undo) -> Result<(), Error> {
+        self.journal.undo.push(step);
+        self.save()
+    }
+
     fn backup_path(&self) -> PathBuf {
-        self.dir.join(format!("backup-{}", self.undo.len()))
+        self.dir.join(format!("backup-{}", self.journal.undo.len()))
     }
 
     /// Back up whatever is at `live`, then rename `staged` into place.
@@ -449,57 +520,81 @@ impl<'a> Transaction<'a> {
     /// Move whatever is at `live` into the transaction backup.
     fn retire(&mut self, live: &Path) -> Result<(), Error> {
         if fs::symlink_metadata(live).is_err() {
-            self.undo.push(Undo::Remove(live.to_owned()));
-            return Ok(());
+            return self.record(Undo::Remove(live.to_owned()));
         }
         let backup = self.backup_path();
-        fs::rename(live, &backup)
-            .map_err(|e| Error::io(format!("back up {}", live.display()), e))?;
-        self.undo.push(Undo::Restore {
+        self.record(Undo::Restore {
             live: live.to_owned(),
-            backup,
-        });
-        Ok(())
+            backup: backup.clone(),
+        })?;
+        fs::rename(live, &backup).map_err(|e| Error::io(format!("back up {}", live.display()), e))
     }
 
     fn write_runtime(&mut self, live: &Path, bytes: Option<&[u8]>) -> Result<(), Error> {
-        let previous = match fs::read(live) {
-            Ok(previous) => Some(previous),
+        let backup = self.backup_path();
+        let backup = match fs::copy(live, &backup) {
+            Ok(_) => Some(backup),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::io(format!("read {}", live.display()), error)),
+            Err(error) => return Err(Error::io(format!("back up {}", live.display()), error)),
         };
-        self.undo.push(Undo::Runtime(live.to_owned(), previous));
+        self.record(Undo::Runtime {
+            live: live.to_owned(),
+            backup,
+        })?;
         match bytes {
             Some(bytes) => state::write_atomic(live, bytes, RUNTIME_UNIT_MODE),
             None => remove_if_present(live),
         }
     }
 
-    /// Undo every recorded step, restore the previous unit state, and return
-    /// `error` with any restoration problems appended. Backups are kept if
-    /// anything could not be restored.
-    fn rollback(self, manifest: &Manifest, error: Error) -> Error {
+    /// Undo the transaction and return `error`, noting any restoration
+    /// problems.
+    fn rollback(self, error: Error) -> Error {
+        match self.undo() {
+            Ok(()) => error,
+            Err(problems) => Error {
+                code: error.code,
+                message: format!("{}; {problems}", error.message),
+            },
+        }
+    }
+
+    /// Undo every recorded step and restore the previous unit state. Backups
+    /// are kept, and the problems returned, if anything could not be restored.
+    fn undo(self) -> Result<(), String> {
         let systemd = Systemd(self.ctx.runner);
         let mut problems = Vec::new();
-        for unit in manifest.units.iter().rev() {
-            if systemd.is_active(&unit.name).unwrap_or(true) {
-                if let Err(e) = systemd.stop(&unit.name) {
+        for unit in self.journal.units.iter().rev() {
+            if systemd.is_active(unit).unwrap_or(true) {
+                if let Err(e) = systemd.stop(unit) {
                     problems.push(e.message);
                 }
             }
         }
-        for step in self.undo.into_iter().rev() {
+        for step in self.journal.undo.into_iter().rev() {
             let result = match step {
-                Undo::Restore { live, backup } => fs::rename(&backup, &live)
-                    .map_err(|e| Error::io(format!("restore {}", live.display()), e)),
+                // A missing backup means the crash came before the move.
+                Undo::Restore { live, backup } => match fs::rename(&backup, &live) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                        Err(Error::io(format!("restore {}", live.display()), e))
+                    }
+                    _ => Ok(()),
+                },
                 Undo::Remove(live) => remove_if_present(&live),
-                Undo::RemoveDir(live) => fs::remove_dir(&live)
-                    .map_err(|e| Error::io(format!("remove {}", live.display()), e)),
+                Undo::RemoveDir(live) => match fs::remove_dir(&live) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                        Err(Error::io(format!("remove {}", live.display()), e))
+                    }
+                    _ => Ok(()),
+                },
                 Undo::Mode(live, mode) => set_mode(&live, mode),
-                Undo::Runtime(live, Some(bytes)) => {
-                    state::write_atomic(&live, &bytes, RUNTIME_UNIT_MODE)
-                }
-                Undo::Runtime(live, None) => remove_if_present(&live),
+                Undo::Runtime {
+                    live,
+                    backup: Some(backup),
+                } => fs::read(&backup)
+                    .map_err(|e| Error::io(format!("read {}", backup.display()), e))
+                    .and_then(|bytes| state::write_atomic(&live, &bytes, RUNTIME_UNIT_MODE)),
+                Undo::Runtime { live, backup: None } => remove_if_present(&live),
             };
             if let Err(e) = result {
                 problems.push(e.message);
@@ -508,25 +603,75 @@ impl<'a> Transaction<'a> {
         if let Err(e) = systemd.daemon_reload() {
             problems.push(e.message);
         }
-        for name in self.was_running.iter().rev() {
+        for name in self.journal.was_running.iter().rev() {
             if let Err(e) = systemd.start(name) {
                 problems.push(e.message);
             }
         }
         if problems.is_empty() {
             let _ = fs::remove_dir_all(&self.dir);
-            return error;
+            return Ok(());
         }
-        Error {
-            code: error.code,
-            message: format!(
-                "{}; rollback incomplete ({}); backups kept in {}",
-                error.message,
-                problems.join("; "),
-                self.dir.display()
-            ),
+        Err(format!(
+            "rollback incomplete ({}); backups kept in {}",
+            problems.join("; "),
+            self.dir.display()
+        ))
+    }
+}
+
+/// Finish transactions left by a tv-pkg process that died (the caller holds
+/// the lock, so no live process owns one): roll back uncommitted ones and
+/// delete committed ones. Fails closed if anything cannot be restored.
+pub fn recover(ctx: &Context) -> Result<(), Error> {
+    let parent = ctx.path(STATE_DIR);
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::io(format!("read {}", parent.display()), error)),
+    };
+    for entry in entries {
+        let dir = entry
+            .map_err(|e| Error::io("read state directory", e))?
+            .path();
+        if !dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("txn-"))
+        {
+            continue;
+        }
+        let journal = match fs::read(dir.join(JOURNAL)) {
+            // Nothing outside the directory was touched yet.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Error::io(format!("read {}", dir.display()), error)),
+            Ok(bytes) => Some(serde_json::from_slice::<Journal>(&bytes).map_err(|e| {
+                Error::invalid(format!(
+                    "interrupted transaction {} is malformed: {e}",
+                    dir.display()
+                ))
+            })?),
+        };
+        let committed = match &journal {
+            None => true,
+            Some(journal) => {
+                state::load(ctx, &journal.id)?.is_some_and(|state| state.digest == journal.digest)
+            }
+        };
+        match journal {
+            Some(journal) if !committed => {
+                let id = journal.id.clone();
+                Transaction { ctx, dir, journal }
+                    .undo()
+                    .map_err(|problems| {
+                        Error::failed(format!("interrupted {id} install: {problems}"))
+                    })?;
+                eprintln!("tv-pkg: rolled back an interrupted {id} install");
+            }
+            _ => fs::remove_dir_all(&dir)
+                .map_err(|e| Error::io(format!("remove {}", dir.display()), e))?,
         }
     }
+    Ok(())
 }
 
 pub fn remove(ctx: &Context, state: &State) -> Result<(), Error> {

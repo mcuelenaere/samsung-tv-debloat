@@ -153,6 +153,7 @@ impl Env {
         Context {
             root: self.root().to_owned(),
             apply_security: false,
+            settle: std::time::Duration::ZERO,
             runner: &self.runner,
             broker: &self.broker,
         }
@@ -507,6 +508,8 @@ fn fresh_install_writes_exact_metadata_and_state() {
             "systemctl is-active --quiet tv-blockd.service",
             "systemctl daemon-reload",
             "systemctl start tv-blockd.service",
+            // Settle check, then the post-install health check.
+            "systemctl is-active --quiet tv-blockd.service",
             "systemctl is-active --quiet tv-blockd.service",
         ]
     );
@@ -746,7 +749,11 @@ fn failed_post_install_check_rolls_back() {
     let before = snapshot(env.root());
     let error =
         tv_pkg::install(&ctx, &native_package(&env, "v1.tvpkg", b"binary-v1"), false).unwrap_err();
-    assert!(error.message.contains("not active"), "{}", error.message);
+    assert!(
+        error.message.contains("stopped right after starting"),
+        "{}",
+        error.message
+    );
     let mut after = snapshot(env.root());
     // tv-pkg's own (empty) state directories may remain.
     after.retain(|path, _| {
@@ -756,6 +763,153 @@ fn failed_post_install_check_rolls_back() {
     });
     assert_eq!(after, before);
     assert!(tv_pkg::list(&ctx).unwrap().is_empty());
+}
+
+#[test]
+fn a_unit_that_dies_while_settling_fails_the_install() {
+    let env = Env::new();
+    // Active on the first check after `start`, dead from then on.
+    struct DiesSoon(FakeRunner, Cell<u32>);
+    impl Runner for DiesSoon {
+        fn run(&self, argv: &[String]) -> io::Result<i32> {
+            let code = self.0.run(argv)?;
+            match argv[1].as_str() {
+                "start" => self.1.set(1),
+                "is-active" if self.1.get() > 0 => {
+                    self.1.set(self.1.get() + 1);
+                    return Ok(if self.1.get() == 2 { 0 } else { 3 });
+                }
+                _ => {}
+            }
+            Ok(code)
+        }
+    }
+    let runner = DiesSoon(FakeRunner::default(), Cell::new(0));
+    let ctx = Context {
+        runner: &runner,
+        settle: std::time::Duration::from_millis(50),
+        ..env.ctx()
+    };
+    let error = tv_pkg::install(&ctx, &native_package(&env, "v1.tvpkg", b"v1"), false).unwrap_err();
+    assert!(
+        error.message.contains("stopped right after starting"),
+        "{}",
+        error.message
+    );
+    assert!(!env.path("/opt/tv-suite/bin/tv-blockd").exists());
+    assert!(tv_pkg::list(&ctx).unwrap().is_empty());
+}
+
+/// Panics on `systemctl start`, like a process killed mid-transaction.
+struct Crashes(FakeRunner);
+impl Runner for Crashes {
+    fn run(&self, argv: &[String]) -> io::Result<i32> {
+        assert_ne!(argv[1], "start", "simulated crash");
+        self.0.run(argv)
+    }
+}
+
+fn txn_dirs(env: &Env) -> Vec<String> {
+    fs::read_dir(env.path("/opt/tv-suite/var/tv-pkg"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("txn-"))
+        .collect()
+}
+
+#[test]
+fn an_interrupted_install_is_rolled_back_by_the_next_run() {
+    let env = Env::new();
+    tv_pkg::install(
+        &env.ctx(),
+        &native_package(&env, "v1.tvpkg", b"binary-v1"),
+        false,
+    )
+    .unwrap();
+    let before = snapshot(env.root());
+
+    // v2 adds a directory and a file; the process "dies" while starting.
+    let mut manifest = native(b"binary-v2");
+    manifest["directories"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path": "/opt/tv-suite/share", "mode": "0700", "smack": "_"}));
+    manifest["files"].as_array_mut().unwrap().push(json!({
+        "source": "payload/extra", "destination": "/opt/tv-suite/share/extra",
+        "sha256": sha(b"extra"), "mode": "0644", "smack": "_"}));
+    let v2 = env.package(
+        "v2.tvpkg",
+        &manifest,
+        &[
+            ("payload/tv-blockd", b"binary-v2"),
+            ("payload/tv-blockd.service", UNIT),
+            ("payload/extra", b"extra"),
+        ],
+    );
+    let crashing = Crashes(FakeRunner::default());
+    *crashing.0.active.borrow_mut() = env.runner.active.borrow().clone();
+    let ctx = Context {
+        runner: &crashing,
+        ..env.ctx()
+    };
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tv_pkg::install(&ctx, &v2, false)
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(
+        fs::read(env.path("/opt/tv-suite/bin/tv-blockd")).unwrap(),
+        b"binary-v2"
+    );
+    assert_eq!(txn_dirs(&env).len(), 1);
+    assert!(!tv_pkg::status(&env.ctx(), "tv-blockd")
+        .unwrap()
+        .1
+        .is_empty());
+
+    // The next mutating run rolls it back first; v1 is then unchanged.
+    *env.runner.active.borrow_mut() = crashing.0.active.borrow().clone();
+    env.runner.take_log();
+    let v1 = native_package(&env, "v1.tvpkg", b"binary-v1");
+    assert_eq!(
+        tv_pkg::install(&env.ctx(), &v1, false).unwrap().changed,
+        Some(false)
+    );
+    assert_eq!(snapshot(env.root()), before);
+    assert!(env.runner.active.borrow().contains("tv-blockd.service"));
+    let log = env.runner.take_log();
+    assert!(
+        log.contains(&"systemctl start tv-blockd.service".to_owned()),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn leftover_transactions_without_pending_work_are_deleted() {
+    let env = Env::new();
+    tv_pkg::install(&env.ctx(), &native_package(&env, "v1.tvpkg", b"v1"), false).unwrap();
+    let state = &tv_pkg::list(&env.ctx()).unwrap()[0];
+    let var = env.path("/opt/tv-suite/var/tv-pkg");
+
+    // Crashed before touching anything: no journal.
+    fs::create_dir(var.join("txn-1")).unwrap();
+    fs::write(var.join("txn-1/file-0"), b"staged").unwrap();
+    // Crashed after committing the state: the journal must not be replayed.
+    fs::create_dir(var.join("txn-2")).unwrap();
+    let binary = env.path("/opt/tv-suite/bin/tv-blockd");
+    let journal = json!({"id": "tv-blockd", "digest": state.digest, "units": [], "was_running": [],
+                         "undo": [{"Remove": binary}]});
+    fs::write(var.join("txn-2/journal.json"), journal.to_string()).unwrap();
+
+    tv_pkg::install(&env.ctx(), &native_package(&env, "v1.tvpkg", b"v1"), false).unwrap();
+    assert!(txn_dirs(&env).is_empty());
+    assert!(binary.exists());
+
+    // A journal that cannot be read fails closed.
+    fs::create_dir(var.join("txn-3")).unwrap();
+    fs::write(var.join("txn-3/journal.json"), b"{truncated").unwrap();
+    let error = tv_pkg::remove(&env.ctx(), "tv-blockd").unwrap_err();
+    assert!(error.message.contains("malformed"), "{}", error.message);
+    assert!(binary.exists());
 }
 
 #[test]

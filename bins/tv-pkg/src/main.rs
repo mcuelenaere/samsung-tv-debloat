@@ -45,6 +45,7 @@ fn main() -> ExitCode {
     let ctx = Context {
         root: PathBuf::from("/"),
         apply_security: true,
+        settle: std::time::Duration::from_secs(3),
         runner: &runner,
         broker: &broker,
     };

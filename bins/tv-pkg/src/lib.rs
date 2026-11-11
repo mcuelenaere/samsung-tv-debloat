@@ -63,6 +63,8 @@ pub struct Context<'a> {
     pub root: PathBuf,
     /// Set owner 0:0 and SMACK labels (needs root on Linux).
     pub apply_security: bool,
+    /// How long started units must stay active before an install succeeds.
+    pub settle: std::time::Duration,
     pub runner: &'a dyn Runner,
     pub broker: &'a dyn Broker,
 }
@@ -90,6 +92,7 @@ pub fn verify(package: &Path) -> Result<Outcome, Error> {
 
 pub fn install(ctx: &Context, package: &Path, adopt_existing: bool) -> Result<Outcome, Error> {
     let _lock = lock(ctx)?;
+    native::recover(ctx)?;
     let mut archive = Archive::open(package)?;
     archive.verify()?;
     let manifest = archive.manifest.clone();
@@ -134,6 +137,7 @@ pub fn status(ctx: &Context, id: &str) -> Result<(State, Vec<String>), Error> {
 
 pub fn remove(ctx: &Context, id: &str) -> Result<Outcome, Error> {
     let _lock = lock(ctx)?;
+    native::recover(ctx)?;
     let state = state::load(ctx, id)?
         .ok_or_else(|| Error::new("not_installed", format!("{id} is not installed")))?;
     match state.manifest.kind {
