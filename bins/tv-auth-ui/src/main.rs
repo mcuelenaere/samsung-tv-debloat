@@ -1525,7 +1525,7 @@ impl Ui {
                     small(
                         "Switches everything above off and puts back what the suite changed: \
                          hosts, brake files, masked or stopped services, the auto-update setting, \
-                         YouTube's flags.",
+                         YouTube's flags, the Home key.",
                         "#8a8f99"
                     )
                 ),
@@ -1670,6 +1670,24 @@ fn tweaks(status: &Value, patch: Option<&Value>) -> Vec<Tweak> {
                 patch["pinned"].as_str().unwrap_or("?")
             ),
             button: "Update".into(),
+        });
+        let custom = patch["config"]["custom_home"] == true;
+        let home = report["home"].as_str().unwrap_or_default();
+        let state = if custom && home == "org.tvauth.home" {
+            "On: the Home key opens the dock.".to_owned()
+        } else if custom {
+            format!("On, but the Home key still opens {home}.")
+        } else {
+            "Off: the Home key opens Samsung's Home.".to_owned()
+        };
+        list.push(Tweak {
+            key: "patch:custom_home".into(),
+            title: "Custom Home".into(),
+            note: format!(
+                "The Home key opens the suite's dock over what is playing: your apps, \
+                 Up for the inputs, Down for Samsung Home and Settings. {state}"
+            ),
+            button: on_off(custom).into(),
         });
     }
     list
@@ -2101,23 +2119,26 @@ unsafe extern "C" fn on_tweak_clicked(data: *mut c_void, _object: *mut c_void, _
             state.load_tweaks(Service::Patch, Some(json!({"method": "update"})), None);
             return;
         }
-        Some("patch:tizentube") => {
+        Some(key @ ("patch:tizentube" | "patch:custom_home")) => {
+            let field = &key["patch:".len()..];
             // `set` replaces the whole config: keep the other settings.
             let mut config = state
                 .patch
                 .as_ref()
                 .map_or_else(|| json!({}), |patch| patch["config"].clone());
-            let on = config["tizentube"] == true;
-            config["tizentube"] = json!(!on);
+            let on = config[field] == true;
+            config[field] = json!(!on);
+            let message = match (field, on) {
+                ("tizentube", true) => "TizenTube is off; YouTube is back to normal.",
+                ("tizentube", false) => "TizenTube is on. Open YouTube to use it.",
+                (_, true) => "Custom Home is off; the Home key opens Samsung's Home.",
+                (_, false) => "Custom Home is on; press Home for the dock.",
+            };
             state.set_status("Applying...");
             state.load_tweaks(
                 Service::Patch,
                 Some(json!({"method": "set", "config": config})),
-                Some(if on {
-                    "TizenTube is off; YouTube is back to normal."
-                } else {
-                    "TizenTube is on. Open YouTube to use it."
-                }),
+                Some(message),
             );
             return;
         }

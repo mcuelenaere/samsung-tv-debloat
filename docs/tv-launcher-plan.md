@@ -270,7 +270,7 @@ No daemon, no evdev, no root at run time.
      The webappservice row is written as part of the install, so the 1 s
      target relative to pkgmgr's `end ok` holds in practice. It was not
      measured against the D-Bus signal itself.
-   - A store install and a WGT were not tested.
+   - Installing and uninstalling WGTs checked by the user on 2026-11-11.
    - Found while testing: webappservice gives a multi-app TPK's row to an app
      of its own choosing, and for `org.tvauth.ui` that is now the dock
      (`tizen_id=org.tvauth.home`, `is_hidden=1`). Since step 1, **TV suite
@@ -304,8 +304,8 @@ No daemon, no evdev, no root at run time.
      13, Samsung's input banner shown); OK on PlayStation 5 switched back
      (14).
    - Settings opens `org.tizen.menu`.
-   - Not done: renaming a source (the mirror and the watcher are in place),
-     marking the current input.
+   - Renaming a source (PS5 to PS5a) updates its tile: checked by the user.
+   - The current input is marked (a blue dot, since the redesign).
    - Focus scrolling is instant (Elementary autoscroll SHOW) in the dock and
      the manager, after the user found scrolling slow once items had to come
      into view. Not yet confirmed by the user.
@@ -333,9 +333,19 @@ No daemon, no evdev, no root at run time.
      server.
 4. **Samsung Home, Settings, TV suite tiles**. Check: Samsung Home opens with
    its sidebar 20 times out of 20; the next Home press shows the dock.
+
+   **Done**: all three open, checked by the user in normal use.
 5. **Tweaks toggle and Undo**. Check: off returns stock Home behaviour at
    once; Undo resets the target.
-6. **Soak and docs**: a day of normal use, standby and resume, a cold boot;
+
+   **Done 2026-11-11** on tv-living: **Custom Home** in the Tweaks tab. Off
+   set the Home key back to `com.samsung.tv.csfs` at once, on to
+   `org.tvauth.home`. **Undo all changes** switched tv-patchd and tv-blockd
+   off: Home key back to csfs, YouTube's flags stock, the Home mirrors in
+   `/run/tv-suite` removed, host blocking, the update lock and the
+   telemetry stop off. The previous settings were then restored with `set`.
+6. **Soak and docs** (the user's soak test runs during the week of
+   2026-11-11): a day of normal use, standby and resume, a cold boot;
    README, persistence table, plan status.
 
 ## Out of scope

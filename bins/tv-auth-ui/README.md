@@ -126,8 +126,11 @@ sends `undo` to tv-blockd and tv-patchd: everything off, and what they
 changed put back. See `bins/tv-blockd/README.md`.
 
 **TizenTube in YouTube** switches `tv-patchd` (`/run/tv-suite/patchd.sock`)
-on and off, and **Update TizenTube** installs npm's latest release. See
-`bins/tv-patchd/README.md`.
+on and off, and **Update TizenTube** installs npm's latest release.
+**Custom Home** switches tv-patchd's `custom_home`: the Home key opens the
+dock below, or Samsung's Home again; its note says which app the Home key
+opens now. Both send tv-patchd's whole config with `set`, so neither
+changes the other. See `bins/tv-patchd/README.md`.
 
 ### Dock (`org.tvauth.home`)
 
