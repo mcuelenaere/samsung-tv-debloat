@@ -80,21 +80,13 @@ fn main() -> ExitCode {
 
     let (mut fields, status, code) = match result {
         Ok(fields) => {
-            let status = if fields.get("changed") == Some(&Value::Bool(false)) {
-                "unchanged"
+            if fields.get("healthy") == Some(&Value::Bool(false)) {
+                (fields, "unhealthy", ExitCode::FAILURE)
+            } else if fields.get("changed") == Some(&Value::Bool(false)) {
+                (fields, "unchanged", ExitCode::SUCCESS)
             } else {
-                "ok"
-            };
-            let unhealthy = fields.get("healthy") == Some(&Value::Bool(false));
-            (
-                fields,
-                status,
-                if unhealthy {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                },
-            )
+                (fields, "ok", ExitCode::SUCCESS)
+            }
         }
         Err(error) if error.code == "busy" => (error_fields(&error), "busy", ExitCode::from(75)),
         Err(error) => (error_fields(&error), "error", ExitCode::FAILURE),
